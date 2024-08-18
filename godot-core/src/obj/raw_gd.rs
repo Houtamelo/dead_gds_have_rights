@@ -39,6 +39,10 @@ pub struct RawGd<T: GodotClass> {
 }
 
 impl<T: GodotClass> RawGd<T> {
+	pub(super) fn cached_rtti(&self) -> Option<&ObjectRtti> {
+		self.cached_rtti.as_ref()
+	}
+	
     /// Create a new object representing a null in Godot.
     pub(super) fn null() -> Self {
         Self {
@@ -641,11 +645,11 @@ impl<T: GodotClass> Clone for RawGd<T> {
     fn clone(&self) -> Self {
         out!("RawGd::clone");
 
-        if self.is_null() {
+        if self.is_null() || !self.is_instance_valid() {
             Self::null()
         } else {
             self.check_rtti("clone");
-
+	        
             // Create new object, adopt cached fields.
             let copy = Self {
                 obj: self.obj,

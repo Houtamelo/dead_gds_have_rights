@@ -160,6 +160,8 @@ pub trait EngineEnum: Copy {
     /// This is not necessarily unique.
     fn ord(self) -> i32;
 
+	/// # Panics
+	/// If `ord` does not map to any enumerator. 
     fn from_ord(ord: i32) -> Self {
         Self::try_from_ord(ord)
             .unwrap_or_else(|| panic!("ordinal {ord} does not map to any enumerator"))
@@ -173,6 +175,8 @@ pub trait EngineBitfield: Copy {
     /// Ordinal value of the bit flag, as specified in Godot.
     fn ord(self) -> u64;
 
+	/// # Panics
+	/// If `ord` does not map to any valid bit flag.
     fn from_ord(ord: u64) -> Self {
         Self::try_from_ord(ord)
             .unwrap_or_else(|| panic!("ordinal {ord} does not map to any valid bit flag"))

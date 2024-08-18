@@ -313,7 +313,7 @@ impl ToGodot for u64 {
     }
 
     fn to_variant(&self) -> Variant {
-        // TODO panic doesn't fit the trait's infallibility too well; maybe in the future try_to_godot/try_to_variant() methods are possible.
+	    // TODO panic doesn't fit the trait's infallibility too well; maybe in the future try_to_godot/try_to_variant() methods are possible.
         i64::try_from(*self)
             .map(|v| v.to_variant())
             .unwrap_or_else(|_| {

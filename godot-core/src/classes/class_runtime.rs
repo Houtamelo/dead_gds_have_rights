@@ -30,8 +30,12 @@ pub(crate) fn display_string<T: GodotClass>(
     obj: &Gd<T>,
     f: &mut std::fmt::Formatter<'_>,
 ) -> std::fmt::Result {
-    let string: GString = obj.raw.as_object().to_string();
-    <GString as std::fmt::Display>::fmt(&string, f)
+	if obj.is_instance_valid() {
+		let string: GString = obj.raw.as_object().to_string();
+		<GString as std::fmt::Display>::fmt(&string, f)
+	} else {
+		write!(f, "{{ freed obj }}")
+	}
 }
 
 pub(crate) fn object_ptr_from_id(instance_id: InstanceId) -> sys::GDExtensionObjectPtr {

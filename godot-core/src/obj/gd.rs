@@ -224,7 +224,7 @@ impl<T: GodotClass> Gd<T> {
     }
 
     /// Returns the instance ID of this object, or `None` if the object is dead or null.
-    pub(crate) fn instance_id_or_none(&self) -> Option<InstanceId> {
+    pub fn instance_id_or_none(&self) -> Option<InstanceId> {
         let known_id = self.instance_id_unchecked();
 
         // Refreshes the internal cached ID on every call, as we cannot be sure that the object has not been
@@ -263,14 +263,7 @@ impl<T: GodotClass> Gd<T> {
         unsafe { instance_id.unwrap_unchecked() }
     }
 
-    /// Checks if this smart pointer points to a live object (read description!).
-    ///
-    /// Using this method is often indicative of bad design -- you should dispose of your pointers once an object is
-    /// destroyed. However, this method exists because GDScript offers it and there may be **rare** use cases.
-    ///
-    /// Do not use this method to check if you can safely access an object. Accessing dead objects is generally safe
-    /// and will panic in a defined manner. Encountering such panics is almost always a bug you should fix, and not a
-    /// runtime condition to check against.
+    /// Checks if this smart pointer points to a live object.
     pub fn is_instance_valid(&self) -> bool {
         self.raw.is_instance_valid()
     }
@@ -383,8 +376,12 @@ impl<T: GodotClass> Gd<T> {
     where
         Derived: GodotClass + Inherits<T>,
     {
-        // Separate method due to more restrictive bounds.
-        self.owned_cast()
+	    if self.is_instance_valid() {
+		    // Separate method due to more restrictive bounds.
+		    self.owned_cast()
+	    } else {
+		    Err(self)
+	    }
     }
 
     /// ⚠️ **Downcast:** convert into a smart pointer to a derived class. Panics on error.
@@ -515,7 +512,6 @@ where
     /// example to the node tree in case of nodes.
     ///
     /// # Panics
-    /// - When the referred-to object has already been destroyed.
     /// - When this is invoked on an upcast `Gd<Object>` that dynamically points to a reference-counted type (i.e. operation not supported).
     /// - When the object is bound by an ongoing `bind()` or `bind_mut()` call (through a separate `Gd` pointer).
     pub fn free(self) {
@@ -536,13 +532,17 @@ where
                 panic!("{}", msg);
             }
         };
+	    
+	    if !self.is_instance_valid() {
+		    return;
+	    }
 
         // TODO disallow for singletons, either only at runtime or both at compile time (new memory policy) and runtime
         use bounds::Declarer;
 
         // Runtime check in case of T=Object, no-op otherwise
-        let ref_counted =
-            <<T as Bounds>::DynMemory as bounds::DynMemory>::is_ref_counted(&self.raw);
+        let ref_counted = <<T as Bounds>::DynMemory as bounds::DynMemory>::is_ref_counted(&self.raw);
+	    
         if ref_counted == Some(true) {
             return error_or_panic(format!(
                 "Called free() on Gd<Object> which points to a RefCounted dynamic type; free() only supported for manually managed types\n\
@@ -551,8 +551,8 @@ where
         }
 
         // If ref_counted returned None, that means the instance was destroyed
-        if ref_counted != Some(false) || !self.is_instance_valid() {
-            return error_or_panic("called free() on already destroyed object".to_string());
+        if ref_counted != Some(false) {
+            return;
         }
 
         // If the object is still alive, make sure the dynamic type matches. Necessary because subsequent checks may rely on the
@@ -677,12 +677,10 @@ impl<T: GodotClass> GodotConvert for Gd<T> {
 
 impl<T: GodotClass> ToGodot for Gd<T> {
     fn to_godot(&self) -> Self::Via {
-        self.raw.check_rtti("to_godot");
         self.clone()
     }
 
     fn into_godot(self) -> Self::Via {
-        self.raw.check_rtti("into_godot");
         self
     }
 }
@@ -712,7 +710,7 @@ impl<T: GodotClass> GodotType for Gd<T> {
         }
     }
 
-    fn class_name() -> crate::meta::ClassName {
+    fn class_name() -> ClassName {
         T::class_name()
     }
 
@@ -835,13 +833,15 @@ where
 // Trait impls Property, Export and TypeStringHint for Option<Gd<T>> are covered by blanket impl for Option<T>
 
 impl<T: GodotClass> PartialEq for Gd<T> {
-    /// ⚠️ Returns whether two `Gd` pointers point to the same object.
-    ///
-    /// # Panics
-    /// When `self` or `other` is dead.
+    /// Returns whether two `Gd` pointers point to the same object (dead or alive).
     fn eq(&self, other: &Self) -> bool {
-        // Panics when one is dead
-        self.instance_id() == other.instance_id()
+	    let Some(a) = self.raw.cached_rtti()
+	    else { return false };
+
+	    let Some(b) = other.raw.cached_rtti()
+	    else { return false };
+	    
+	    a.instance_id() == b.instance_id()
     }
 }
 
@@ -860,12 +860,9 @@ impl<T: GodotClass> Debug for Gd<T> {
 }
 
 impl<T: GodotClass> std::hash::Hash for Gd<T> {
-    /// ⚠️ Hashes this object based on its instance ID.
-    ///
-    /// # Panics
-    /// When `self` is dead.
+    /// Hashes this object based on its instance ID.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.instance_id().hash(state);
+        self.instance_id_unchecked().hash(state);
     }
 }
 
