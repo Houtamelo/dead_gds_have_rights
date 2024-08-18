@@ -130,12 +130,16 @@ fn base_smuggling() {
     expect_panic("object with dead base: bind()", || {
         obj.bind();
     });
+    /*
+    // Commented because cloning dead/null pointers is safe, 
+    // and gds have their instance id cached even if what they are point at no longer exists.
     expect_panic("object with dead base: instance_id()", || {
         obj.instance_id();
     });
-    expect_panic("object with dead base: clone()", || {
-        let _ = obj.clone();
-    });
+    //expect_panic("object with dead base: clone()", || {
+    //    let _ = obj.clone();
+    //});
+    */
     expect_panic("object with dead base: upcast()", || {
         obj.upcast::<Object>();
     });

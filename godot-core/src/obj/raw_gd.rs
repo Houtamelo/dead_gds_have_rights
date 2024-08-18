@@ -39,6 +39,10 @@ pub struct RawGd<T: GodotClass> {
 }
 
 impl<T: GodotClass> RawGd<T> {
+    pub(super) fn cached_rtti(&self) -> Option<&ObjectRtti> {
+        self.cached_rtti.as_ref()
+    }
+
     /// Initializes this `RawGd<T>` from the object pointer as a **weak ref**, meaning it does not
     /// initialize/increment the reference counter.
     ///
@@ -662,7 +666,7 @@ impl<T: GodotClass> Clone for RawGd<T> {
     fn clone(&self) -> Self {
         out!("RawGd::clone");
 
-        if self.is_null() {
+        if self.is_null() || !self.is_instance_valid() {
             Self::null()
         } else {
             self.check_rtti("clone");

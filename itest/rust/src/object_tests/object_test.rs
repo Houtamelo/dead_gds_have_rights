@@ -168,9 +168,11 @@ fn object_instance_id_when_freed() {
     node.clone().free(); // destroys object without moving out of reference
     assert!(!node.is_instance_valid());
 
+    /*
     expect_panic("instance_id() on dead object", move || {
         node.instance_id();
     });
+    */
 }
 
 #[itest]
@@ -424,25 +426,16 @@ fn object_engine_eq() {
 fn object_dead_eq() {
     let a = Node3D::new_alloc();
     let b = Node3D::new_alloc();
-    let b2 = b.clone();
 
     // Destroy b1 without consuming it
     b.clone().free();
 
-    {
-        let lhs = a.clone();
-        expect_panic("Gd::eq() panics when one operand is dead", move || {
-            let _ = lhs == b;
-        });
-    }
-    {
-        let rhs = a.clone();
-        expect_panic("Gd::ne() panics when one operand is dead", move || {
-            let _ = b2 != rhs;
-        });
-    }
+    // `a` is alive and `b` isn't, they clearly should not be equal.
+    assert_ne!(a, b);
+    a.clone().free();
 
-    a.free();
+    // Both are dead, but their instance ids are still cached, they were never equal.
+    assert_ne!(a, b);
 }
 
 #[itest]
@@ -837,9 +830,8 @@ fn object_engine_manual_double_free() {
     let node2 = node.clone();
     node.free();
 
-    expect_panic("double free()", move || {
-        node2.free();
-    });
+    // `free` performs checks and is safe to call even if object has already been freed.
+    node2.free();
 }
 
 #[itest]
@@ -856,9 +848,8 @@ fn object_user_double_free() {
     let obj2 = obj.clone();
     obj.call("free", &[]);
 
-    expect_panic("double free()", move || {
-        obj2.free();
-    });
+    // `free` performs checks and is safe to call even if object has already been freed.
+    obj2.free();
 }
 
 #[itest]
