@@ -678,7 +678,7 @@ mod custom_callable {
     // 4.2+ custom callables - helper functions
 
     fn add_remove_child(ctx: &TestContext, node: &mut Gd<Node>) {
-        let mut tree = ctx.scene_tree.clone();
+        let mut tree = ctx.scene_tree;
         tree.add_child(&*node);
         tree.remove_child(&*node);
     }

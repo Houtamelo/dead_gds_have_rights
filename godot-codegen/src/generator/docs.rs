@@ -65,7 +65,7 @@ pub fn make_class_doc(
     let trait_name = class_name.virtual_trait_name();
 
     let notes = special_cases::get_class_extra_docs(class_name)
-        .map(|notes| format!("# Specific notes for this class\n\n{}", notes))
+        .map(|notes| format!("# Specific notes for this class\n\n{notes}"))
         .unwrap_or_default();
 
     format!(
@@ -92,7 +92,7 @@ pub fn make_virtual_trait_doc(trait_name_str: &str, class_name: &TyName) -> Stri
     );
 
     let notes = special_cases::get_interface_extra_docs(trait_name_str)
-        .map(|notes| format!("# Specific notes for this interface\n\n{}", notes))
+        .map(|notes| format!("# Specific notes for this interface\n\n{notes}"))
         .unwrap_or_default();
 
     format!(

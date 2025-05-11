@@ -304,7 +304,7 @@ fn variant_equal() {
 #[itest]
 fn variant_call() {
     let node2d = Node2D::new_alloc();
-    let variant = Variant::from(node2d.clone());
+    let variant = Variant::from(node2d);
 
     // Object
     let position = Vector2::new(4.0, 5.0);

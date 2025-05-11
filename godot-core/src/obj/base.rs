@@ -9,6 +9,7 @@ use crate::obj::{Gd, GodotClass};
 use crate::{classes, sys};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 
 /// Restricted version of `Gd`, to hold the base instance inside a user's `GodotClass`.
 ///
@@ -34,6 +35,26 @@ pub struct Base<T: GodotClass> {
     // 1.   Gd<T>  -- triggers InstanceStorage destruction
     // 2.
     obj: ManuallyDrop<Gd<T>>,
+}
+
+impl<T: GodotClass> Deref for Base<T>
+where
+    Gd<T>: Deref<Target = T>,
+{
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.obj
+    }
+}
+
+impl<T: GodotClass> DerefMut for Base<T>
+where
+    Gd<T>: DerefMut<Target = T>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.obj
+    }
 }
 
 impl<T: GodotClass> Base<T> {

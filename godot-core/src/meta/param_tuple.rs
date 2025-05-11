@@ -47,6 +47,7 @@ pub trait InParamTuple: ParamTuple {
     ///
     /// - `args_ptr` must be a pointer to an array of length [`Self::LEN`](ParamTuple::LEN)
     /// - Each element of `args_ptr` must be reborrowable as a `&Variant` with a lifetime that lasts for the duration of the call.
+    #[allow(clippy::result_large_err)]
     unsafe fn from_varcall_args(
         args_ptr: *const sys::GDExtensionConstVariantPtr,
         call_ctx: &CallContext,

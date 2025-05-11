@@ -358,9 +358,10 @@ where
     }
 }
 
-impl<T, D> DynGd<T, D>
+impl<T, D, B> DynGd<T, D>
 where
-    T: GodotClass + Bounds<Memory = bounds::MemManual>,
+    B: GodotClass,
+    T: GodotClass + Bounds<Memory = bounds::MemManual<B>>,
     D: ?Sized + 'static,
 {
     /// Destroy the manually-managed Godot object.

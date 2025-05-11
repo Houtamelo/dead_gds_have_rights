@@ -62,6 +62,7 @@ impl<Params: InParamTuple, Ret: ToGodot> Signature<Params, Ret> {
     ///
     /// A call to this function must be caused by Godot making a varcall with parameters `Params` and return type `Ret`.
     #[inline]
+    #[allow(clippy::result_large_err)]
     pub unsafe fn in_varcall(
         instance_ptr: sys::GDExtensionClassInstancePtr,
         call_ctx: &CallContext,
@@ -127,6 +128,7 @@ impl<Params: OutParamTuple, Ret: FromGodot> Signature<Params, Ret> {
     /// - `object_ptr` must be a live instance of a class with the type expected by `method_bind`
     /// - `method_bind` must expect explicit args `args`, varargs `varargs`, and return a value of type `Ret`
     #[inline]
+    #[allow(clippy::result_large_err)]
     pub unsafe fn out_class_varcall(
         method_bind: sys::ClassMethodBind,
         // Separate parameters to reduce tokens in generated class API.

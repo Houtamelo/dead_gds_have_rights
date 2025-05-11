@@ -60,7 +60,7 @@ fn oneditor_no_panic_on_ready() {
     obj.bind_mut().some_primitive.init(64);
     obj.notify(NodeNotification::READY);
     assert!(obj.bind().was_ready_run);
-    obj.bind_mut().node_field.clone().free();
+    obj.bind_mut().node_field.free();
     obj.free();
 }
 

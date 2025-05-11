@@ -214,6 +214,7 @@ pub(super) unsafe fn ptrcall_arg<P: FromGodot, const N: isize>(
 /// # Safety
 ///
 /// - It must be safe to reborrow `arg` as a `&Variant` with a lifetime that lasts for the duration of the call.
+#[allow(clippy::result_large_err)]
 pub(super) unsafe fn varcall_arg<P: FromGodot>(
     arg: sys::GDExtensionConstVariantPtr,
     call_ctx: &CallContext,

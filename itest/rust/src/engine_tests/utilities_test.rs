@@ -85,7 +85,7 @@ fn utilities_max() {
 #[itest]
 fn utilities_is_instance_valid() {
     let node = Node3D::new_alloc();
-    let variant = Variant::from(node.clone());
+    let variant = Variant::from(node);
     assert!(is_instance_valid(variant.clone()));
 
     node.free();

@@ -242,7 +242,7 @@ impl<'a> Context<'a> {
         *self
             .method_table_indices
             .get(key)
-            .unwrap_or_else(|| panic!("did not register table index for key {:?}", key))
+            .unwrap_or_else(|| panic!("did not register table index for key {key:?}"))
     }
 
     /// Checks if this is a builtin type (not `Object`).

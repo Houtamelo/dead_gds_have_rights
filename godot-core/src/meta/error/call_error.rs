@@ -108,6 +108,7 @@ impl CallError {
     // Constructors returning Result<(), Self>; possible failure
 
     /// Checks whether number of arguments matches the number of parameters.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn check_arg_count(
         call_ctx: &CallContext,
         arg_count: usize,
@@ -124,6 +125,7 @@ impl CallError {
     }
 
     /// Checks the Godot side of a varcall (low-level `sys::GDExtensionCallError`).
+    #[allow(clippy::result_large_err)]
     pub(crate) fn check_out_varcall<T: ToGodot>(
         call_ctx: &CallContext,
         err: sys::GDExtensionCallError,
@@ -322,7 +324,7 @@ impl CallError {
             call_expr: format!("{call_ctx}()"),
             reason: reason.into(),
             source: source.map(|e| SourceError::Convert {
-                value: e.value().map_or_else(String::new, |v| format!("{:?}", v)),
+                value: e.value().map_or_else(String::new, |v| format!("{v:?}")),
                 erased_error: e.into(),
             }),
         }

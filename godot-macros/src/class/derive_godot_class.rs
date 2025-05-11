@@ -89,6 +89,20 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
                     &self.#name
                 }
             }
+
+            impl ::std::ops::Deref for #class_name {
+                type Target = #base_class;
+
+                fn deref(&self) -> &Self::Target {
+                    &self.#name
+                }
+            }
+
+            impl ::std::ops::DerefMut for #class_name {
+                fn deref_mut(&mut self) -> &mut Self::Target {
+                    &mut self.#name
+                }
+            }
         }
     } else {
         TokenStream::new()
@@ -721,7 +735,7 @@ fn handle_opposite_keys(
     key: &str,
     attribute: &str,
 ) -> ParseResult<Option<bool>> {
-    let antikey = format!("no_{}", key);
+    let antikey = format!("no_{key}");
     let result = handle_mutually_exclusive_keys(parser, attribute, &[key, &antikey])?;
 
     if let Some(idx) = result {

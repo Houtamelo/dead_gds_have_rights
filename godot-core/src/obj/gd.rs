@@ -103,6 +103,8 @@ pub struct Gd<T: GodotClass> {
     pub(crate) raw: RawGd<T>,
 }
 
+impl<T: GodotClass> Copy for Gd<T> where RawGd<T>: Copy {}
+
 // Size equality check (should additionally be covered by mem::transmute())
 static_assert_eq_size_align!(
     sys::GDExtensionObjectPtr,
@@ -243,9 +245,9 @@ impl<T: GodotClass> Gd<T> {
     }
 
     /// Returns Godot's instance ID of this object.
-    /// 
+    ///
     /// - If this object is dead, returns the cached instance ID instead.
-    /// - Does not panic. 
+    /// - Does not panic.
     pub fn instance_id(&self) -> InstanceId {
         let instance_id = self.raw.instance_id_unchecked();
 
@@ -560,9 +562,9 @@ impl<T: GodotClass> Gd<T> {
 
 /// _The methods in this impl block are only available for objects `T` that are manually managed,
 /// i.e. anything that is not `RefCounted` or inherited from it._ <br><br>
-impl<T> Gd<T>
+impl<T, B: GodotClass> Gd<T>
 where
-    T: GodotClass + Bounds<Memory = bounds::MemManual>,
+    T: GodotClass + Bounds<Memory = bounds::MemManual<B>>,
 {
     /// Destroy the manually-managed Godot object.
     ///
@@ -605,7 +607,7 @@ where
 
         // Runtime check in case of T=Object, no-op otherwise
         let ref_counted =
-            <<T as Bounds>::DynMemory as bounds::DynMemory>::is_ref_counted(&self.raw);
+            <<T as Bounds>::DynMemory as bounds::DynMemory>::is_ref_counted(self.raw.cached_rtti());
 
         if ref_counted == Some(true) {
             return error_or_panic(format!(
@@ -650,9 +652,9 @@ where
 
 /// _The methods in this impl block are only available for objects `T` that are reference-counted,
 /// i.e. anything that inherits `RefCounted`._ <br><br>
-impl<T> Gd<T>
+impl<T, B: GodotClass> Gd<T>
 where
-    T: GodotClass + Bounds<Memory = bounds::MemRefCounted>,
+    T: GodotClass + Bounds<Memory = bounds::MemRefCounted<B>>,
 {
     /// Makes sure that `self` does not share references with other `Gd` instances.
     ///
@@ -678,7 +680,7 @@ where
     pub fn try_to_unique(self) -> Result<Self, (Self, usize)> {
         use crate::obj::bounds::DynMemory as _;
 
-        match <T as Bounds>::DynMemory::get_ref_count(&self.raw) {
+        match <T as Bounds>::DynMemory::get_ref_count(self.raw.obj(), self.raw.cached_rtti()) {
             Some(1) => Ok(self),
             Some(ref_count) => Err((self, ref_count)),
             None => unreachable!(),
@@ -894,9 +896,9 @@ impl<T: GodotClass> ParamType for Option<Gd<T>> {
     }
 }
 
-impl<T> Default for Gd<T>
+impl<T, B: GodotClass> Default for Gd<T>
 where
-    T: cap::GodotDefault + Bounds<Memory = bounds::MemRefCounted>,
+    T: cap::GodotDefault + Bounds<Memory = bounds::MemRefCounted<B>>,
 {
     /// Creates a default-constructed `T` inside a smart pointer.
     ///

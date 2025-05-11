@@ -4,8 +4,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-
 use crate::framework::{expect_panic, itest};
+use godot::builtin::math::ApproxEq;
 use godot::prelude::*;
 
 #[itest(skip)]
@@ -131,7 +131,7 @@ fn base_smuggling() {
         obj.bind();
     });
     /*
-    // Commented because cloning dead/null pointers is safe, 
+    // Commented because cloning dead/null pointers is safe,
     // and gds have their instance id cached even if what they are point at no longer exists.
     expect_panic("object with dead base: instance_id()", || {
         obj.instance_id();
@@ -179,6 +179,17 @@ fn base_swapping() {
 
     one.free();
     two.free();
+}
+
+// Test that classes that implement `WithBaseField` can deref/deref_mut directly into the `base` class.
+#[itest]
+fn base_deref() {
+    let mut based = Based::new_alloc();
+    let position = Vector2::new(1.0, 2.0);
+    based.set_position(position);
+    assert!(position.approx_eq(&based.get_position()));
+
+    based.free();
 }
 
 fn create_object_with_extracted_base() -> (Gd<Baseless>, Base<Node2D>) {

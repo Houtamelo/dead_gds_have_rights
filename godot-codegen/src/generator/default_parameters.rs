@@ -29,7 +29,8 @@ pub fn make_function_definition_with_defaults(
 
     let simple_fn_name = safe_ident(sig.name());
     let extended_fn_name = format_ident!("{}_ex", simple_fn_name);
-    let default_parameter_usage = format!("To set the default parameters, use [`Self::{}`] and its builder methods.  See [the book](https://godot-rust.github.io/book/godot-api/functions.html#default-parameters) for detailed usage instructions.", extended_fn_name);
+    let default_parameter_usage = format!("To set the default parameters, use [`Self::{extended_fn_name}`] and its builder methods. \
+     See [the book](https://godot-rust.github.io/book/godot-api/functions.html#default-parameters) for detailed usage instructions.");
     let vis = functions_common::make_vis(sig.is_private());
 
     let (builder_doc, surround_class_prefix) = make_extender_doc(sig, &extended_fn_name);
@@ -187,19 +188,14 @@ fn make_extender_doc(sig: &dyn Function, extended_fn_name: &Ident) -> (String, T
     match sig.surrounding_class() {
         Some(TyName { rust_ty, .. }) => {
             surround_class_prefix = quote! { re_export::#rust_ty:: };
-            builder_doc = format!(
-                "Default-param extender for [`{class}::{method}`][super::{class}::{method}].",
-                class = rust_ty,
-                method = extended_fn_name,
-            );
+            builder_doc = format!("Default-param extender for [`{rust_ty}::{extended_fn_name}`][super::{rust_ty}::{extended_fn_name}].");
         }
         None => {
             // There are currently no default parameters for utility functions
             // -> this is currently dead code, but _should_ work if Godot ever adds them.
             surround_class_prefix = TokenStream::new();
             builder_doc = format!(
-                "Default-param extender for [`{function}`][super::{function}].",
-                function = extended_fn_name
+                "Default-param extender for [`{extended_fn_name}`][super::{extended_fn_name}]."
             );
         }
     };

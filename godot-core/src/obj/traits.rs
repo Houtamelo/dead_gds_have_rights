@@ -78,8 +78,8 @@ impl GodotClass for NoBase {
 }
 
 unsafe impl Bounds for NoBase {
-    type Memory = bounds::MemManual;
-    type DynMemory = bounds::MemManual;
+    type Memory = bounds::MemManual<Self>;
+    type DynMemory = bounds::MemManual<Self>;
     type Declarer = bounds::DeclEngine;
     type Exportable = bounds::No;
 }
@@ -524,9 +524,9 @@ pub trait NewGd: GodotClass {
     fn new_gd() -> Gd<Self>;
 }
 
-impl<T> NewGd for T
+impl<T, B: GodotClass> NewGd for T
 where
-    T: cap::GodotDefault + Bounds<Memory = bounds::MemRefCounted>,
+    T: cap::GodotDefault + Bounds<Memory = bounds::MemRefCounted<B>>,
 {
     fn new_gd() -> Gd<Self> {
         Gd::default()
@@ -546,9 +546,9 @@ pub trait NewAlloc: GodotClass {
     fn new_alloc() -> Gd<Self>;
 }
 
-impl<T> NewAlloc for T
+impl<T, B: GodotClass> NewAlloc for T
 where
-    T: cap::GodotDefault + Bounds<Memory = bounds::MemManual>,
+    T: cap::GodotDefault + Bounds<Memory = bounds::MemManual<B>>,
 {
     fn new_alloc() -> Gd<Self> {
         use crate::obj::bounds::Declarer as _;

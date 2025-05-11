@@ -53,7 +53,7 @@ fn node_get_node_fail() {
 
 #[itest]
 fn node_path_from_str(ctx: &TestContext) {
-    let child = ctx.scene_tree.clone();
+    let child = ctx.scene_tree;
     assert_eq!(
         child.get_path().to_string(),
         NodePath::from_str("/root/TestRunner").unwrap().to_string()
@@ -86,7 +86,7 @@ fn node_scene_tree() {
 
 #[itest]
 fn node_call_group(ctx: &TestContext) {
-    let mut node = ctx.scene_tree.clone();
+    let mut node = ctx.scene_tree;
     let mut tree = node.get_tree().unwrap();
 
     node.add_to_group("group");

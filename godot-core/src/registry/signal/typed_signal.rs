@@ -132,11 +132,12 @@ impl<'c, C: WithSignals, Ps: meta::ParamTuple> TypedSignal<'c, C, Ps> {
     /// type state builder for simple + common connections, thus hopefully being a tiny bit lighter on compile times.
     fn inner_connect_godot_fn<F>(
         &self,
+        flags: Option<ConnectFlags>,
         godot_fn: impl FnMut(&[&Variant]) -> Result<Variant, ()> + 'static,
     ) {
         let callable_name = make_callable_name::<F>();
         let callable = Callable::from_local_fn(&callable_name, godot_fn);
-        self.inner_connect_untyped(&callable, None);
+        self.inner_connect_untyped(&callable, flags);
     }
 
     /// Connect an untyped callable, with optional flags.
@@ -187,7 +188,7 @@ macro_rules! impl_signal_connect {
                     function($($args),*);
                 });
 
-                self.inner_connect_godot_fn::<F>(godot_fn);
+                self.inner_connect_godot_fn::<F>(None, godot_fn);
             }
 
             /// Connect a method (member function) with `&mut self` as the first parameter.
@@ -206,7 +207,7 @@ macro_rules! impl_signal_connect {
                     function(target_mut, $($args),*);
                 });
 
-                self.inner_connect_godot_fn::<F>(godot_fn);
+                self.inner_connect_godot_fn::<F>(None, godot_fn);
             }
 
             /// Connect a method (member function) with any `&mut OtherC` as the first parameter, where
@@ -234,7 +235,79 @@ macro_rules! impl_signal_connect {
                     method(target_mut, $($args),*);
                 });
 
-                self.inner_connect_godot_fn::<F>(godot_fn);
+                self.inner_connect_godot_fn::<F>(None, godot_fn);
+            }
+
+            /// Connect a non-member function (global function, associated function or closure).
+            ///
+            /// Example usages:
+            /// ```ignore
+            /// sig.connect(Self::static_func);
+            /// sig.connect(global_func);
+            /// sig.connect(|arg| { /* closure */ });
+            /// ```
+            ///
+            /// - To connect to a method on the object that owns this signal, use [`connect_self()`][Self::connect_self].
+            /// - If you need [`connect flags`](ConnectFlags) (other than [`DEFERRED`](ConnectFlags::DEFERRED))
+            ///   or cross-thread signals, use [`connect_builder()`][Self::connect_builder].
+            pub fn connect_deferred<F, R>(&self, mut function: F)
+            where
+                F: FnMut($($Ps),*) -> R + 'static,
+            {
+                let godot_fn = make_godot_fn(move |($($args,)*):($($Ps,)*)| {
+                    function($($args),*);
+                });
+
+                self.inner_connect_godot_fn::<F>(Some(ConnectFlags::DEFERRED), godot_fn);
+            }
+
+            /// Connect a method (member function) with `&mut self` as the first parameter.
+            ///
+            /// - To connect to methods on other objects, use [`connect_other()`][Self::connect_other].
+            /// - If you need [`connect flags`](ConnectFlags) (other than [`DEFERRED`](ConnectFlags::DEFERRED))
+            ///   or cross-thread signals, use [`connect_builder()`][Self::connect_builder].
+            pub fn connect_self_deferred<F, R, Decl>(&self, mut function: F)
+            where
+                F: FnMut(&mut C, $($Ps),*) -> R + 'static,
+                C: GodotDeref<Decl>,
+            {
+                let mut gd = self.receiver_object();
+                let godot_fn = make_godot_fn(move |($($args,)*):($($Ps,)*)| {
+                    let mut target = C::get_mut(&mut gd);
+                    let target_mut = target.deref_mut();
+                    function(target_mut, $($args),*);
+                });
+
+                self.inner_connect_godot_fn::<F>(Some(ConnectFlags::DEFERRED), godot_fn);
+            }
+
+            /// Connect a method (member function) with any `&mut OtherC` as the first parameter, where
+            /// `OtherC`: [`GodotClass`](GodotClass) (both user and engine classes are accepted).
+            ///
+            /// The parameter `object` can be of 2 different "categories":
+            /// - Any `&Gd<OtherC>` (e.g.: `&Gd<Node>`, `&Gd<CustomUserClass>`).
+            /// - `&OtherC`, as long as `OtherC` is a user class that contains a `base` field (it implements the
+            ///   [`WithBaseField`](WithBaseField) trait).
+            ///
+            /// ---
+            ///
+            /// - To connect to methods on the object that owns this signal, use [`connect_self()`][Self::connect_self].
+            /// - If you need [`connect flags`](ConnectFlags) (other than [`DEFERRED`](ConnectFlags::DEFERRED))
+            ///   or cross-thread signals, use [`connect_builder()`][Self::connect_builder].
+            pub fn connect_other_deferred<F, R, OtherC, Decl>(&self, object: &impl ToSignalObj<OtherC>, mut method: F)
+            where
+                F: FnMut(&mut OtherC, $($Ps),*) -> R + 'static,
+                OtherC: GodotDeref<Decl>,
+            {
+                let mut gd = object.to_signal_obj();
+
+                let godot_fn = make_godot_fn(move |($($args,)*):($($Ps,)*)| {
+                    let mut target = OtherC::get_mut(&mut gd);
+                    let target_mut = target.deref_mut();
+                    method(target_mut, $($args),*);
+                });
+
+                self.inner_connect_godot_fn::<F>(Some(ConnectFlags::DEFERRED), godot_fn);
             }
         }
     };

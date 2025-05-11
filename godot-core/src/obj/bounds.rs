@@ -39,7 +39,7 @@
 //! use godot::obj::{bounds, Bounds};
 //!
 //! struct MyGd<T>
-//! where T: GodotClass + Bounds<Memory = bounds::MemManual>
+//! where T: GodotClass + Bounds<Memory = bounds::MemManual<T>>
 //! {
 //!    inner: Gd<T>,
 //! }
@@ -48,9 +48,10 @@
 // Note that depending on if you want to exclude `Object`, you should use `DynMemory` instead of `Memory`.
 
 use crate::obj::cap::GodotDefault;
-use crate::obj::{Bounds, Gd, GodotClass, RawGd};
+use crate::obj::{Bounds, Gd, GodotClass, InstanceId, RawGd};
 use crate::storage::{InstanceCache, Storage};
-use crate::{out, sys};
+use crate::{classes, out, sys};
+use godot_ffi::{interface_fn, GodotNullableFfi};
 use private::Sealed;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -108,7 +109,7 @@ pub(super) mod private {
     ///
     /// This is only necessary if you do not use the proc-macro API.
     ///
-    /// Since `Bounds` is a supertrait of [`GodotClass`][crate::obj::GodotClass], you cannot accidentally forget to implement it.
+    /// Since `Bounds` is a super-trait of [`GodotClass`][crate::obj::GodotClass], you cannot accidentally forget to implement it.
     ///
     /// # Example
     /// ```no_run
@@ -147,7 +148,8 @@ pub(super) mod private {
 // Macro re-exports
 
 pub use crate::implement_godot_bounds;
-
+use crate::meta::CallContext;
+use crate::private::ObjectRtti;
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Memory bounds
 
@@ -158,38 +160,23 @@ pub trait Memory: Sealed {}
 ///
 /// For `Gd<Object>`, it is determined at runtime whether the instance is manually managed or ref-counted.
 #[doc(hidden)]
-pub trait DynMemory: Sealed {
-    /// Initialize reference counter
+pub trait DynMemory: Sealed + Clone {
+    type TSelf: GodotClass;
+
     #[doc(hidden)]
-    fn maybe_init_ref<T: GodotClass>(obj: &mut RawGd<T>);
+    fn maybe_init_ref(obj: *mut Self::TSelf, cached_rtti: Option<ObjectRtti>);
 
     /// If ref-counted, then increment count
     #[doc(hidden)]
-    fn maybe_inc_ref<T: GodotClass>(obj: &mut RawGd<T>);
-
-    /// If ref-counted, then decrement count. Returns `true` if the count hit 0 and the object can be
-    /// safely freed.
-    ///
-    /// This behavior can be overriden by a script, making it possible for the function to return `false`
-    /// even when the reference count hits 0. This is meant to be used to have a separate reference count
-    /// from Godot's internal reference count, or otherwise stop the object from being freed when the
-    /// reference count hits 0.
-    ///
-    /// # Safety
-    ///
-    /// If this method is used on a [`Gd`] that inherits from [`RefCounted`](crate::classes::RefCounted)
-    /// then the reference count must either be incremented before it hits 0, or some [`Gd`] referencing
-    /// this object must be forgotten.
-    #[doc(hidden)]
-    unsafe fn maybe_dec_ref<T: GodotClass>(obj: &mut RawGd<T>) -> bool;
+    fn maybe_inc_ref(obj: &mut RawGd<Self::TSelf>);
 
     /// Check if ref-counted, return `None` if information is not available (dynamic and obj dead)
     #[doc(hidden)]
-    fn is_ref_counted<T: GodotClass>(obj: &RawGd<T>) -> Option<bool>;
+    fn is_ref_counted(rtti: Option<ObjectRtti>) -> Option<bool>;
 
     /// Return the reference count, or `None` if the object is dead or manually managed.
     #[doc(hidden)]
-    fn get_ref_count<T: GodotClass>(obj: &RawGd<T>) -> Option<usize>;
+    fn get_ref_count(obj: *mut Self::TSelf, rtti: Option<ObjectRtti>) -> Option<usize>;
 
     /// Returns `true` if argument and return pointers are passed as `Ref<T>` pointers given this
     /// [`PtrcallType`].
@@ -199,20 +186,42 @@ pub trait DynMemory: Sealed {
     fn pass_as_ref(_call_type: sys::PtrcallType) -> bool {
         false
     }
+
+    fn new(obj: *mut Self::TSelf, cached_rtti: Option<ObjectRtti>) -> Self;
+    fn cached_rtti(&self) -> Option<ObjectRtti>;
+    fn obj(&self) -> *mut Self::TSelf;
 }
 
 /// Memory managed through Godot reference counter (always present).
 /// This is used for `RefCounted` classes and derived.
-pub struct MemRefCounted {}
-impl Sealed for MemRefCounted {}
-impl Memory for MemRefCounted {}
-impl DynMemory for MemRefCounted {
-    fn maybe_init_ref<T: GodotClass>(obj: &mut RawGd<T>) {
+#[repr(C)]
+pub struct MemRefCounted<T: GodotClass> {
+    pub(super) obj: *mut T,
+    // Must not be changed after initialization.
+    cached_rtti: Option<ObjectRtti>,
+}
+
+impl<T: GodotClass> Clone for MemRefCounted<T> {
+    fn clone(&self) -> Self {
+        Self {
+            obj: self.obj,
+            cached_rtti: self.cached_rtti,
+        }
+    }
+}
+
+impl<T: GodotClass> Sealed for MemRefCounted<T> {}
+impl<T: GodotClass> Memory for MemRefCounted<T> {}
+impl<T: GodotClass> DynMemory for MemRefCounted<T> {
+    type TSelf = T;
+
+    fn maybe_init_ref(obj: *mut T, cached_rtti: Option<ObjectRtti>) {
         out!("  MemRefc::init  <{}>", std::any::type_name::<T>());
-        if obj.is_null() {
+        if gd_is_null(obj, cached_rtti) {
             return;
         }
-        obj.with_ref_counted(|refc| {
+
+        with_ref_counted(obj, cached_rtti, |refc| {
             let success = refc.init_ref();
             assert!(success, "init_ref() failed");
         });
@@ -225,7 +234,7 @@ impl DynMemory for MemRefCounted {
         assert!(success, "init_ref() failed");*/
     }
 
-    fn maybe_inc_ref<T: GodotClass>(obj: &mut RawGd<T>) {
+    fn maybe_inc_ref(obj: &mut RawGd<T>) {
         out!("  MemRefc::inc   <{}>", std::any::type_name::<T>());
         if obj.is_null() {
             return;
@@ -236,24 +245,12 @@ impl DynMemory for MemRefCounted {
         });
     }
 
-    unsafe fn maybe_dec_ref<T: GodotClass>(obj: &mut RawGd<T>) -> bool {
-        out!("  MemRefc::dec   <{}>", std::any::type_name::<T>());
-        if obj.is_null() {
-            return false;
-        }
-        obj.with_ref_counted(|refc| {
-            let is_last = refc.unreference();
-            out!("  +-- was last={is_last}");
-            is_last
-        })
-    }
-
-    fn is_ref_counted<T: GodotClass>(_obj: &RawGd<T>) -> Option<bool> {
+    fn is_ref_counted(_rtti: Option<ObjectRtti>) -> Option<bool> {
         Some(true)
     }
 
-    fn get_ref_count<T: GodotClass>(obj: &RawGd<T>) -> Option<usize> {
-        let ref_count = obj.with_ref_counted(|refc| refc.get_reference_count());
+    fn get_ref_count(obj: *mut T, rtti: Option<ObjectRtti>) -> Option<usize> {
+        let ref_count = with_ref_counted(obj, rtti, |refc| refc.get_reference_count());
 
         // TODO find a safer cast alternative, e.g. num-traits crate with ToPrimitive (Debug) + AsPrimitive (Release).
         Some(ref_count as usize)
@@ -262,33 +259,101 @@ impl DynMemory for MemRefCounted {
     fn pass_as_ref(call_type: sys::PtrcallType) -> bool {
         matches!(call_type, sys::PtrcallType::Virtual)
     }
+
+    fn new(obj: *mut T, cached_rtti: Option<ObjectRtti>) -> Self {
+        Self { obj, cached_rtti }
+    }
+
+    fn cached_rtti(&self) -> Option<ObjectRtti> {
+        self.cached_rtti
+    }
+
+    fn obj(&self) -> *mut T {
+        self.obj
+    }
+}
+
+impl<T: GodotClass> MemRefCounted<T> {
+    unsafe fn maybe_dec_ref(obj: *mut T, rtti: Option<ObjectRtti>) -> bool {
+        out!(
+            "MemRefCounted::maybe_dec_ref   <{}>",
+            std::any::type_name::<T>()
+        );
+
+        // SAFETY: This `Gd` won't be dropped again after this.
+        // If destruction is triggered by Godot, Storage already knows about it, no need to notify it
+
+        if gd_is_null(obj, rtti) {
+            false
+        } else {
+            with_ref_counted(obj, rtti, |refc| {
+                let is_last = refc.unreference();
+                out!("  +-- was last={is_last}");
+                is_last
+            })
+        }
+    }
+}
+
+impl<T: GodotClass> Drop for MemRefCounted<T> {
+    fn drop(&mut self) {
+        out!("MemRefCounted::drop   <{}>", std::any::type_name::<T>());
+        let should_drop = unsafe { Self::maybe_dec_ref(self.obj, self.cached_rtti) };
+
+        if should_drop {
+            unsafe {
+                interface_fn!(object_destroy)(obj_sys(self.obj));
+            }
+        }
+    }
 }
 
 /// Memory managed through Godot reference counter, if present; otherwise manual.
 /// This is used only for `Object` classes.
 #[doc(hidden)]
-pub struct MemDynamic {}
-impl MemDynamic {
+#[repr(C)]
+pub struct MemDynamic<T: GodotClass> {
+    pub(super) obj: *mut T,
+    // Must not be changed after initialization.
+    cached_rtti: Option<ObjectRtti>,
+}
+
+impl<T: GodotClass> Clone for MemDynamic<T> {
+    fn clone(&self) -> Self {
+        Self {
+            obj: self.obj,
+            cached_rtti: self.cached_rtti,
+        }
+    }
+}
+
+impl<T: GodotClass> MemDynamic<T> {
     /// Check whether dynamic type is ref-counted.
-    fn inherits_refcounted<T: GodotClass>(obj: &RawGd<T>) -> bool {
+    fn inherits_refcounted(obj: &RawGd<T>) -> bool
+    where
+        T: GodotClass,
+    {
         obj.instance_id_unchecked()
             .is_some_and(|id| id.is_ref_counted())
     }
 }
-impl Sealed for MemDynamic {}
-impl DynMemory for MemDynamic {
-    fn maybe_init_ref<T: GodotClass>(obj: &mut RawGd<T>) {
+
+impl<T: GodotClass> Sealed for MemDynamic<T> {}
+impl<T: GodotClass> DynMemory for MemDynamic<T> {
+    type TSelf = T;
+
+    fn maybe_init_ref(obj: *mut T, cached_rtti: Option<ObjectRtti>) {
         out!("  MemDyn::init  <{}>", std::any::type_name::<T>());
-        if Self::inherits_refcounted(obj) {
+        if inherits_refcounted(cached_rtti) {
             // Will call `RefCounted::init_ref()` which checks for liveness.
             out!("    MemDyn -> MemRefc");
-            MemRefCounted::maybe_init_ref(obj)
+            MemRefCounted::maybe_init_ref(obj, cached_rtti)
         } else {
             out!("    MemDyn -> MemManu");
         }
     }
 
-    fn maybe_inc_ref<T: GodotClass>(obj: &mut RawGd<T>) {
+    fn maybe_inc_ref(obj: &mut RawGd<T>) {
         out!("  MemDyn::inc   <{}>", std::any::type_name::<T>());
         if Self::inherits_refcounted(obj) {
             // Will call `RefCounted::reference()` which checks for liveness.
@@ -296,49 +361,101 @@ impl DynMemory for MemDynamic {
         }
     }
 
-    unsafe fn maybe_dec_ref<T: GodotClass>(obj: &mut RawGd<T>) -> bool {
-        out!("  MemDyn::dec   <{}>", std::any::type_name::<T>());
-        if obj
-            .instance_id_unchecked()
-            .is_some_and(|id| id.is_ref_counted())
-        {
-            // Will call `RefCounted::unreference()` which checks for liveness.
-            MemRefCounted::maybe_dec_ref(obj)
+    fn is_ref_counted(rtti: Option<ObjectRtti>) -> Option<bool> {
+        // Return `None` if obj is dead
+        rtti.map(|rtti| rtti.instance_id().is_ref_counted())
+    }
+
+    fn get_ref_count(obj: *mut T, rtti: Option<ObjectRtti>) -> Option<usize> {
+        if inherits_refcounted(rtti) {
+            MemRefCounted::get_ref_count(obj, rtti)
         } else {
-            false
+            None
         }
     }
 
-    fn is_ref_counted<T: GodotClass>(obj: &RawGd<T>) -> Option<bool> {
-        // Return `None` if obj is dead
-        obj.instance_id_unchecked().map(|id| id.is_ref_counted())
+    fn new(obj: *mut T, cached_rtti: Option<ObjectRtti>) -> Self {
+        Self { obj, cached_rtti }
     }
 
-    fn get_ref_count<T: GodotClass>(obj: &RawGd<T>) -> Option<usize> {
-        if Self::inherits_refcounted(obj) {
-            MemRefCounted::get_ref_count(obj)
-        } else {
-            None
+    fn cached_rtti(&self) -> Option<ObjectRtti> {
+        self.cached_rtti
+    }
+
+    fn obj(&self) -> *mut T {
+        self.obj
+    }
+}
+
+impl<T: GodotClass> Drop for MemDynamic<T> {
+    fn drop(&mut self) {
+        out!("MemDynamic::drop   <{}>", std::any::type_name::<T>());
+
+        // SAFETY: This `Gd` won't be dropped again after this.
+        // If destruction is triggered by Godot, Storage already knows about it, no need to notify it
+        let should_drop = unsafe {
+            if self
+                .cached_rtti
+                .map(|rtti| rtti.instance_id())
+                .is_some_and(|id| id.is_ref_counted())
+            {
+                // Will call `RefCounted::unreference()` which checks for liveness.
+                MemRefCounted::maybe_dec_ref(self.obj, self.cached_rtti)
+            } else {
+                false
+            }
+        }; // may drop
+        if should_drop {
+            unsafe {
+                interface_fn!(object_destroy)(obj_sys(self.obj));
+            }
         }
     }
 }
 
 /// No memory management, user responsible for not leaking.
 /// This is used for all `Object` derivates, which are not `RefCounted`. `Object` itself is also excluded.
-pub struct MemManual {}
-impl Sealed for MemManual {}
-impl Memory for MemManual {}
-impl DynMemory for MemManual {
-    fn maybe_init_ref<T: GodotClass>(_obj: &mut RawGd<T>) {}
-    fn maybe_inc_ref<T: GodotClass>(_obj: &mut RawGd<T>) {}
-    unsafe fn maybe_dec_ref<T: GodotClass>(_obj: &mut RawGd<T>) -> bool {
-        false
+#[repr(C)]
+pub struct MemManual<T: GodotClass> {
+    pub(super) obj: *mut T,
+    // Must not be changed after initialization.
+    cached_rtti: Option<ObjectRtti>,
+}
+
+impl<T: GodotClass> Clone for MemManual<T> {
+    fn clone(&self) -> Self {
+        *self
     }
-    fn is_ref_counted<T: GodotClass>(_obj: &RawGd<T>) -> Option<bool> {
+}
+
+impl<T: GodotClass> Copy for MemManual<T> {}
+
+impl<T: GodotClass> Sealed for MemManual<T> {}
+impl<T: GodotClass> Memory for MemManual<T> {}
+impl<T: GodotClass> DynMemory for MemManual<T> {
+    type TSelf = T;
+
+    fn maybe_init_ref(_: *mut T, _: Option<ObjectRtti>) {}
+
+    fn maybe_inc_ref(_: &mut RawGd<T>) {}
+
+    fn is_ref_counted(_: Option<ObjectRtti>) -> Option<bool> {
         Some(false)
     }
-    fn get_ref_count<T: GodotClass>(_obj: &RawGd<T>) -> Option<usize> {
+    fn get_ref_count(_: *mut T, _: Option<ObjectRtti>) -> Option<usize> {
         None
+    }
+
+    fn new(obj: *mut T, cached_rtti: Option<ObjectRtti>) -> Self {
+        Self { obj, cached_rtti }
+    }
+
+    fn cached_rtti(&self) -> Option<ObjectRtti> {
+        self.cached_rtti
+    }
+
+    fn obj(&self) -> *mut T {
+        self.obj
     }
 }
 
@@ -390,8 +507,7 @@ impl Declarer for DeclEngine {
         T: GodotDefault + Bounds<Declarer = Self>,
     {
         unsafe {
-            let object_ptr =
-                sys::interface_fn!(classdb_construct_object)(T::class_name().string_sys());
+            let object_ptr = interface_fn!(classdb_construct_object)(T::class_name().string_sys());
             Gd::from_obj_sys(object_ptr)
         }
     }
@@ -434,3 +550,87 @@ impl Exportable for Yes {}
 pub enum No {}
 impl Sealed for No {}
 impl Exportable for No {}
+
+pub(crate) unsafe fn ffi_cast<T: GodotClass, U: GodotClass>(
+    obj: *mut T,
+    rtti: Option<ObjectRtti>,
+) -> Option<RawGd<U>> {
+    // `self` may be null when we convert a null-variant into a `Option<Gd<T>>`, since we use `ffi_cast`
+    // in the `ffi_from_variant` conversion function to ensure type-correctness. So the chain would be as follows:
+    // - Variant::nil()
+    // - null RawGd<Object>
+    // - null RawGd<T>
+    // - Option::<Gd<T>>::None
+    if gd_is_null(obj, rtti) {
+        // Null can be cast to anything.
+        // Forgetting a null doesn't do anything, since dropping a null also does nothing.
+        return Some(RawGd::null());
+    }
+
+    // Before Godot API calls, make sure the object is alive (and in Debug mode, of the correct type).
+    // Current design decision: EVERY cast fails on incorrect type, even if target type is correct. This avoids the risk of violated
+    // invariants that leak to the Godot implementation. Also, we do not provide a way to recover from bad types -- this is always
+    // a bug that must be solved by the user.
+    check_rtti(obj, rtti, "ffi_cast");
+
+    let class_tag = interface_fn!(classdb_get_class_tag)(U::class_name().string_sys());
+    let cast_object_ptr = interface_fn!(object_cast_to)(obj_sys(obj), class_tag);
+
+    // Create weak object, as ownership will be moved and reference-counter stays the same.
+    sys::ptr_then(cast_object_ptr, |ptr| RawGd::from_obj_sys_weak(ptr))
+}
+
+pub(crate) fn check_rtti<T: GodotClass>(
+    obj: *mut T,
+    rtti: Option<ObjectRtti>,
+    method_name: &'static str,
+) {
+    let call_ctx = CallContext::gd::<T>(method_name);
+
+    let instance_id = check_dynamic_type(obj, rtti, &call_ctx);
+    classes::ensure_object_alive(instance_id, obj_sys(obj), &call_ctx);
+}
+
+pub(crate) fn check_dynamic_type<T: GodotClass>(
+    obj: *mut T,
+    rtti: Option<ObjectRtti>,
+    _call_ctx: &CallContext<'static>,
+) -> InstanceId {
+    debug_assert!(
+        !gd_is_null(obj, rtti),
+        "{_call_ctx}: cannot call method on null object",
+    );
+
+    // SAFETY: code surrounding RawGd<T> ensures that `self` is non-null; above is just a sanity check against internal bugs.
+    let rtti = unsafe { rtti.unwrap_unchecked() };
+    rtti.check_type::<T>()
+}
+
+pub(crate) fn obj_sys<T: GodotClass>(obj: *mut T) -> sys::GDExtensionObjectPtr {
+    obj as sys::GDExtensionObjectPtr
+}
+
+pub(crate) fn with_ref_counted<T: GodotClass, R>(
+    obj: *mut T,
+    rtti: Option<ObjectRtti>,
+    apply: impl Fn(&mut classes::RefCounted) -> R,
+) -> R {
+    // Note: this previously called Declarer::scoped_mut() - however, no need to go through bind() for changes in base RefCounted.
+    // Any accesses to user objects (e.g. destruction if refc=0) would bind anyway.
+
+    let tmp = unsafe { ffi_cast::<T, classes::RefCounted>(obj, rtti) };
+    let mut tmp = tmp.expect("object expected to inherit RefCounted");
+    let return_val = apply(tmp.as_target_mut());
+
+    std::mem::forget(tmp); // no ownership transfer
+    return_val
+}
+
+pub(crate) fn gd_is_null<T>(obj: *mut T, rtti: Option<ObjectRtti>) -> bool {
+    obj.is_null() || rtti.is_none()
+}
+
+pub fn inherits_refcounted(rtti: Option<ObjectRtti>) -> bool {
+    rtti.map(|rtti| rtti.instance_id())
+        .is_some_and(|id| id.is_ref_counted())
+}
