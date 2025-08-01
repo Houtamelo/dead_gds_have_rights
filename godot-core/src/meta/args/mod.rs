@@ -16,16 +16,10 @@ mod ref_arg;
 pub use as_arg::{val_into_arg, ArgPassing, AsArg, ByRef, ByValue, ParamType};
 pub use object_arg::AsObjectArg;
 pub use ref_arg::RefArg;
+pub use cow_arg::CowArg;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Internal APIs
-
-// Solely public for itest/convert_test.rs.
-#[cfg(feature = "trace")]
-#[doc(hidden)]
-pub use cow_arg::CowArg;
-#[cfg(not(feature = "trace"))]
-pub(crate) use cow_arg::CowArg;
 
 #[allow(unused_imports)] // ObjectCow is used in generated code.
 pub(crate) use object_arg::{ObjectArg, ObjectCow, ObjectNullArg};
