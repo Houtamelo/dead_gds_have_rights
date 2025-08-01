@@ -14,9 +14,9 @@ mod ref_arg;
 // Public APIs
 
 pub use as_arg::{val_into_arg, ArgPassing, AsArg, ByRef, ByValue, ParamType};
+pub use cow_arg::CowArg;
 pub use object_arg::AsObjectArg;
 pub use ref_arg::RefArg;
-pub use cow_arg::CowArg;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Internal APIs
