@@ -1,8 +1,8 @@
 [package]
 name = "godot-bindings"
-version = "0.2.4"
+version = "0.3.4"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MPL-2.0"
 keywords = ["gamedev", "godot", "engine", "ffi", "sys"]
 categories = ["game-engines", "graphics"]
@@ -34,6 +34,7 @@ api-4-4 = []
 default = []
 
 api-custom = ["dep:bindgen", "dep:regex", "dep:which"]
+api-custom-json = ["dep:nanoserde", "dep:bindgen", "dep:regex", "dep:which"]
 api-custom-extheader = []
 
 [dependencies]
@@ -42,6 +43,8 @@ gdextension-api = { workspace = true }
 bindgen = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 which = { workspace = true, optional = true }
+# Required by `api-custom-json` to parse the extension API JSON (to get the Godot version).
+nanoserde = { workspace = true, optional = true }
 
 [dev-dependencies]
 # For tests, we need regex unconditionally.
@@ -51,7 +54,9 @@ regex = { workspace = true }
 [package.metadata.docs.rs]
 features = ["experimental-godot-api"]
 rustdoc-args = ["--cfg", "published_docs"]
+rustc-args = ["--cfg", "published_docs"]
 
-# Currently causes "unused manifest key" warnings. Maybe re-enable in the future, to make `published_docs` known.
-#[lints.rust]
-#unexpected_cfgs = { level = "warn", check-cfg = ['cfg(published_docs)'] }
+# Enabled only for godot-bindings; the others have it set via build.rs.
+# Necessary to avoid warnings in release workflow.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(published_docs)'] }

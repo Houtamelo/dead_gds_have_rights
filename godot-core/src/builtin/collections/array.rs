@@ -12,9 +12,9 @@ use crate::builtin::*;
 use crate::meta;
 use crate::meta::error::{ConvertError, FromGodotError, FromVariantError};
 use crate::meta::{
-    element_godot_type_name, element_variant_type, ArrayElement, ArrayTypeInfo, AsArg, ClassName,
-    CowArg, FromGodot, GodotConvert, GodotFfiVariant, GodotType, ParamType, PropertyHintInfo,
-    RefArg, ToGodot,
+    element_godot_type_name, element_variant_type, ArrayElement, ArrayTypeInfo, AsArg, ByRef,
+    ClassName, ExtVariantType, FromGodot, GodotConvert, GodotFfiVariant, GodotType, ParamType,
+    PropertyHintInfo, RefArg, ToGodot,
 };
 use crate::obj::{bounds, Bounds, DynGd, Gd, GodotClass};
 use crate::registry::property::{BuiltinExport, Export, Var};
@@ -675,7 +675,7 @@ impl<T: ArrayElement> Array<T> {
         // We need one dummy element of type T, because Godot's bsearch_custom() checks types (so Variant::nil() can't be passed).
         // Optimization: roundtrip Variant -> T -> Variant could be avoided, but anyone needing speed would use Rust binary search...
         let ignored_value = self.at(0);
-        let ignored_value = <T as ParamType>::owned_to_arg(ignored_value);
+        let ignored_value = meta::val_into_arg(ignored_value); //AsArg::into_arg(&ignored_value);
 
         let godot_comparator = |args: &[&Variant]| {
             let value = T::from_variant(args[0]);
@@ -910,12 +910,12 @@ impl<T: ArrayElement> Array<T> {
     /// In particular this means that all reads are fine, since all values can be converted to `Variant`. However, writes are only OK
     /// if they match the type `T`.
     #[doc(hidden)]
-    pub unsafe fn as_inner_mut(&self) -> inner::InnerArray {
+    pub unsafe fn as_inner_mut(&self) -> inner::InnerArray<'_> {
         // The memory layout of `Array<T>` does not depend on `T`.
         inner::InnerArray::from_outer_typed(self)
     }
 
-    fn as_inner(&self) -> ImmutableInnerArray {
+    fn as_inner(&self) -> ImmutableInnerArray<'_> {
         ImmutableInnerArray {
             // SAFETY: We can only read from the array.
             inner: unsafe { self.as_inner_mut() },
@@ -1110,7 +1110,7 @@ impl VariantArray {
 //   Arrays are properly initialized through a `from_sys` call, but the ref-count should be incremented
 //   as that is the callee's responsibility. Which we do by calling `std::mem::forget(array.clone())`.
 unsafe impl<T: ArrayElement> GodotFfi for Array<T> {
-    const VARIANT_TYPE: VariantType = VariantType::ARRAY;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(VariantType::ARRAY);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Opaque; .. }
 }
@@ -1118,29 +1118,8 @@ unsafe impl<T: ArrayElement> GodotFfi for Array<T> {
 // Only implement for untyped arrays; typed arrays cannot be nested in Godot.
 impl ArrayElement for VariantArray {}
 
-impl<'r, T: ArrayElement> AsArg<Array<T>> for &'r Array<T> {
-    fn into_arg<'cow>(self) -> CowArg<'cow, Array<T>>
-    where
-        'r: 'cow, // Original reference must be valid for at least as long as the returned cow.
-    {
-        CowArg::Borrowed(self)
-    }
-}
-
 impl<T: ArrayElement> ParamType for Array<T> {
-    type Arg<'v> = CowArg<'v, Self>;
-
-    fn owned_to_arg<'v>(self) -> Self::Arg<'v> {
-        CowArg::Owned(self)
-    }
-
-    fn arg_to_ref<'r>(arg: &'r Self::Arg<'_>) -> &'r Self {
-        arg.cow_as_ref()
-    }
-
-    fn arg_into_owned(arg: Self::Arg<'_>) -> Self {
-        arg.cow_into_owned()
-    }
+    type ArgPassing = ByRef;
 }
 
 impl<T: ArrayElement> GodotConvert for Array<T> {
@@ -1371,9 +1350,9 @@ impl<T: ArrayElement> GodotFfiVariant for Array<T> {
 
     fn ffi_from_variant(variant: &Variant) -> Result<Self, ConvertError> {
         // First check if the variant is an array. The array conversion shouldn't be called otherwise.
-        if variant.get_type() != Self::VARIANT_TYPE {
+        if variant.get_type() != Self::VARIANT_TYPE.variant_as_nil() {
             return Err(FromVariantError::BadType {
-                expected: Self::VARIANT_TYPE,
+                expected: Self::VARIANT_TYPE.variant_as_nil(),
                 actual: variant.get_type(),
             }
             .into_error(variant.clone()));
@@ -1436,7 +1415,7 @@ impl<T: ArrayElement + ToGodot> FromIterator<T> for Array<T> {
 }
 
 /// Extends a `Array` with the contents of an iterator.
-impl<T: ArrayElement + ToGodot> Extend<T> for Array<T> {
+impl<T: ArrayElement> Extend<T> for Array<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         // Unfortunately the GDExtension API does not offer the equivalent of `Vec::reserve`.
         // Otherwise, we could use it to pre-allocate based on `iter.size_hint()`.
@@ -1444,7 +1423,8 @@ impl<T: ArrayElement + ToGodot> Extend<T> for Array<T> {
         // A faster implementation using `resize()` and direct pointer writes might still be possible.
         // Note that this could technically also use iter(), since no moves need to happen (however Extend requires IntoIterator).
         for item in iter.into_iter() {
-            self.push(ParamType::owned_to_arg(item));
+            // self.push(AsArg::into_arg(&item));
+            self.push(meta::val_into_arg(item));
         }
     }
 }
@@ -1551,7 +1531,7 @@ impl<T: ArrayElement> PartialOrd for Array<T> {
 /// # See also
 /// To create an `Array` of variants, see the [`varray!`] macro.
 ///
-/// For dictionaries, a similar macro [`dict!`] exists.
+/// For dictionaries, a similar macro [`vdict!`] exists.
 #[macro_export]
 macro_rules! array {
     ($($elements:expr),* $(,)?) => {
@@ -1578,7 +1558,9 @@ macro_rules! array {
 /// # See also
 /// To create a typed `Array` with a single element type, see the [`array!`] macro.
 ///
-/// For dictionaries, a similar macro [`dict!`] exists.
+/// For dictionaries, a similar macro [`vdict!`] exists.
+///
+/// To construct slices of variants, use [`vslice!`].
 #[macro_export]
 macro_rules! varray {
     // Note: use to_variant() and not Variant::from(), as that works with both references and values
@@ -1590,6 +1572,49 @@ macro_rules! varray {
                 array.push(&$elements.to_variant());
             )*
             array
+        }
+    };
+}
+
+/// Constructs a slice of [`Variant`] literals, useful for passing to vararg functions.
+///
+/// Many APIs in Godot have variable-length arguments. GDScript can call such functions by simply passing more arguments, but in Rust,
+/// the parameter type `&[Variant]` is used.
+///
+/// This macro creates a [slice](https://doc.rust-lang.org/std/primitive.slice.html) of `Variant` values.
+///
+/// # Examples
+/// Variable number of arguments:
+/// ```no_run
+/// # use godot::prelude::*;
+/// let slice: &[Variant] = vslice![42, "hello", true];
+///
+/// let concat: GString = godot::global::str(slice);
+/// ```
+/// _(In practice, you might want to use [`godot_str!`][crate::global::godot_str] instead of `str()`.)_
+///
+/// Dynamic function call via reflection. NIL can still be passed inside `vslice!`, just use `Variant::nil()`.
+/// ```no_run
+/// # use godot::prelude::*;
+/// # fn some_object() -> Gd<Object> { unimplemented!() }
+/// let mut obj: Gd<Object> = some_object();
+/// obj.call("some_method", vslice![Vector2i::new(1, 2), Variant::nil()]);
+/// ```
+///
+/// # See also
+/// To create typed and untyped `Array`s, use the [`array!`] and [`varray!`] macros respectively.
+///
+/// For dictionaries, a similar macro [`vdict!`] exists.
+#[macro_export]
+macro_rules! vslice {
+    // Note: use to_variant() and not Variant::from(), as that works with both references and values
+    ($($elements:expr),* $(,)?) => {
+        {
+            use $crate::meta::ToGodot as _;
+            let mut array = $crate::builtin::VariantArray::default();
+            &[
+                $( $elements.to_variant(), )*
+            ]
         }
     };
 }

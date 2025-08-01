@@ -6,14 +6,15 @@
  */
 
 use crate::framework::itest;
-use godot::builtin::{GString, Signal, StringName};
+use godot::builtin::{vslice, GString, Signal, StringName};
 use godot::classes::object::ConnectFlags;
 use godot::classes::{Node, Node3D, Object, RefCounted};
-use godot::meta::ToGodot;
+use godot::meta::{FromGodot, GodotConvert, ParamType, ToGodot};
 use godot::obj::{Base, Gd, InstanceId, NewAlloc, NewGd};
+use godot::prelude::ConvertError;
 use godot::register::{godot_api, GodotClass};
-use godot::sys;
 use godot::sys::Global;
+use godot::{meta, sys};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -27,7 +28,7 @@ fn signal_basic_connect_emit() {
     assert_eq!(receiver.bind().last_received(), LastReceived::Unit);
 
     emitter.connect("signal_int", &receiver.callable("receive_int"));
-    emitter.emit_signal("signal_int", &[1278.to_variant()]);
+    emitter.emit_signal("signal_int", vslice![1278]);
     assert_eq!(receiver.bind().last_received(), LastReceived::Int(1278));
 
     let emitter_variant = emitter.to_variant();
@@ -54,15 +55,18 @@ fn signal_symbols_internal() {
     internal.connect_signals_internal(tracker.clone());
     drop(internal);
 
+    // Make sure that connection has been properly registered by Godot.
+    assert!(!emitter.get_incoming_connections().is_empty());
+
     emitter.bind_mut().emit_signals_internal();
 
     // Check that closure is invoked.
     assert_eq!(tracker.get(), 1234, "Emit failed (closure)");
 
-    // Check that instance method is invoked.
+    // Check that instance methods self_receive() and self_receive_gd_inc1() are invoked.
     assert_eq!(
         emitter.bind().last_received_int,
-        1234,
+        1234 + 1, // self_receive_gd_inc1() increments by 1, and should be called after self_receive().
         "Emit failed (method)"
     );
 
@@ -123,6 +127,29 @@ fn signal_symbols_external() {
     emitter.free();
 }
 
+#[cfg(since_api = "4.2")]
+#[itest]
+fn signal_receiver_auto_disconnect() {
+    let emitter = Emitter::new_alloc();
+    let sig = emitter.signals().signal_int();
+
+    let receiver = Receiver::new_alloc();
+    sig.connect_other(&receiver, Receiver::receive_int_mut);
+
+    let outgoing_connections = emitter.get_signal_connection_list("signal_int");
+    let incoming_connections = receiver.get_incoming_connections();
+
+    assert_eq!(incoming_connections.len(), 1);
+    assert_eq!(incoming_connections, outgoing_connections);
+
+    receiver.free();
+
+    // Should be auto-disconnected by Godot.
+    let outgoing_connections = emitter.get_signal_connection_list("signal_int");
+    assert!(outgoing_connections.is_empty());
+    emitter.free();
+}
+
 // "External" means connect/emit happens from outside the class, via Gd::signals().
 #[cfg(since_api = "4.2")]
 #[itest]
@@ -135,16 +162,16 @@ fn signal_symbols_external_builder() {
 
     // Connect to other object.
     let receiver_mut = Receiver::new_alloc();
-    sig.connect_builder()
+    sig.builder()
         .name("receive_the_knowledge")
-        .connect_other(&receiver_mut, Receiver::receive_int_mut);
+        .connect_other_mut(&receiver_mut, Receiver::receive_int_mut);
 
     sig.connect_other(&receiver_mut, Receiver::receive_int_mut);
 
     let tracker = Rc::new(Cell::new(0));
     {
         let tracker = tracker.clone();
-        sig.connect_builder().connect(move |i| tracker.set(i));
+        sig.builder().connect(move |i| tracker.set(i));
     }
 
     // Emit signal.
@@ -185,7 +212,7 @@ fn signal_symbols_sync() {
     let sync_tracker = Arc::new(Mutex::new(0));
     {
         let sync_tracker = sync_tracker.clone();
-        sig.connect_builder()
+        sig.builder()
             .connect_sync(move |i| *sync_tracker.lock().unwrap() = i);
     }
 
@@ -219,7 +246,7 @@ fn signal_symbols_engine(ctx: &crate::framework::TestContext) {
     {
         let entered_tracker = entered_tracker.clone();
 
-        entered.connect_builder().connect(move |node| {
+        entered.builder().connect(move |node| {
             *entered_tracker.borrow_mut() = Some(node);
         });
     }
@@ -321,8 +348,8 @@ fn signal_symbols_connect_engine() {
 
     node.signals()
         .property_list_changed()
-        .connect_builder()
-        .connect_other(&engine, |this| {
+        .builder()
+        .connect_other_gd(&engine, |this| {
             assert_eq!(this.get_name(), StringName::from("hello"));
         });
 
@@ -339,6 +366,7 @@ fn signal_symbols_connect_inferred() {
     let user = Emitter::new_alloc();
     let engine = Node::new_alloc();
 
+    // User signals.
     user.signals()
         .child_entered_tree()
         .connect_other(&engine, |this, mut child| {
@@ -357,18 +385,49 @@ fn signal_symbols_connect_inferred() {
         let _ = this.last_received_int;
     });
 
+    // User signals, builder.
+    user.signals().renamed().builder().connect_self_mut(|this| {
+        // Use method/field that `Emitter` declares.
+        this.connect_base_signals_internal();
+        let _ = this.last_received_int;
+    });
+
+    // Engine signals.
     engine.signals().ready().connect_other(&user, |this| {
         // Use method/field that `Emitter` declares.
         this.connect_base_signals_internal();
         let _ = this.last_received_int;
     });
 
+    // Engine signals, builder.
     engine
         .signals()
         .tree_exiting()
-        .connect_builder()
+        .builder()
         .flags(ConnectFlags::DEFERRED)
-        .connect_self(|this| {
+        .connect_self_gd(|mut this| {
+            // Use methods that `Node` declares.
+            let _ = this.get_path(); // ref.
+            this.set_unique_name_in_owner(true); // mut.
+        });
+
+    engine
+        .signals()
+        .tree_exiting()
+        .builder()
+        .connect_other_mut(&user, |this| {
+            // Use methods that `Node` declares.
+            use godot::obj::WithBaseField; // not recommended pattern; `*_gd()` connectors preferred.
+
+            let _ = this.base().get_path(); // ref.
+            this.base_mut().set_unique_name_in_owner(true); // mut.
+        });
+
+    engine
+        .signals()
+        .tree_exiting()
+        .builder()
+        .connect_other_gd(&user, |mut this| {
             // Use methods that `Node` declares.
             let _ = this.get_path(); // ref.
             this.set_unique_name_in_owner(true); // mut.
@@ -418,6 +477,59 @@ fn signal_construction_and_id() {
     assert_eq!(signal.object(), None);
 }
 
+#[cfg(since_api = "4.2")]
+#[itest]
+fn enums_as_signal_args() {
+    #[derive(Debug, Clone)]
+    enum EventType {
+        Ready,
+    }
+
+    impl GodotConvert for EventType {
+        type Via = u8;
+    }
+
+    impl ToGodot for EventType {
+        type ToVia<'v> = Self::Via;
+
+        fn to_godot(&self) -> Self::ToVia<'_> {
+            match self {
+                EventType::Ready => 0,
+            }
+        }
+    }
+
+    impl ParamType for EventType {
+        type ArgPassing = meta::ByValue;
+    }
+
+    impl FromGodot for EventType {
+        fn try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
+            match via {
+                0 => Ok(Self::Ready),
+                _ => Err(ConvertError::new("value out of range")),
+            }
+        }
+    }
+
+    #[derive(GodotClass)]
+    #[class(base = RefCounted, init)]
+    struct SignalObject {
+        base: Base<RefCounted>,
+    }
+
+    #[godot_api]
+    impl SignalObject {
+        #[signal]
+        fn game_event(ty: EventType);
+    }
+
+    let object = SignalObject::new_gd();
+    let event = EventType::Ready;
+
+    object.signals().game_event().emit(event);
+}
+
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Helper types
 
@@ -460,6 +572,14 @@ mod emitter {
         }
 
         #[func]
+        pub fn self_receive_gd_inc1(mut this: Gd<Self>, _arg1: i64) {
+            #[cfg(since_api = "4.2")]
+            {
+                this.bind_mut().last_received_int += 1;
+            }
+        }
+
+        #[func]
         pub fn self_receive_constant(&mut self) {
             #[cfg(since_api = "4.2")]
             {
@@ -480,6 +600,7 @@ mod emitter {
             sig.connect_self(Self::self_receive);
             sig.connect(Self::self_receive_static);
             sig.connect(move |i| tracker.set(i));
+            sig.builder().connect_self_gd(Self::self_receive_gd_inc1);
         }
 
         #[cfg(since_api = "4.2")]
@@ -573,9 +694,8 @@ impl PubClassPrivSignal {
 
 #[cfg(since_api = "4.2")]
 mod custom_callable {
-    use godot::builtin::{Callable, Signal};
+    use godot::builtin::{vslice, Callable, Signal};
     use godot::classes::Node;
-    use godot::meta::ToGodot;
     use godot::obj::{Gd, NewAlloc};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -592,7 +712,7 @@ mod custom_callable {
                 node.add_user_signal("test_signal");
             },
             |node| {
-                node.emit_signal("test_signal", &[987i64.to_variant()]);
+                node.emit_signal("test_signal", vslice![987i64]);
             },
         );
     }
@@ -606,7 +726,7 @@ mod custom_callable {
                 node.add_user_signal("test_signal");
             },
             |node| {
-                node.emit_signal("test_signal", &[987i64.to_variant()]);
+                node.emit_signal("test_signal", vslice![987i64]);
             },
         );
     }

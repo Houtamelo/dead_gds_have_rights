@@ -16,6 +16,8 @@
 # Commands to run (in that order) if none are given on the command line.
 DEFAULT_COMMANDS=("fmt" "clippy" "test" "itest")
 
+GODOT4_BIN="/home/houtamelo/bin/Godot_v4.4.1-stable_linux.x86_64"
+
 # Store help text in a variable $HELP_TEXT so we don't need weird indentation later on.
 read -r -d '' HELP_TEXT <<EOF
 Usage: check.sh [OPTION|COMMAND...]

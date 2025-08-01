@@ -6,7 +6,7 @@
  */
 
 use godot_ffi as sys;
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
 use crate::builtin::math::{ApproxEq, FloatExt, GlamConv, GlamType};
 use crate::builtin::{inner, real, Basis, EulerOrder, RQuat, RealConv, Vector3};
@@ -107,11 +107,6 @@ impl Quaternion {
         }
     }
 
-    #[deprecated = "Renamed to `Quaternion::exp()`"]
-    pub fn to_exp(self) -> Self {
-        self.exp()
-    }
-
     pub fn from_euler(euler: Vector3) -> Self {
         let half_a1 = euler.y * 0.5;
         let half_a2 = euler.x * 0.5;
@@ -161,11 +156,6 @@ impl Quaternion {
     /// _Godot equivalent: `Quaternion.get_euler()`_
     pub fn get_euler_with(self, order: EulerOrder) -> Vector3 {
         Basis::from_quaternion(self).get_euler_with(order)
-    }
-
-    #[deprecated = "Renamed to `get_euler()` + `get_euler_with()`"]
-    pub fn to_euler(self, order: EulerOrder) -> Vector3 {
-        self.get_euler_with(order)
     }
 
     pub fn inverse(self) -> Self {
@@ -269,7 +259,7 @@ impl Quaternion {
     }
 
     #[doc(hidden)]
-    pub fn as_inner(&self) -> inner::InnerQuaternion {
+    pub fn as_inner(&self) -> inner::InnerQuaternion<'_> {
         inner::InnerQuaternion::from_outer(self)
     }
 
@@ -347,7 +337,7 @@ impl Mul<Vector3> for Quaternion {
 // SAFETY:
 // This type is represented as `Self` in Godot, so `*mut Self` is sound.
 unsafe impl GodotFfi for Quaternion {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::QUATERNION;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::QUATERNION);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }

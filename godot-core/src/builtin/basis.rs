@@ -6,9 +6,9 @@
  */
 
 use godot_ffi as sys;
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
-use crate::builtin::math::{ApproxEq, FloatExt, GlamConv, GlamType};
+use crate::builtin::math::{ApproxEq, FloatExt, GlamConv, GlamType, XformInv};
 use crate::builtin::real_consts::FRAC_PI_2;
 use crate::builtin::{real, EulerOrder, Quaternion, RMat3, RQuat, RVec2, RVec3, Vector3};
 use std::cmp::Ordering;
@@ -128,11 +128,6 @@ impl Basis {
         RMat3::from_quat(quat.to_glam()).to_front()
     }
 
-    #[deprecated = "Renamed to `from_quaternion()`"]
-    pub fn from_quat(quat: Quaternion) -> Self {
-        Self::from_quaternion(quat)
-    }
-
     /// Create a `Basis` from three angles `a`, `b`, and `c` interpreted
     /// as Euler angles according to the given `EulerOrder`.
     ///
@@ -171,11 +166,6 @@ impl Basis {
         super::inner::InnerBasis::looking_at(target, up, use_model_front)
     }
 
-    #[deprecated = "Renamed to `looking_at()`"]
-    pub fn new_looking_at(target: Vector3, up: Vector3, use_model_front: bool) -> Self {
-        Self::looking_at(target, up, use_model_front)
-    }
-
     /// Creates a `[Vector3; 3]` with the columns of the `Basis`.
     pub fn to_cols(&self) -> [Vector3; 3] {
         self.transposed().rows
@@ -206,11 +196,6 @@ impl Basis {
         RQuat::from_mat3(&self.orthonormalized().to_glam()).to_front()
     }
 
-    #[deprecated = "Renamed to `get_quaternion()`"]
-    pub fn to_quat(&self) -> Quaternion {
-        self.get_quaternion()
-    }
-
     /// Returns the scale of the matrix.
     ///
     /// _Godot equivalent: `Basis.get_scale()`_
@@ -224,11 +209,6 @@ impl Basis {
             self.col_b().length(),
             self.col_c().length(),
         ) * det_sign
-    }
-
-    #[deprecated = "Renamed to `get_scale()`"]
-    pub fn scale(&self) -> Vector3 {
-        self.get_scale()
     }
 
     /// Returns the rotation of the matrix in euler angles, with the order `YXZ`.
@@ -301,11 +281,6 @@ impl Basis {
             }
         }
         .to_front()
-    }
-
-    #[deprecated = "Renamed to `get_euler()` + `get_euler_with()`"]
-    pub fn to_euler(&self, order: EulerOrder) -> Vector3 {
-        self.get_euler_with(order)
     }
 
     fn is_between_neg1_1(f: real) -> Ordering {
@@ -629,10 +604,34 @@ impl Mul<Vector3> for Basis {
     }
 }
 
+impl XformInv<Vector3> for Basis {
+    /// Inversely transforms given [`Vector3`] by this basis,
+    /// under the assumption that the basis is orthonormal (i.e. rotation/reflection is fine, scaling/skew is not).
+    ///
+    /// Since given basis is assumed to be orthonormal (i.e. it is both orthogonal – with all axis perpendicular to each other – and all the axis are normalized),
+    /// `basis.transposed()` (matrix flipped over its diagonal) is equal to `basis.inverse()`
+    /// (i.e. `basis * basis.transposed() == basis * basis.inverse() == Basis::Identity`),
+    /// thus `basis.xform_inv(vector)` is equivalent both to `basis.transposed() * vector` and `basis.inverse() * vector`.
+    ///
+    /// See [`Basis::transposed()`] and [Godot docs (stable) for `Basis`](https://docs.godotengine.org/en/stable/classes/class_basis.html)
+    /// with following [Matrices and Transform tutorial](https://docs.godotengine.org/en/stable/tutorials/math/matrices_and_transforms.html).
+    ///
+    /// For transforming by inverse of a non-orthonormal basis (e.g. with scaling) `basis.inverse() * vector` can be used instead. See [`Basis::inverse()`].
+    ///
+    /// _Godot equivalent: `vector * basis`_
+    fn xform_inv(&self, rhs: Vector3) -> Vector3 {
+        Vector3::new(
+            self.col_a().dot(rhs),
+            self.col_b().dot(rhs),
+            self.col_c().dot(rhs),
+        )
+    }
+}
+
 // SAFETY:
 // This type is represented as `Self` in Godot, so `*mut Self` is sound.
 unsafe impl GodotFfi for Basis {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::BASIS;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::BASIS);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }

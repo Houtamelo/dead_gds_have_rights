@@ -7,8 +7,10 @@
 
 //! Parses the `#[var]` and `#[export]` attributes on fields.
 
-use crate::class::{Field, FieldVar, Fields, GetSet, GetterSetterImpl, UsageFlags};
-use crate::util::{format_funcs_collection_constant, format_funcs_collection_struct};
+use crate::class::data_models::fields::Fields;
+use crate::class::data_models::group_export::FieldGroup;
+use crate::class::{Field, FieldVar, GetSet, GetterSetterImpl, UsageFlags};
+use crate::util::{format_funcs_collection_constant, format_funcs_collection_struct, ident};
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
 
@@ -48,22 +50,30 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
             ty: field_type,
             var,
             export,
+            group,
+            subgroup,
             ..
         } = field;
 
         // Ensure we add a var if the user only provided a `#[export]`.
         let var = match (export, var) {
-            (Some(_), None) => Some(FieldVar {
-                usage_flags: UsageFlags::InferredExport,
-                ..Default::default()
-            }),
+            (Some(export), None) => {
+                let usage_flags = if let Some(usage) = export.to_export_usage() {
+                    UsageFlags::Custom(vec![usage])
+                } else {
+                    UsageFlags::InferredExport
+                };
+                FieldVar {
+                    usage_flags,
+                    ..Default::default()
+                }
+            }
 
-            (_, var) => var.clone(),
+            (_, Some(var)) => var.clone(),
+            _ => continue,
         };
 
-        let Some(var) = var else {
-            continue;
-        };
+        make_groups_registrations(group, subgroup, &mut export_tokens, class_name);
 
         let field_name = field_ident.to_string();
 
@@ -154,7 +164,9 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
         );
 
         export_tokens.push(quote! {
-            ::godot::register::private::#registration_fn::<#class_name, #field_type>(
+            // This type may be reused in #hint, in case of generic functions.
+            type FieldType = #field_type;
+            ::godot::register::private::#registration_fn::<#class_name, FieldType>(
                 #field_name,
                 #getter_tokens,
                 #setter_tokens,
@@ -210,4 +222,42 @@ fn make_getter_setter(
     let constant = format_funcs_collection_constant(class_name, &gs.function_name);
 
     quote! { #funcs_collection::#constant }
+}
+
+/// Generates registrations for declared group and subgroup and pushes them to export tokens.
+///
+/// Groups must be registered before subgroups (otherwise the ordering is broken).
+fn make_groups_registrations(
+    group: &Option<FieldGroup>,
+    subgroup: &Option<FieldGroup>,
+    export_tokens: &mut Vec<TokenStream>,
+    class_name: &Ident,
+) {
+    export_tokens.push(make_group_registration(
+        group,
+        ident("register_group"),
+        class_name,
+    ));
+    export_tokens.push(make_group_registration(
+        subgroup,
+        ident("register_subgroup"),
+        class_name,
+    ));
+}
+
+fn make_group_registration(
+    group: &Option<FieldGroup>,
+    register_fn: Ident,
+    class_name: &Ident,
+) -> TokenStream {
+    let Some(FieldGroup { name, prefix }) = group else {
+        return TokenStream::new();
+    };
+
+    quote! {
+    ::godot::register::private::#register_fn::<#class_name>(
+            #name,
+            #prefix
+    );
+    }
 }

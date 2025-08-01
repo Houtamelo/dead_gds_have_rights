@@ -10,7 +10,7 @@ use crate::models::domain::{
     BuildConfiguration, BuiltinClass, BuiltinMethod, BuiltinSize, BuiltinVariant, Class,
     ClassCommons, ClassConstant, ClassConstantValue, ClassMethod, ClassSignal, Constructor, Enum,
     Enumerator, EnumeratorValue, ExtensionApi, FnDirection, FnParam, FnQualifier, FnReturn,
-    FunctionCommon, GodotApiVersion, ModName, NativeStructure, Operator, Singleton, TyName,
+    FunctionCommon, GodotApiVersion, ModName, NativeStructure, Operator, RustTy, Singleton, TyName,
     UtilityFunction,
 };
 use crate::models::json::{
@@ -92,6 +92,11 @@ impl Class {
         // Already checked in is_class_deleted(), but code remains more maintainable if those are separate, and it's cheap to validate.
         let is_experimental = special_cases::is_class_experimental(&ty_name.godot_ty);
 
+        let is_instantiable = special_cases::is_class_instantiable(&ty_name) //.
+            .unwrap_or(json.is_instantiable);
+
+        let is_final = ctx.is_final(&ty_name);
+
         let mod_name = ModName::from_godot(&ty_name.godot_ty);
 
         let constants = option_as_slice(&json.constants)
@@ -123,15 +128,21 @@ impl Class {
             })
             .collect();
 
+        let base_class = json
+            .inherits
+            .as_ref()
+            .map(|godot_name| TyName::from_godot(godot_name));
+
         Some(Self {
             common: ClassCommons {
                 name: ty_name,
                 mod_name,
             },
             is_refcounted: json.is_refcounted,
-            is_instantiable: json.is_instantiable,
+            is_instantiable,
             is_experimental,
-            inherits: json.inherits.clone(),
+            is_final,
+            base_class,
             api_level: get_api_level(json),
             constants,
             enums,
@@ -370,6 +381,7 @@ impl BuiltinMethod {
                 is_vararg: method.is_vararg,
                 is_private: false, // See 'exposed' below. Could be special_cases::is_method_private(builtin_name, &method.name),
                 is_virtual_required: false,
+                is_unsafe: false, // Builtin methods don't use raw pointers.
                 direction: FnDirection::Outbound {
                     hash: method.hash.expect("hash absent for builtin method"),
                 },
@@ -452,6 +464,7 @@ impl ClassMethod {
             },
         };
 
+        // May still be renamed further, for unsafe methods. Not done here because data to determine safety is not available yet.
         let rust_method_name = Self::make_virtual_method_name(class_name, &method.name);
 
         Self::from_json_inner(method, rust_method_name, class_name, direction, ctx)
@@ -483,29 +496,49 @@ impl ClassMethod {
 
         // Since Godot 4.4, GDExtension advertises whether virtual methods have a default implementation or are required to be overridden.
         #[cfg(before_api = "4.4")]
-        let is_virtual_required = special_cases::is_virtual_method_required(
-            &class_name.rust_ty.to_string(),
-            rust_method_name,
-        );
+        let is_virtual_required =
+            special_cases::is_virtual_method_required(&class_name, &method.name);
 
         #[cfg(since_api = "4.4")]
-        let is_virtual_required = method.is_virtual
-            && method.is_required.unwrap_or_else(|| {
+        #[allow(clippy::let_and_return)]
+        let is_virtual_required = method.is_virtual && {
+            // Evaluate this always first (before potential manual overrides), to detect mistakes in spec.
+            let is_required_in_json = method.is_required.unwrap_or_else(|| {
                 panic!(
                     "virtual method {}::{} lacks field `is_required`",
                     class_name.rust_ty, rust_method_name
                 );
             });
 
+            // Potential special cases come here. The situation "virtual function is required in base class, but not in derived"
+            // is not handled here, but in virtual_traits.rs. Here, virtual methods appear only once, in their base.
+
+            is_required_in_json
+        };
+
+        let parameters = FnParam::new_range(&method.arguments, ctx);
+        let return_value = FnReturn::new(&method.return_value, ctx);
+        let is_unsafe = Self::function_uses_pointers(&parameters, &return_value);
+
+        // Future note: if further changes are made to the virtual method name, make sure to make it reversible so that #[godot_api]
+        // can match on the Godot name of the virtual method.
+        let rust_method_name = if is_unsafe && method.is_virtual {
+            // If the method is unsafe, we need to rename it to avoid conflicts with the safe version.
+            conv::make_unsafe_virtual_fn_name(rust_method_name)
+        } else {
+            rust_method_name.to_string()
+        };
+
         Some(Self {
             common: FunctionCommon {
-                name: rust_method_name.to_string(),
+                name: rust_method_name,
                 godot_name: godot_method_name,
-                parameters: FnParam::new_range(&method.arguments, ctx),
-                return_value: FnReturn::new(&method.return_value, ctx),
+                parameters,
+                return_value,
                 is_vararg: method.is_vararg,
                 is_private,
                 is_virtual_required,
+                is_unsafe,
                 direction,
             },
             qualifier,
@@ -514,12 +547,28 @@ impl ClassMethod {
     }
 
     fn make_virtual_method_name<'m>(class_name: &TyName, godot_method_name: &'m str) -> &'m str {
-        // Remove leading underscore from virtual method names.
-        let method_name = godot_method_name
-            .strip_prefix('_')
-            .unwrap_or(godot_method_name);
+        // Hardcoded overrides.
+        if let Some(rust_name) =
+            special_cases::maybe_rename_virtual_method(class_name, godot_method_name)
+        {
+            return rust_name;
+        }
 
-        special_cases::maybe_rename_virtual_method(class_name, method_name)
+        // In general, just rlemove leading underscore from virtual method names.
+        godot_method_name
+            .strip_prefix('_')
+            .unwrap_or(godot_method_name)
+    }
+
+    fn function_uses_pointers(parameters: &[FnParam], return_value: &FnReturn) -> bool {
+        let has_pointer_params = parameters
+            .iter()
+            .any(|param| matches!(param.type_, RustTy::RawPointer { .. }));
+
+        let has_pointer_return = matches!(return_value.type_, Some(RustTy::RawPointer { .. }));
+
+        // No short-circuiting due to variable decls, but that's fine.
+        has_pointer_params || has_pointer_return
     }
 }
 
@@ -546,6 +595,7 @@ impl UtilityFunction {
         if special_cases::is_utility_function_deleted(function, ctx) {
             return None;
         }
+        let is_private = special_cases::is_utility_function_private(function);
 
         // Some vararg functions like print() or str() are declared with a single argument "arg1: Variant", but that seems
         // to be a mistake. We change their parameter list by removing that.
@@ -571,8 +621,9 @@ impl UtilityFunction {
                 parameters,
                 return_value: FnReturn::new(&return_value, ctx),
                 is_vararg: function.is_vararg,
-                is_private: false,
+                is_private,
                 is_virtual_required: false,
+                is_unsafe: false, // Utility functions don't use raw pointers.
                 direction: FnDirection::Outbound {
                     hash: function.hash,
                 },
@@ -611,7 +662,7 @@ impl Enum {
             conv::make_enumerator_names(godot_class_name, &rust_enum_name, godot_enumerator_names)
         };
 
-        let enumerators = json_enum
+        let enumerators: Vec<Enumerator> = json_enum
             .values
             .iter()
             .zip(rust_enumerator_names)
@@ -619,6 +670,8 @@ impl Enum {
                 Enumerator::from_json(json_constant, rust_name, is_bitfield)
             })
             .collect();
+
+        let max_index = Enum::find_index_enum_max_impl(is_bitfield, &enumerators);
 
         Self {
             name: ident(&rust_enum_name),
@@ -628,6 +681,7 @@ impl Enum {
             is_private,
             is_exhaustive,
             enumerators,
+            max_index,
         }
     }
 }

@@ -52,21 +52,24 @@ mod param_tuple;
 mod property_info;
 mod signature;
 mod traits;
+mod uniform_object_deref;
 
 pub(crate) mod sealed;
 
 pub mod error;
+pub mod inspect;
 
 pub use args::*;
 pub use class_name::ClassName;
 pub use godot_convert::{FromGodot, GodotConvert, ToGodot};
-pub use traits::{ArrayElement, GodotType, PackedArrayElement};
-
 pub use param_tuple::{InParamTuple, OutParamTuple, ParamTuple};
+pub use traits::{ArrayElement, GodotType, PackedArrayElement};
+pub use uniform_object_deref::UniformObjectDeref;
 
 pub(crate) use array_type_info::ArrayTypeInfo;
 pub(crate) use traits::{
-    element_godot_type_name, element_variant_type, GodotFfiVariant, GodotNullableFfi,
+    element_godot_type_name, element_variant_type, ffi_variant_type, ExtVariantType,
+    GodotFfiVariant, GodotNullableFfi,
 };
 
 use crate::registry::method::MethodParamOrReturnInfo;

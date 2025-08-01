@@ -7,7 +7,7 @@
 
 use core::cmp::Ordering;
 use godot_ffi as sys;
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
 use crate::builtin::math::{FloatExt, GlamConv, GlamType};
 use crate::builtin::vectors::Vector2Axis;
@@ -71,12 +71,6 @@ impl_vector_fns!(Vector2, RVec2, real, (x, y));
 
 /// # Specialized `Vector2` functions
 impl Vector2 {
-    #[deprecated = "Moved to `Vector2i::cast_float()`"]
-    #[inline]
-    pub const fn from_vector2i(v: Vector2i) -> Self {
-        v.cast_float()
-    }
-
     /// Creates a unit Vector2 rotated to the given `angle` in radians. This is equivalent to doing `Vector2::new(angle.cos(), angle.sin())`
     /// or `Vector2::RIGHT.rotated(angle)`.
     ///
@@ -166,7 +160,7 @@ impl Vector2 {
 
     #[doc(hidden)]
     #[inline]
-    pub fn as_inner(&self) -> inner::InnerVector2 {
+    pub fn as_inner(&self) -> inner::InnerVector2<'_> {
         inner::InnerVector2::from_outer(self)
     }
 }
@@ -187,7 +181,7 @@ impl fmt::Display for Vector2 {
 // SAFETY:
 // This type is represented as `Self` in Godot, so `*mut Self` is sound.
 unsafe impl GodotFfi for Vector2 {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::VECTOR2;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::VECTOR2);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }

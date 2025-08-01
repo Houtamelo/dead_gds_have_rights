@@ -54,8 +54,7 @@ pub trait Var: GodotConvert {
 // Note: HTML link for #[export] works if this symbol is inside prelude, but not in register::property.
 /// Trait implemented for types that can be used as [`#[export]`](../register/derive.GodotClass.html#properties-and-exports) fields.
 ///
-/// `Export` is only implemented for objects `Gd<T>` if either `T: Inherits<Node>` or `T: Inherits<Resource>`, just like GDScript.
-/// This means you cannot use `#[export]` with `Gd<RefCounted>`, for example.
+/// To export objects, see the [_Exporting_ section of `Gd<T>`](../obj/struct.Gd.html#exporting).
 ///
 /// For enums, this trait can be derived using the [`#[derive(Export)]`](../derive.Export.html) macro.
 #[doc(alias = "property")]
@@ -64,7 +63,8 @@ pub trait Var: GodotConvert {
 #[diagnostic::on_unimplemented(
     message = "`#[var]` properties require `Var` trait; #[export] ones require `Export` trait",
     label = "type cannot be used as a property",
-    note = "see also: https://godot-rust.github.io/book/register/properties.html"
+    note = "see also: https://godot-rust.github.io/book/register/properties.html",
+    note = "`Gd` and `DynGd` cannot be exported directly; wrap them in `Option<...>` or `OnEditor<...>`."
 )]
 pub trait Export: Var {
     /// The export info to use for an exported field of this type, if no other export info is specified.
@@ -226,7 +226,10 @@ where
 pub mod export_info_functions {
     use crate::builtin::GString;
     use crate::global::PropertyHint;
-    use crate::meta::PropertyHintInfo;
+    use crate::meta::{GodotType, PropertyHintInfo, PropertyInfo};
+    use crate::obj::EngineEnum;
+    use crate::registry::property::Export;
+    use godot_ffi::VariantType;
 
     /// Turn a list of variables into a comma separated string containing only the identifiers corresponding
     /// to a true boolean variable.
@@ -409,37 +412,89 @@ pub mod export_info_functions {
         }
     }
 
-    /// Equivalent to `@export_file` in Godot.
-    ///
-    /// Pass an empty string to have no filter.
-    pub fn export_file<S: AsRef<str>>(filter: S) -> PropertyHintInfo {
-        export_file_inner(false, filter)
+    /// Handles `@export_file`, `@export_global_file`, `@export_dir` and `@export_global_dir`.
+    pub fn export_file_or_dir<T: Export>(
+        is_file: bool,
+        is_global: bool,
+        filter: impl AsRef<str>,
+    ) -> PropertyHintInfo {
+        let field_ty = T::Via::property_info("");
+        let filter = filter.as_ref();
+        debug_assert!(is_file || filter.is_empty()); // Dir never has filter.
+
+        export_file_or_dir_inner(&field_ty, is_file, is_global, filter)
     }
 
-    /// Equivalent to `@export_global_file` in Godot.
-    ///
-    /// Pass an empty string to have no filter.
-    pub fn export_global_file<S: AsRef<str>>(filter: S) -> PropertyHintInfo {
-        export_file_inner(true, filter)
-    }
-
-    pub fn export_file_inner<S: AsRef<str>>(global: bool, filter: S) -> PropertyHintInfo {
-        let hint = if global {
-            PropertyHint::GLOBAL_FILE
-        } else {
-            PropertyHint::FILE
+    pub fn export_file_or_dir_inner(
+        field_ty: &PropertyInfo,
+        is_file: bool,
+        is_global: bool,
+        filter: &str,
+    ) -> PropertyHintInfo {
+        let hint = match (is_file, is_global) {
+            (true, true) => PropertyHint::GLOBAL_FILE,
+            (true, false) => PropertyHint::FILE,
+            (false, true) => PropertyHint::GLOBAL_DIR,
+            (false, false) => PropertyHint::DIR,
         };
 
+        // Returned value depends on field type.
+        match field_ty.variant_type {
+            // GString field:
+            // { "type": 4, "hint": 13, "hint_string": "*.png" }
+            VariantType::STRING => PropertyHintInfo {
+                hint,
+                hint_string: GString::from(filter),
+            },
+
+            // Array<GString> or PackedStringArray field:
+            // { "type": 28, "hint": 23, "hint_string": "4/13:*.png" }
+            #[cfg(since_api = "4.3")]
+            VariantType::PACKED_STRING_ARRAY => to_string_array_hint(hint, filter),
+            #[cfg(since_api = "4.3")]
+            VariantType::ARRAY if field_ty.is_array_of_elem::<GString>() => {
+                to_string_array_hint(hint, filter)
+            }
+
+            _ => {
+                // E.g. `global_file`.
+                let attribute_name = hint.as_str().to_lowercase();
+
+                // TODO nicer error handling.
+                // Compile time may be difficult (at least without extra traits... maybe const fn?). But at least more context info, field name etc.
+                #[cfg(since_api = "4.3")]
+                panic!(
+                    "#[export({attribute_name})] only supports GString, Array<String> or PackedStringArray field types\n\
+                    encountered: {field_ty:?}"
+                );
+
+                #[cfg(before_api = "4.3")]
+                panic!(
+                    "#[export({attribute_name})] only supports GString type prior to Godot 4.3\n\
+                    encountered: {field_ty:?}"
+                );
+            }
+        }
+    }
+
+    /// For `Array<GString>` and `PackedStringArray` fields using one of the `@export[_global]_{file|dir}` annotations.
+    ///
+    /// Formats: `"4/13:"`, `"4/15:*.png"`, ...
+    fn to_string_array_hint(hint: PropertyHint, filter: &str) -> PropertyHintInfo {
+        let variant_ord = VariantType::STRING.ord(); // "4"
+        let hint_ord = hint.ord();
+        let hint_string = format!("{variant_ord}/{hint_ord}");
+
         PropertyHintInfo {
-            hint,
-            hint_string: filter.as_ref().into(),
+            hint: PropertyHint::TYPE_STRING,
+            hint_string: format!("{hint_string}:{filter}").into(),
         }
     }
 
     pub fn export_placeholder<S: AsRef<str>>(placeholder: S) -> PropertyHintInfo {
         PropertyHintInfo {
             hint: PropertyHint::PLACEHOLDER_TEXT,
-            hint_string: placeholder.as_ref().into(),
+            hint_string: GString::from(placeholder.as_ref()),
         }
     }
 
@@ -462,14 +517,13 @@ pub mod export_info_functions {
     // right side are the corresponding property hint. Godot is not always consistent between the two, such
     // as `export_multiline` being `PROPERTY_HINT_MULTILINE_TEXT`.
     default_export_funcs!(
+        export_storage => NONE, // Storage exports don't display in the editor.
         export_flags_2d_physics => LAYERS_2D_PHYSICS,
         export_flags_2d_render => LAYERS_2D_RENDER,
         export_flags_2d_navigation => LAYERS_2D_NAVIGATION,
         export_flags_3d_physics => LAYERS_3D_PHYSICS,
         export_flags_3d_render => LAYERS_3D_RENDER,
         export_flags_3d_navigation => LAYERS_3D_NAVIGATION,
-        export_dir => DIR,
-        export_global_dir => GLOBAL_DIR,
         export_multiline => MULTILINE_TEXT,
         export_color_no_alpha => COLOR_NO_ALPHA,
     );
@@ -605,13 +659,13 @@ mod export_impls {
 pub(crate) fn builtin_type_string<T: GodotType>() -> String {
     use sys::GodotFfi as _;
 
-    let variant_type = T::Ffi::VARIANT_TYPE;
+    let variant_type = T::Ffi::VARIANT_TYPE.variant_as_nil();
 
     // Godot 4.3 changed representation for type hints, see https://github.com/godotengine/godot/pull/90716.
     if sys::GdextBuild::since_api("4.3") {
-        format!("{}:", variant_type.sys())
+        format!("{}:", variant_type.ord())
     } else {
-        format!("{}:{}", variant_type.sys(), T::godot_type_name())
+        format!("{}:{}", variant_type.ord(), T::godot_type_name())
     }
 }
 

@@ -9,8 +9,9 @@ use crate::builtin::Variant;
 use crate::meta::error::ConvertError;
 use crate::meta::{FromGodot, GodotConvert, GodotFfiVariant, RefArg, ToGodot};
 use crate::sys;
-use godot_ffi::{GodotFfi, GodotNullableFfi, PtrcallType};
+use godot_ffi::{ExtVariantType, GodotFfi, GodotNullableFfi, PtrcallType};
 use std::fmt;
+use std::ops::Deref;
 
 /// Owned or borrowed value, used when passing arguments through `impl AsArg` to Godot APIs.
 #[doc(hidden)]
@@ -119,7 +120,7 @@ unsafe impl<T> GodotFfi for CowArg<'_, T>
 where
     T: GodotFfi,
 {
-    const VARIANT_TYPE: sys::VariantType = T::VARIANT_TYPE;
+    const VARIANT_TYPE: ExtVariantType = T::VARIANT_TYPE;
 
     unsafe fn new_from_sys(_ptr: sys::GDExtensionConstTypePtr) -> Self {
         wrong_direction!(new_from_sys)
@@ -180,5 +181,16 @@ where
 
     fn is_null(&self) -> bool {
         self.cow_as_ref().is_null()
+    }
+}
+
+impl<T> Deref for CowArg<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            CowArg::Owned(value) => value,
+            CowArg::Borrowed(value) => value,
+        }
     }
 }

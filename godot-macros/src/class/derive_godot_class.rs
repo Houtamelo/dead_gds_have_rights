@@ -5,9 +5,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use crate::class::data_models::fields::{named_fields, Fields};
+use crate::class::data_models::group_export::FieldGroup;
 use crate::class::{
     make_property_impl, make_virtual_callback, BeforeKind, Field, FieldCond, FieldDefault,
-    FieldExport, FieldVar, Fields, SignatureInfo,
+    FieldExport, FieldVar, SignatureInfo,
 };
 use crate::util::{
     bail, error, format_funcs_collection_struct, ident, path_ends_with_complex,
@@ -33,9 +35,10 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
     }
 
     let mut modifiers = Vec::new();
-    let named_fields = named_fields(class)?;
+    let named_fields = named_fields(class, "#[derive(GodotClass)]")?;
     let mut struct_cfg = parse_struct_attributes(class)?;
     let mut fields = parse_fields(named_fields, struct_cfg.init_strategy)?;
+
     if struct_cfg.is_editor_plugin() {
         modifiers.push(quote! { with_editor_plugin })
     }
@@ -69,7 +72,10 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
     #[cfg(not(all(feature = "register-docs", since_api = "4.3")))]
     let docs = quote! {};
     let base_class = quote! { ::godot::classes::#base_ty };
-    let inherits_macro = format_ident!("unsafe_inherits_transitive_{}", base_ty);
+
+    // Use this name because when typing a non-existent class, users will be met with the following error:
+    //    could not find `inherit_from_OS__ensure_class_exists` in `class_macros`.
+    let inherits_macro_ident = format_ident!("inherit_from_{}__ensure_class_exists", base_ty);
 
     let prv = quote! { ::godot::private };
     let godot_exports_impl = make_property_impl(class_name, &fields);
@@ -133,6 +139,10 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         }
         InitStrategy::Absent => {
             is_instantiable = false;
+
+            // Workaround for https://github.com/godot-rust/gdext/issues/874 before Godot 4.5.
+            #[cfg(before_api = "4.5")]
+            modifiers.push(quote! { with_generated_no_default::<#class_name> });
         }
     };
     if is_instantiable {
@@ -159,6 +169,7 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
     // Note: one limitation is that macros don't work for `impl nested::MyClass` blocks.
     let visibility_macro = make_visibility_macro(class_name, class.vis_marker.as_ref());
     let base_field_macro = make_base_field_macro(class_name, fields.base_field.is_some());
+    let deny_manual_init_macro = make_deny_manual_init_macro(class_name, struct_cfg.init_strategy);
 
     Ok(quote! {
         impl ::godot::obj::GodotClass for #class_name {
@@ -191,6 +202,7 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         #init_expecter
         #visibility_macro
         #base_field_macro
+        #deny_manual_init_macro
         #( #deprecations )*
         #( #errors )*
 
@@ -200,7 +212,7 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
             )
         ));
 
-        #prv::class_macros::#inherits_macro!(#class_name);
+        #prv::class_macros::#inherits_macro_ident!(#class_name);
     })
 }
 
@@ -243,6 +255,35 @@ fn make_base_field_macro(class_name: &Ident, has_base_field: bool) -> TokenStrea
             macro_rules! #macro_name {
                 ( $( $tt:tt )* ) => {};
             }
+        }
+    }
+}
+
+/// Generates code for a decl-macro that prevents manual `init()` for incompatible init strategies.
+fn make_deny_manual_init_macro(class_name: &Ident, init_strategy: InitStrategy) -> TokenStream {
+    let macro_name = util::format_class_deny_manual_init_macro(class_name);
+
+    let class_attr = match init_strategy {
+        InitStrategy::Absent => "#[class(no_init)]",
+        InitStrategy::Generated => "#[class(init)]",
+        InitStrategy::UserDefined => {
+            // For classes that expect manual init, do nothing.
+            return quote! {
+                macro_rules! #macro_name {
+                    () => {};
+                }
+            };
+        }
+    };
+
+    let error_message =
+        format!("Class `{class_name}` is marked with {class_attr} but provides an init() method.");
+
+    quote! {
+        macro_rules! #macro_name {
+            () => {
+                compile_error!(#error_message);
+            };
         }
     }
 }
@@ -411,13 +452,15 @@ fn make_user_class_impl(
         // See also __virtual_call() codegen.
         // This doesn't explicitly check if the base class inherits from Node (and thus has `_ready`), but the derive-macro already does
         // this for the `OnReady` field declaration.
-        let (hash_param, hash_check);
+        let (hash_param, matches_ready_hash);
         if cfg!(since_api = "4.4") {
             hash_param = quote! { hash: u32, };
-            hash_check = quote! { && hash == ::godot::sys::known_virtual_hashes::Node::ready };
+            matches_ready_hash = quote! {
+                (name, hash) == ::godot::sys::godot_virtual_consts::Node::ready
+            };
         } else {
             hash_param = TokenStream::new();
-            hash_check = TokenStream::new();
+            matches_ready_hash = quote! { name == "_ready" }
         }
 
         let default_virtual_fn = quote! {
@@ -428,7 +471,7 @@ fn make_user_class_impl(
                 use ::godot::obj::UserClass as _;
                 #tool_check
 
-                if name == "_ready" #hash_check {
+                if #matches_ready_hash {
                     #callback
                 } else {
                     None
@@ -533,25 +576,6 @@ fn parse_struct_attributes(class: &venial::Struct) -> ParseResult<ClassAttribute
     })
 }
 
-/// Fetches data for all named fields for a struct.
-///
-/// Errors if `class` is a tuple struct.
-fn named_fields(class: &venial::Struct) -> ParseResult<Vec<(venial::NamedField, Punct)>> {
-    // This is separate from parse_fields to improve compile errors. The errors from here demand larger and more non-local changes from the API
-    // user than those from parse_struct_attributes, so this must be run first.
-    match &class.fields {
-        // TODO disallow unit structs in the future
-        // It often happens that over time, a registered class starts to require a base field.
-        // Extending a {} struct requires breaking less code, so we should encourage it from the start.
-        venial::Fields::Unit => Ok(vec![]),
-        venial::Fields::Tuple(_) => bail!(
-            &class.fields,
-            "#[derive(GodotClass)] is not supported for tuple structs",
-        )?,
-        venial::Fields::Named(fields) => Ok(fields.fields.inner.clone()),
-    }
-}
-
 /// Returns field names and 1 base field, if available.
 fn parse_fields(
     named_fields: Vec<(venial::NamedField, Punct)>,
@@ -601,10 +625,10 @@ fn parse_fields(
             }
 
             // Deprecated #[init(default = expr)]
-            if let Some(default) = parser.handle_expr("default")? {
+            if let Some((key, default)) = parser.handle_expr_with_key("default")? {
                 if field.default_val.is_some() {
                     return bail!(
-                        parser.span(),
+                        key,
                         "Cannot use both `val` and `default` keys in #[init]; prefer using `val`"
                     );
                 }
@@ -654,6 +678,20 @@ fn parse_fields(
         if let Some(mut parser) = KvParser::parse(&named_field.attributes, "export")? {
             let export = FieldExport::new_from_kv(&mut parser)?;
             field.export = Some(export);
+            parser.finish()?;
+        }
+
+        // #[export_group(name = ..., prefix = ...)]
+        if let Some(mut parser) = KvParser::parse(&named_field.attributes, "export_group")? {
+            let group = FieldGroup::new_from_kv(&mut parser)?;
+            field.group = Some(group);
+            parser.finish()?;
+        }
+
+        // #[export_subgroup(name = ..., prefix = ...)]
+        if let Some(mut parser) = KvParser::parse(&named_field.attributes, "export_subgroup")? {
+            let subgroup = FieldGroup::new_from_kv(&mut parser)?;
+            field.subgroup = Some(subgroup);
             parser.finish()?;
         }
 

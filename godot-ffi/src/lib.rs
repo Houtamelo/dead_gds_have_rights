@@ -73,7 +73,9 @@ macro_rules! wasm_declare_init_fn {
     () => {};
 }
 
-pub use crate::godot_ffi::{GodotFfi, GodotNullableFfi, PrimitiveConversionError, PtrcallType};
+pub use crate::godot_ffi::{
+    ExtVariantType, GodotFfi, GodotNullableFfi, PrimitiveConversionError, PtrcallType,
+};
 
 // Method tables
 pub use gen::table_builtins::*;
@@ -82,8 +84,7 @@ pub use gen::table_editor_classes::*;
 pub use gen::table_scene_classes::*;
 pub use gen::table_servers_classes::*;
 pub use gen::table_utilities::*;
-#[cfg(since_api = "4.4")]
-pub use gen::virtual_hashes as known_virtual_hashes;
+pub use gen::virtual_consts as godot_virtual_consts;
 
 // Other
 pub use extras::*;
@@ -434,9 +435,42 @@ pub fn main_thread_id() -> std::thread::ThreadId {
 ///
 /// # Panics
 /// - If it is called before the engine bindings have been initialized.
-#[cfg(not(wasm_nothreads))]
 pub fn is_main_thread() -> bool {
-    std::thread::current().id() == main_thread_id()
+    #[cfg(not(wasm_nothreads))]
+    {
+        std::thread::current().id() == main_thread_id()
+    }
+
+    #[cfg(wasm_nothreads)]
+    {
+        true
+    }
+}
+
+/// Assign the current thread id to be the main thread.
+///
+/// This is required for platforms on which Godot runs the main loop on a different thread than the thread the library was loaded on.
+/// Android is one such platform.
+///
+/// # Safety
+///
+/// - must only be called after [`initialize`] has been called.
+pub unsafe fn discover_main_thread() {
+    #[cfg(not(wasm_nothreads))]
+    {
+        if is_main_thread() {
+            // we don't have to do anything if the current thread is already the main thread.
+            return;
+        }
+
+        let thread_id = std::thread::current().id();
+
+        // SAFETY: initialize must have already been called before this function is called. By clearing and setting the cell again we can reinitialize it.
+        unsafe {
+            MAIN_THREAD_ID.clear();
+            MAIN_THREAD_ID.set(thread_id);
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------

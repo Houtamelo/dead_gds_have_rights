@@ -161,7 +161,8 @@ pub struct Class {
     pub is_refcounted: bool,
     pub is_instantiable: bool,
     pub is_experimental: bool,
-    pub inherits: Option<String>,
+    pub is_final: bool,
+    pub base_class: Option<TyName>,
     pub api_level: ClassCodegenLevel,
     pub constants: Vec<ClassConstant>,
     pub enums: Vec<Enum>,
@@ -282,6 +283,8 @@ pub struct FunctionCommon {
     pub is_vararg: bool,
     pub is_private: bool,
     pub is_virtual_required: bool,
+    /// Whether raw pointers appear in signature. Affects safety, and in case of virtual methods, the name.
+    pub is_unsafe: bool,
     pub direction: FnDirection,
 }
 
@@ -721,6 +724,20 @@ pub enum ArgPassing {
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
+/// Behavior of virtual methods in derived classes.
+pub enum VirtualMethodPresence {
+    /// Preserve default behavior of base class (required or optional).
+    Inherit,
+
+    /// Virtual method is now required/optional according to `is_required`, independent of base method declaration.
+    Override { is_required: bool },
+
+    /// Virtual method is removed in derived classes (no longer appearing in their interface trait).
+    Remove,
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
 /// Contains multiple naming conventions for types (classes, builtin classes, enums).
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct TyName {
@@ -744,6 +761,9 @@ impl TyName {
         }
     }
 
+    /// Get name of virtual interface trait.
+    ///
+    /// This is also valid if the outer class generates no traits (e.g. to explicitly mention absence in docs).
     pub fn virtual_trait_name(&self) -> String {
         format!("I{}", self.rust_ty)
     }

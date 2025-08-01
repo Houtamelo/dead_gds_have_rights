@@ -5,15 +5,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-// TODO remove once instance_from_id() etc are removed.
-#![allow(deprecated)]
+// Note: in the past, we had is_instance_valid() -- we also tested that godot-rust is not susceptible to the godot-cpp issue
+// https://github.com/godotengine/godot-cpp/issues/1390.
 
 use crate::framework::itest;
 
-use godot::builtin::{GString, Variant};
-use godot::classes::Node3D;
+use godot::builtin::{vslice, GString, Variant};
 use godot::global::*;
-use godot::obj::NewAlloc;
 
 #[itest]
 fn utilities_abs() {
@@ -33,17 +31,17 @@ fn utilities_sign() {
 
 #[itest]
 fn utilities_str() {
-    let concat = str(&[
-        Variant::from(12),
-        Variant::from(" is a "),
-        Variant::from(true),
-        Variant::from(" number"),
-    ]);
+    let a = 12;
+    let b = " is a ";
+    let c = true;
+    let d = " number";
+    let concat = str(vslice![a, b, c, d]);
 
     let empty = str(&[]);
 
     // TODO: implement GString==&str operator. Then look for "...".into() patterns and replace them.
     assert_eq!(concat, "12 is a true number".into());
+    assert_eq!(concat, godot_str!("{a}{b}{c}{d}"));
     assert_eq!(empty, GString::new());
 }
 
@@ -66,28 +64,13 @@ fn utilities_wrap() {
 
 #[itest]
 fn utilities_max() {
-    let output = max(
-        &Variant::from(1.0),
-        &Variant::from(3.0),
-        &[Variant::from(5.0), Variant::from(7.0)],
-    );
+    let output = max(&Variant::from(1.0), &Variant::from(3.0), vslice![5.0, 7.0]);
     assert_eq!(output, Variant::from(7.0));
 
     let output = max(
         &Variant::from(-1.0),
         &Variant::from(-3.0),
-        &[Variant::from(-5.0), Variant::from(-7.0)],
+        vslice![-5.0, -7.0],
     );
     assert_eq!(output, Variant::from(-1.0));
-}
-
-// Checks that godot-rust is not susceptible to the godot-cpp issue https://github.com/godotengine/godot-cpp/issues/1390.
-#[itest]
-fn utilities_is_instance_valid() {
-    let node = Node3D::new_alloc();
-    let variant = Variant::from(node);
-    assert!(is_instance_valid(variant.clone()));
-
-    node.free();
-    assert!(!is_instance_valid(variant));
 }

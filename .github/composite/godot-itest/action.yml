@@ -7,6 +7,11 @@ name: godot
 description: "Run Godot integration tests"
 
 inputs:
+  godot-indirect-json:
+    required: false
+    default: ''
+    description: "If set to true, compiles godot-rust with the `api-custom-json` feature against the generated JSON file"
+
   artifact-name:
     required: true
     description: "Name of the compiled Godot artifact to download"
@@ -89,6 +94,7 @@ runs:
         with-llvm: ${{ inputs.with-llvm }}
         cache-key: ${{ inputs.rust-cache-key }}
 
+    # if
     - name: "Patch prebuilt version ({{ inputs.godot-prebuilt-patch }})"
       if: inputs.godot-prebuilt-patch != ''
       env:
@@ -125,9 +131,18 @@ runs:
 
       shell: bash
 
+    # else if
+    - name: "Dump extension api"
+      if: inputs.godot-prebuilt-patch == '' && inputs.godot-indirect-json == 'true'
+      run: |
+        $GODOT4_BIN --headless --dump-extension-api
+        mv extension_api.json $RUNNER_DIR/godot_bin/extension_api.json
+        echo "GODOT4_GDEXTENSION_JSON=$RUNNER_DIR/godot_bin/extension_api.json" >> $GITHUB_ENV
+      shell: bash
+
     # else
     - name: "No patch selected"
-      if: inputs.godot-prebuilt-patch == ''
+      if: inputs.godot-prebuilt-patch == '' && inputs.godot-indirect-json != 'true'
       run: |
           echo "No patch selected; use default godot4-prebuilt version."
       shell: bash
@@ -161,7 +176,7 @@ runs:
       #             since it's not available on Windows, use taskkill in that case.
       # * exit:     the terminated process would return 143, but this is more explicit and future-proof
       #
-      # --disallow-focus: fail if #[itest(focus)] is encountered, to prevent running only a few tests for full CI
+      # --disallow-focus: fail if #[itest (focus)] is encountered, to prevent running only a few tests for full CI
       run: |
         cd itest/godot
         echo "OUTCOME=itest" >> $GITHUB_ENV

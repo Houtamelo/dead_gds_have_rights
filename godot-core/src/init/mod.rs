@@ -16,8 +16,9 @@ use crate::out;
 
 pub use sys::GdextBuild;
 
+pub use sys::is_main_thread;
 #[cfg(not(wasm_nothreads))]
-pub use sys::{is_main_thread, main_thread_id};
+pub use sys::main_thread_id;
 
 #[doc(hidden)]
 #[deny(unsafe_op_in_unsafe_fn)]
@@ -31,11 +32,7 @@ pub unsafe fn __gdext_load_library<E: ExtensionLibrary>(
         // cause TLS-destructors to run then we have a setting already for how to deal with them. Otherwise, this could cause the default
         // behavior to kick in and disable hot reloading.
         #[cfg(target_os = "linux")]
-        match E::override_hot_reload() {
-            None => sys::linux_reload_workaround::default_set_hot_reload(),
-            Some(true) => sys::linux_reload_workaround::enable_hot_reload(),
-            Some(false) => sys::linux_reload_workaround::disable_hot_reload(),
-        }
+        sys::linux_reload_workaround::default_set_hot_reload();
 
         let tool_only_in_editor = match E::editor_run_behavior() {
             EditorRunBehavior::ToolClassesOnly => true,
@@ -161,6 +158,10 @@ unsafe fn gdext_on_level_init(level: InitLevel) {
     unsafe { sys::load_class_method_table(level) };
 
     match level {
+        InitLevel::Servers => {
+            // SAFETY: called from the main thread, sys::initialized has already been called.
+            unsafe { sys::discover_main_thread() };
+        }
         InitLevel::Scene => {
             // SAFETY: On the main thread, api initialized, `Scene` was initialized above.
             unsafe { ensure_godot_features_compatible() };
@@ -321,20 +322,6 @@ pub unsafe trait ExtensionLibrary {
     /// have to rename it by yourself in your build process, as well as specify the updated binary name in your `.gdextension` file.
     /// This is just to ensure gdext is aware of the new name given to the binary, avoiding runtime errors.
     fn override_wasm_binary() -> Option<&'static str> {
-        None
-    }
-
-    /// Whether to enable hot reloading of this library. Return `None` to use the default behavior.
-    ///
-    /// Enabling this will ensure that the library can be hot reloaded. If this is disabled then hot reloading may still work, but there is no
-    /// guarantee. Enabling this may also lead to memory leaks, so it should not be enabled for builds that are intended to be final builds.
-    ///
-    /// By default, this is enabled for debug builds and disabled for release builds.
-    ///
-    /// Note that this is only checked *once* upon initializing the library. Changing this from `true` to `false` will be picked up as the
-    /// library is then fully reloaded upon hot-reloading, however changing it from `false` to `true` is almost certainly not going to work
-    /// unless hot-reloading is already working regardless of this setting.
-    fn override_hot_reload() -> Option<bool> {
         None
     }
 }

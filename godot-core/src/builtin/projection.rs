@@ -6,11 +6,12 @@
  */
 
 use godot_ffi as sys;
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
-use crate::builtin::inner::InnerProjection;
 use crate::builtin::math::{ApproxEq, GlamConv, GlamType};
-use crate::builtin::{real, Plane, RMat4, RealConv, Transform3D, Vector2, Vector4, Vector4Axis};
+use crate::builtin::{
+    inner, real, Plane, RMat4, RealConv, Transform3D, Vector2, Vector4, Vector4Axis,
+};
 
 use std::ops::Mul;
 
@@ -470,8 +471,8 @@ impl Projection {
     }
 
     #[doc(hidden)]
-    pub(crate) fn as_inner(&self) -> InnerProjection {
-        InnerProjection::from_outer(self)
+    pub(crate) fn as_inner(&self) -> inner::InnerProjection<'_> {
+        inner::InnerProjection::from_outer(self)
     }
 }
 
@@ -557,7 +558,7 @@ impl GlamConv for Projection {
 
 // SAFETY: This type is represented as `Self` in Godot, so `*mut Self` is sound.
 unsafe impl GodotFfi for Projection {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::PROJECTION;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::PROJECTION);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }
@@ -594,7 +595,7 @@ impl ProjectionPlane {
 }
 
 /// The eye to create a projection for, when creating a projection adjusted for head-mounted displays.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
 #[repr(C)]
 pub enum ProjectionEye {
     LEFT = 1,

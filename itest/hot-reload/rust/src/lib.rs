@@ -11,12 +11,12 @@ struct HotReload;
 
 #[gdextension]
 unsafe impl ExtensionLibrary for HotReload {
-    fn on_level_init(_level: InitLevel) {
-        println!("[Rust]      Init level {:?}", _level);
+    fn on_level_init(level: InitLevel) {
+        println!("[Rust]      Init level {level:?}");
     }
 
-    fn on_level_deinit(_level: InitLevel) {
-        println!("[Rust]      Deinit level {:?}", _level);
+    fn on_level_deinit(level: InitLevel) {
+        println!("[Rust]      Deinit level {level:?}");
     }
 }
 
@@ -28,6 +28,9 @@ struct Reloadable {
     #[export]
     #[init(val = Planet::Earth)]
     favorite_planet: Planet,
+
+    #[init(val = NoDefault::obtain())]
+    _other_object: Gd<NoDefault>,
 }
 
 #[godot_api]
@@ -41,7 +44,21 @@ impl Reloadable {
     fn from_string(s: GString) -> Gd<Self> {
         Gd::from_object(Reloadable {
             favorite_planet: Planet::from_godot(s),
+            _other_object: NoDefault::obtain(),
         })
+    }
+}
+
+// no_init reloadability - https://github.com/godot-rust/gdext/issues/874.
+#[derive(GodotClass)]
+#[class(no_init, base=Node)]
+struct NoDefault {}
+
+#[godot_api]
+impl NoDefault {
+    #[func]
+    fn obtain() -> Gd<Self> {
+        Gd::from_object(NoDefault {})
     }
 }
 

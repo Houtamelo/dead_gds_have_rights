@@ -8,7 +8,7 @@
 use godot_ffi as sys;
 
 use crate::builtin::{inner, Variant, VariantArray};
-use crate::meta::{FromGodot, ToGodot};
+use crate::meta::{ExtVariantType, FromGodot, ToGodot};
 use sys::types::OpaqueDictionary;
 use sys::{ffi_methods, interface_fn, GodotFfi};
 
@@ -34,7 +34,7 @@ use std::{fmt, ptr};
 /// dict.set(coord, "Tile77");
 ///
 /// // Or create the same dictionary in a single expression.
-/// let dict = dict! {
+/// let dict = vdict! {
 ///    "str": "Hello",
 ///    "num": 23,
 ///    coord: "Tile77",
@@ -365,7 +365,7 @@ impl Dictionary {
     }
 
     #[doc(hidden)]
-    pub fn as_inner(&self) -> inner::InnerDictionary {
+    pub fn as_inner(&self) -> inner::InnerDictionary<'_> {
         inner::InnerDictionary::from_outer(self)
     }
 
@@ -394,7 +394,7 @@ impl Dictionary {
 //   incremented as that is the callee's responsibility. Which we do by calling
 //   `std::mem::forget(dictionary.clone())`.
 unsafe impl GodotFfi for Dictionary {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::DICTIONARY;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::DICTIONARY);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Opaque; .. }
 }
@@ -762,10 +762,10 @@ fn u8_to_bool(u: u8) -> bool {
 ///
 /// # Example
 /// ```no_run
-/// use godot::builtin::{dict, Variant};
+/// use godot::builtin::{vdict, Variant};
 ///
 /// let key = "my_key";
-/// let d = dict! {
+/// let d = vdict! {
 ///     "key1": 10,
 ///     "another": Variant::nil(),
 ///     key: true,
@@ -777,7 +777,7 @@ fn u8_to_bool(u: u8) -> bool {
 ///
 /// For arrays, similar macros [`array!`][macro@crate::builtin::array] and [`varray!`][macro@crate::builtin::varray] exist.
 #[macro_export]
-macro_rules! dict {
+macro_rules! vdict {
     ($($key:tt: $value:expr),* $(,)?) => {
         {
             let mut d = $crate::builtin::Dictionary::new();
@@ -789,5 +789,15 @@ macro_rules! dict {
             )*
             d
         }
+    };
+}
+
+#[macro_export]
+#[deprecated = "Migrate to `vdict!`. The name `dict!` will be used in the future for typed dictionaries."]
+macro_rules! dict {
+    ($($key:tt: $value:expr),* $(,)?) => {
+        $crate::vdict!(
+            $($key: $value),*
+        )
     };
 }

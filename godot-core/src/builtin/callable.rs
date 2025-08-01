@@ -14,7 +14,7 @@ use crate::obj::bounds::DynMemory;
 use crate::obj::Bounds;
 use crate::obj::{Gd, GodotClass, InstanceId};
 use std::{fmt, ptr};
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
 #[cfg(all(since_api = "4.2", before_api = "4.3"))]
 type CallableCustomInfo = sys::GDExtensionCallableCustomInfo;
@@ -152,6 +152,32 @@ impl Callable {
             rust_function,
             name,
             thread_id: Some(std::thread::current().id()),
+            linked_obj_id: None,
+        })
+    }
+
+    /// Creates a new callable linked to the given object from **single-threaded** Rust function or closure.
+    ///
+    /// `name` is used for the string representation of the closure, which helps with debugging.
+    ///
+    /// Such a callable will be automatically invalidated by Godot when a linked object is freed.
+    /// Prefer using [`Gd::linked_callable()`] instead.
+    ///
+    /// If you need a callable which can live indefinitely use [`Callable::from_local_fn()`].
+    #[cfg(since_api = "4.2")]
+    pub fn from_linked_fn<F, T, S>(name: S, linked_object: &Gd<T>, rust_function: F) -> Self
+    where
+        T: GodotClass,
+        F: 'static + FnMut(&[&Variant]) -> Result<Variant, ()>,
+        S: meta::AsArg<GString>,
+    {
+        meta::arg_into_owned!(name);
+
+        Self::from_fn_wrapper(FnWrapper {
+            rust_function,
+            name,
+            thread_id: Some(std::thread::current().id()),
+            linked_obj_id: Some(linked_object.instance_id()),
         })
     }
 
@@ -168,6 +194,7 @@ impl Callable {
             rust_function,
             name,
             thread_id: Some(std::thread::current().id()),
+            linked_obj_id: None,
         });
 
         callable_usage(&callable)
@@ -205,21 +232,7 @@ impl Callable {
             rust_function,
             name,
             thread_id: None,
-        })
-    }
-
-    #[deprecated = "Now split into from_local_fn (single-threaded) and from_sync_fn (multi-threaded)."]
-    #[cfg(since_api = "4.2")]
-    pub fn from_fn<F, S>(name: S, rust_function: F) -> Self
-    where
-        F: 'static + Send + Sync + FnMut(&[&Variant]) -> Result<Variant, ()>,
-        S: Into<GString>,
-    {
-        // Do not call from_sync_fn() since that is feature-gated, but this isn't due to compatibility.
-        Self::from_fn_wrapper(FnWrapper {
-            rust_function,
-            name: name.into(),
-            thread_id: None,
+            linked_obj_id: None,
         })
     }
 
@@ -253,9 +266,12 @@ impl Callable {
     where
         F: FnMut(&[&Variant]) -> Result<Variant, ()>,
     {
+        let object_id = inner.linked_object_id();
+
         let userdata = CallableUserdata { inner };
 
         let info = CallableCustomInfo {
+            object_id,
             callable_userdata: Box::into_raw(Box::new(userdata)) as *mut std::ffi::c_void,
             call_func: Some(rust_callable_call_fn::<F>),
             free_func: Some(rust_callable_destroy::<FnWrapper<F>>),
@@ -432,7 +448,7 @@ impl Callable {
     }
 
     #[doc(hidden)]
-    pub fn as_inner(&self) -> inner::InnerCallable {
+    pub fn as_inner(&self) -> inner::InnerCallable<'_> {
         inner::InnerCallable::from_outer(self)
     }
 }
@@ -456,7 +472,7 @@ impl_builtin_traits! {
 // The `opaque` in `Callable` is just a pair of pointers, and requires no special initialization or cleanup
 // beyond what is done in `from_opaque` and `drop`. So using `*mut Opaque` is safe.
 unsafe impl GodotFfi for Callable {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::CALLABLE;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::CALLABLE);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Opaque;
         fn new_from_sys;
@@ -508,6 +524,7 @@ pub use custom_callable::RustCallable;
 mod custom_callable {
     use super::*;
     use crate::builtin::GString;
+    use godot_ffi::GDObjectInstanceID;
     use std::hash::Hash;
     use std::thread::ThreadId;
 
@@ -530,6 +547,14 @@ mod custom_callable {
 
         /// `None` if the callable is multi-threaded ([`Callable::from_sync_fn`]).
         pub(super) thread_id: Option<ThreadId>,
+        /// `None` if callable is not linked with any object.
+        pub(super) linked_obj_id: Option<InstanceId>,
+    }
+
+    impl<F> FnWrapper<F> {
+        pub(crate) fn linked_object_id(&self) -> GDObjectInstanceID {
+            self.linked_obj_id.map(InstanceId::to_u64).unwrap_or(0)
+        }
     }
 
     /// Represents a custom callable object defined in Rust.

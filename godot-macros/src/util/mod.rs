@@ -85,6 +85,17 @@ pub(crate) use bail;
 pub(crate) use error;
 pub(crate) use require_api_version;
 
+/// Keeps all attributes except the one specified (e.g. `"itest"`).
+pub fn retain_attributes_except<'a>(
+    attributes: &'a [venial::Attribute],
+    macro_name: &'a str,
+) -> impl Iterator<Item = &'a venial::Attribute> {
+    attributes.iter().filter(move |attr| {
+        attr.get_single_path_segment()
+            .is_none_or(|segment| segment != macro_name)
+    })
+}
+
 pub fn reduce_to_signature(function: &venial::Function) -> venial::Function {
     let mut reduced = function.clone();
     reduced.vis_marker = None; // retained outside in the case of #[signal].
@@ -417,4 +428,9 @@ pub fn format_class_visibility_macro(class_name: &Ident) -> Ident {
 /// Returns the name of the macro used to communicate whether the `struct` (class) contains a base field.
 pub fn format_class_base_field_macro(class_name: &Ident) -> Ident {
     format_ident!("__godot_{class_name}_has_base_field_macro")
+}
+
+/// Returns the name of the macro used to deny manual `init()` for incompatible init strategies.
+pub fn format_class_deny_manual_init_macro(class_name: &Ident) -> Ident {
+    format_ident!("__deny_manual_init_{class_name}")
 }

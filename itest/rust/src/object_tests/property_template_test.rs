@@ -44,6 +44,16 @@ fn property_template_test(ctx: &TestContext) {
             continue;
         }
 
+        // Skip @export_file and similar properties for Array<GString> and PackedStringArray (only supported in Godot 4.3+).
+        // Here, we use API and not runtime level, because inclusion/exclusion of GDScript code is determined at build time in godot-bindings.
+        //
+        // Name can start in `export_file`, `export_global_file`, `export_dir`, `export_global_dir`.
+        // Can end in either `_array` or `_parray`.
+        #[cfg(before_api = "4.3")]
+        if (name.contains("_file_") || name.contains("_dir_")) && name.ends_with("array") {
+            continue;
+        }
+
         if name.starts_with("var_") || name.starts_with("export_") {
             properties.insert(name, property);
         }
@@ -60,11 +70,15 @@ fn property_template_test(ctx: &TestContext) {
 
         let mut rust_usage = rust_prop.at("usage").to::<i64>();
 
-        // the GDSscript variables are script variables, and so have `PROPERTY_USAGE_SCRIPT_VARIABLE` set.
-        if rust_usage == PropertyUsageFlags::STORAGE.ord() as i64 {
-            // `PROPERTY_USAGE_SCRIPT_VARIABLE` does the same thing as `PROPERTY_USAGE_STORAGE` and so
-            // GDScript doesn't set both if it doesn't need to.
-            rust_usage = PropertyUsageFlags::SCRIPT_VARIABLE.ord() as i64
+        // The GDSscript variables are script variables, and so have `PROPERTY_USAGE_SCRIPT_VARIABLE` set.
+        // Before 4.3, `PROPERTY_USAGE_SCRIPT_VARIABLE` did the same thing as `PROPERTY_USAGE_STORAGE` and
+        // so GDScript didn't set both if it didn't need to.
+        if GdextBuild::before_api("4.3") {
+            if rust_usage == PropertyUsageFlags::STORAGE.ord() as i64 {
+                rust_usage = PropertyUsageFlags::SCRIPT_VARIABLE.ord() as i64
+            } else {
+                rust_usage |= PropertyUsageFlags::SCRIPT_VARIABLE.ord() as i64;
+            }
         } else {
             rust_usage |= PropertyUsageFlags::SCRIPT_VARIABLE.ord() as i64;
         }
@@ -93,14 +107,24 @@ fn property_template_test(ctx: &TestContext) {
                 "mismatch in property {name}:\n  GDScript: {gdscript_prop:?}\n  Rust:     {rust_prop:?}"
             ));
         }
+        /*else { // Keep around for debugging.
+            println!(
+                "good property {name}:\n  GDScript: {gdscript_prop:?}\n  Rust:     {rust_prop:?}"
+            );
+        }*/
     }
+
+    rust_properties.free();
 
     assert!(
         properties.is_empty(),
         "not all properties were matched, missing: {properties:?}"
     );
 
-    assert!(errors.is_empty(), "{}", errors.join("\n"));
-
-    rust_properties.free();
+    assert!(
+        errors.is_empty(),
+        "Encountered {} mismatches between GDScript and Rust:\n{}",
+        errors.len(),
+        errors.join("\n")
+    );
 }

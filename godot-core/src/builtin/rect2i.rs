@@ -10,7 +10,7 @@ use std::cmp;
 use crate::builtin::{Rect2, Side, Vector2i};
 
 use godot_ffi as sys;
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
 /// 2D axis-aligned integer bounding box.
 ///
@@ -31,7 +31,7 @@ use sys::{ffi_methods, GodotFfi};
 /// # Godot docs
 ///
 /// [`Rect2i` (stable)](https://docs.godotengine.org/en/stable/classes/class_rect2i.html)
-#[derive(Default, Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Default, Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Rect2i {
@@ -69,12 +69,6 @@ impl Rect2i {
             position,
             size: end - position,
         }
-    }
-
-    #[deprecated = "Moved to `Rect2::cast_int()`"]
-    #[inline]
-    pub const fn from_rect2(rect: Rect2) -> Self {
-        rect.cast_int()
     }
 
     /// Create a new `Rect2` from a `Rect2i`, using `as` for `i32` to `real` conversions.
@@ -243,11 +237,6 @@ impl Rect2i {
         Some(Self::from_corners(new_pos, new_end))
     }
 
-    #[deprecated = "Renamed to `intersect()`"]
-    pub fn intersection(self, b: Self) -> Option<Self> {
-        self.intersect(b)
-    }
-
     /// Returns `true` if the `Rect2i` overlaps with `b` (i.e. they have at least one
     /// point in common)
     #[inline]
@@ -293,7 +282,7 @@ impl Rect2i {
 // SAFETY:
 // This type is represented as `Self` in Godot, so `*mut Self` is sound.
 unsafe impl GodotFfi for Rect2i {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::RECT2I;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::RECT2I);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }

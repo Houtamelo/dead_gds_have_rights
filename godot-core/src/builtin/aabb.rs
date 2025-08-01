@@ -6,7 +6,7 @@
  */
 
 use godot_ffi as sys;
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
 use crate::builtin::math::ApproxEq;
 use crate::builtin::{real, Plane, Vector3, Vector3Axis};
@@ -147,23 +147,10 @@ impl Aabb {
             && point.z < self.size.z
     }
 
-    #[inline]
-    #[deprecated = "Renamed to `contains_point()`, for consistency with `Rect2i`"]
-    pub fn has_point(self, point: Vector3) -> bool {
-        self.contains_point(point)
-    }
-
     /// Returns if this bounding box has a surface or a length, i.e. at least one component of [`Self::size`] is greater than 0.
     #[inline]
     pub fn has_surface(self) -> bool {
         (self.size.x > 0.0) || (self.size.y > 0.0) || (self.size.z > 0.0)
-    }
-
-    /// Returns true if at least one of the size's components (X, Y, Z) is greater than 0.
-    #[inline]
-    #[deprecated = "Replaced with `has_surface()`, which has different semantics"]
-    pub fn has_area(self) -> bool {
-        ((self.size.x > 0.0) as u8 + (self.size.y > 0.0) as u8 + (self.size.z > 0.0) as u8) >= 2
     }
 
     /// Returns true if the AABB has a volume, and false if the AABB is flat, linear, empty, or has a negative size.
@@ -192,11 +179,6 @@ impl Aabb {
         rect.size = end.coord_min(end_b) - rect.position;
 
         Some(rect)
-    }
-
-    #[deprecated = "Renamed to `intersect()`"]
-    pub fn intersection(self, b: Aabb) -> Option<Self> {
-        self.intersect(b)
     }
 
     /// Returns `true` if this AABB is finite, by calling `@GlobalScope.is_finite` on each component.
@@ -466,7 +448,7 @@ impl std::fmt::Display for Aabb {
 // SAFETY:
 // This type is represented as `Self` in Godot, so `*mut Self` is sound.
 unsafe impl GodotFfi for Aabb {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::AABB;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::AABB);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }

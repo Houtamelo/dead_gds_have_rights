@@ -8,7 +8,7 @@ use std::fmt;
 
 use godot_ffi as sys;
 use godot_ffi::interface_fn;
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
 use crate::builtin::{inner, Encoding, GString, NodePath, Variant};
 use crate::meta::error::StringError;
@@ -67,7 +67,7 @@ impl StringName {
     ///
     /// Some notes on the encodings:
     /// - **Latin-1:** Since every byte is a valid Latin-1 character, no validation besides the `NUL` byte is performed.
-    ///   It is your responsibility to ensure that the input is valid Latin-1.
+    ///   It is your responsibility to ensure that the input is meaningful under Latin-1.
     /// - **ASCII**: Subset of Latin-1, which is additionally validated to be valid, non-`NUL` ASCII characters.
     /// - **UTF-8**: The input is validated to be UTF-8.
     ///
@@ -247,7 +247,7 @@ impl StringName {
     }
 
     #[doc(hidden)]
-    pub fn as_inner(&self) -> inner::InnerStringName {
+    pub fn as_inner(&self) -> inner::InnerStringName<'_> {
         inner::InnerStringName::from_outer(self)
     }
 
@@ -268,7 +268,7 @@ impl StringName {
 //   incremented as that is the callee's responsibility. Which we do by calling
 //   `std::mem::forget(string_name.clone())`.
 unsafe impl GodotFfi for StringName {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::STRING_NAME;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::STRING_NAME);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Opaque; .. }
 }

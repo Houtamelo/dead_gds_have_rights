@@ -6,15 +6,18 @@
  */
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::fmt::Display;
 
 use godot::builtin::{
-    array, dict, varray, Array, GString, NodePath, Signal, StringName, Variant, Vector2, Vector3,
+    array, varray, vdict, vslice, Array, Color, GString, NodePath, PackedInt32Array,
+    PackedStringArray, Projection, Quaternion, Signal, StringName, Transform2D, Transform3D,
+    Variant, Vector2, Vector2i, Vector3, Vector3i,
 };
 use godot::builtin::{Basis, Dictionary, VariantArray, VariantOperator, VariantType};
-use godot::classes::{Node, Node2D};
+use godot::classes::{Node, Node2D, Resource};
 use godot::meta::{FromGodot, ToGodot};
-use godot::obj::{Gd, InstanceId, NewAlloc};
+use godot::obj::{Gd, InstanceId, NewAlloc, NewGd};
 use godot::sys::GodotFfi;
 
 use crate::common::roundtrip;
@@ -72,6 +75,121 @@ fn variant_conversions() {
 
     // signal
     roundtrip(Signal::invalid());
+}
+
+#[itest]
+fn variant_relaxed_conversions() {
+    // See https://github.com/godotengine/godot/blob/4.4-stable/core/variant/variant.cpp#L532.
+
+    let obj = Node::new_alloc();
+
+    // reflexive
+    convert_relaxed_to(-22i8, -22i8);
+    convert_relaxed_to("some str", GString::from("some str"));
+    convert_relaxed_to(TEST_BASIS, TEST_BASIS);
+    convert_relaxed_to(obj, obj);
+
+    // int <-> float
+    convert_relaxed_to(1234567890i64, 1234567890f64);
+    convert_relaxed_to(1234567890f64, 1234567890i64);
+
+    // int <-> bool
+    convert_relaxed_to(-123, true);
+    convert_relaxed_to(0, false);
+    convert_relaxed_to(true, 1);
+    convert_relaxed_to(false, 0);
+
+    // float <-> bool
+    convert_relaxed_to(123.45, true);
+    convert_relaxed_to(0.0, false);
+    convert_relaxed_to(true, 1.0);
+    convert_relaxed_to(false, 0.0);
+
+    // GString <-> StringName
+    convert_relaxed_to("hello", StringName::from("hello"));
+    convert_relaxed_to(StringName::from("hello"), GString::from("hello"));
+
+    // GString <-> NodePath
+    convert_relaxed_to("hello", NodePath::from("hello"));
+    convert_relaxed_to(NodePath::from("hello"), GString::from("hello"));
+
+    // anything -> nil
+    convert_relaxed_to(Variant::nil(), Variant::nil());
+    convert_relaxed_to((), Variant::nil());
+    convert_relaxed_fail::<()>(obj);
+    convert_relaxed_fail::<()>(123.45);
+    convert_relaxed_fail::<()>(Vector3i::new(1, 2, 3));
+
+    // nil -> anything (except Variant) - fails
+    convert_relaxed_fail::<i64>(Variant::nil());
+    convert_relaxed_fail::<GString>(Variant::nil());
+    convert_relaxed_fail::<Gd<Node>>(Variant::nil());
+    convert_relaxed_fail::<VariantArray>(Variant::nil());
+    convert_relaxed_fail::<Dictionary>(Variant::nil());
+
+    // anything -> Variant
+    convert_relaxed_to(123, Variant::from(123));
+    convert_relaxed_to("hello", Variant::from("hello"));
+
+    // Array -> Packed*Array
+    let packed_ints = PackedInt32Array::from([1, 2, 3]);
+    let packed_strings = PackedStringArray::from(["a".into(), "bb".into()]);
+    let strings: Array<GString> = array!["a", "bb"];
+
+    convert_relaxed_to(array![1, 2, 3], packed_ints.clone());
+    convert_relaxed_to(varray![1, 2, 3], packed_ints.clone());
+    convert_relaxed_to(strings.clone(), packed_strings.clone());
+    convert_relaxed_to(varray!["a", "bb"], packed_strings.clone());
+
+    // Packed*Array -> Array
+    convert_relaxed_to(packed_ints.clone(), array![1, 2, 3]);
+    convert_relaxed_to(packed_ints, varray![1, 2, 3]);
+    convert_relaxed_to(packed_strings.clone(), strings);
+    convert_relaxed_to(packed_strings, varray!["a", "bb"]);
+
+    // Object|nil -> optional Object
+    convert_relaxed_to(obj, Some(obj));
+    convert_relaxed_to(Variant::nil(), Option::<Gd<Node>>::None);
+
+    // Object -> Rid
+    let res = Resource::new_gd();
+    let rid = res.get_rid();
+    convert_relaxed_to(res.clone(), rid);
+
+    // Vector2 <-> Vector2i
+    convert_relaxed_to(Vector2::new(1.0, 2.0), Vector2i::new(1, 2));
+    convert_relaxed_to(Vector2i::new(1, 2), Vector2::new(1.0, 2.0));
+
+    // int|String -> Color (don't use float colors due to rounding errors / 255-vs-256 imprecision).
+    convert_relaxed_to(0xFF_80_00_40u32, Color::from_rgba8(255, 128, 0, 64));
+    convert_relaxed_to("MEDIUM_AQUAMARINE", Color::MEDIUM_AQUAMARINE);
+
+    // Everything -> Transform3D
+    convert_relaxed_to(Transform2D::IDENTITY, Transform3D::IDENTITY);
+    convert_relaxed_to(Basis::IDENTITY, Transform3D::IDENTITY);
+    convert_relaxed_to(Quaternion::IDENTITY, Transform3D::IDENTITY);
+
+    // Projection <-> Transform3D
+    convert_relaxed_to(Projection::IDENTITY, Transform3D::IDENTITY);
+    convert_relaxed_to(Transform3D::IDENTITY, Projection::IDENTITY);
+
+    // Quaternion <-> Basis
+    convert_relaxed_to(Basis::IDENTITY, Quaternion::IDENTITY);
+    convert_relaxed_to(Quaternion::IDENTITY, Basis::IDENTITY);
+
+    // Other geometric conversions between the above fail.
+    convert_relaxed_fail::<Transform2D>(Projection::IDENTITY);
+    convert_relaxed_fail::<Transform2D>(Quaternion::IDENTITY);
+    convert_relaxed_fail::<Transform2D>(Basis::IDENTITY);
+    convert_relaxed_fail::<Projection>(Transform2D::IDENTITY);
+    convert_relaxed_fail::<Projection>(Quaternion::IDENTITY);
+    convert_relaxed_fail::<Projection>(Basis::IDENTITY);
+    convert_relaxed_fail::<Quaternion>(Transform2D::IDENTITY);
+    convert_relaxed_fail::<Quaternion>(Projection::IDENTITY);
+    convert_relaxed_fail::<Basis>(Transform2D::IDENTITY);
+    convert_relaxed_fail::<Basis>(Projection::IDENTITY);
+
+    obj.free();
 }
 
 #[itest]
@@ -143,14 +261,14 @@ fn variant_dead_object_conversions() {
 
     // Verify Display + Debug impl.
     assert_eq!(format!("{variant}"), "<Freed Object>");
-    assert_eq!(format!("{variant:?}"), "<Freed Object>");
+    assert_eq!(format!("{variant:?}"), "VariantGd { freed obj }");
 
     // Variant::try_to().
     let result = variant.try_to::<Gd<Node>>();
     let err = result.expect_err("Variant::try_to::<Gd>() with dead object should fail");
     assert_eq!(
         err.to_string(),
-        "variant holds object which is no longer alive: <Freed Object>"
+        "variant holds object which is no longer alive: VariantGd { freed obj }"
     );
 
     // Variant::to().
@@ -164,7 +282,7 @@ fn variant_dead_object_conversions() {
     let err = result.expect_err("Variant::try_to::<Option<Gd>>() with dead object should fail");
     assert_eq!(
         err.to_string(),
-        "variant holds object which is no longer alive: <Freed Object>"
+        "variant holds object which is no longer alive: VariantGd { freed obj }"
     );
 }
 
@@ -308,7 +426,7 @@ fn variant_call() {
 
     // Object
     let position = Vector2::new(4.0, 5.0);
-    let result = variant.call("set_position", &[position.to_variant()]);
+    let result = variant.call("set_position", vslice![position]);
     assert!(result.is_nil());
 
     let result = variant
@@ -333,7 +451,7 @@ fn variant_call() {
     // Vector2
     let vector = Vector2::new(5.0, 3.0);
     let vector_rhs = Vector2::new(1.0, -1.0);
-    let result = vector.to_variant().call("dot", &[vector_rhs.to_variant()]);
+    let result = vector.to_variant().call("dot", vslice![vector_rhs]);
     assert_eq!(result, 2.0.to_variant());
 
     // Dynamic checks are only available in Debug builds.
@@ -478,7 +596,7 @@ fn variant_null_object_is_nil() {
 
     // Simulates an object that is returned but null
     // Use reflection to get a variant as return type
-    let variant = node.call("get_node_or_null", &[node_path.to_variant()]);
+    let variant = node.call("get_node_or_null", vslice![node_path]);
     let raw_type: sys::GDExtensionVariantType =
         unsafe { sys::interface_fn!(variant_get_type)(variant.var_sys()) };
 
@@ -500,7 +618,7 @@ fn variant_stringify() {
         gstr("[1, \"hello\", false]")
     );
     assert_eq!(
-        dict! { "KEY": 50 }.to_variant().stringify(),
+        vdict! { "KEY": 50 }.to_variant().stringify(),
         gstr("{ \"KEY\": 50 }")
     );
 }
@@ -510,7 +628,7 @@ fn variant_booleanize() {
     assert!(gstr("string").to_variant().booleanize());
     assert!(10.to_variant().booleanize());
     assert!(varray![""].to_variant().booleanize());
-    assert!(dict! { "Key": 50 }.to_variant().booleanize());
+    assert!(vdict! { "Key": 50 }.to_variant().booleanize());
 
     assert!(!Dictionary::new().to_variant().booleanize());
     assert!(!varray![].to_variant().booleanize());
@@ -522,7 +640,7 @@ fn variant_booleanize() {
 #[itest]
 fn variant_hash() {
     let hash_is_not_0 = [
-        dict! {}.to_variant(),
+        vdict! {}.to_variant(),
         gstr("").to_variant(),
         varray![].to_variant(),
     ];
@@ -530,7 +648,7 @@ fn variant_hash() {
         gstr("string").to_variant(),
         varray![false, true, 4, "7"].to_variant(),
         0.to_variant(),
-        dict! { 0 : dict!{ 0: 1 } }.to_variant(),
+        vdict! { 0 : vdict!{ 0: 1 } }.to_variant(),
     ];
 
     for variant in hash_is_not_0 {
@@ -544,10 +662,49 @@ fn variant_hash() {
 
     // It's not guaranteed that different object will have different hash, but it is
     // extremely unlikely for a collision to happen.
-    assert_ne!(dict! { 0: dict! { 0: 0 } }, dict! { 0: dict! { 0: 1 } });
+    assert_ne!(vdict! { 0: vdict! { 0: 0 } }, vdict! { 0: vdict! { 0: 1 } });
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
+
+fn convert_relaxed_to<T, U>(from: T, expected_to: U)
+where
+    T: ToGodot + fmt::Debug,
+    U: FromGodot + PartialEq + fmt::Debug,
+{
+    let variant = from.to_variant();
+    let result = variant.try_to_relaxed::<U>();
+
+    match result {
+        Ok(to) => {
+            assert_eq!(
+                to, expected_to,
+                "converting {from:?} to {to:?} resulted in unexpected value"
+            );
+        }
+        Err(err) => {
+            panic!("Conversion from {from:?} to {expected_to:?} failed: {err}");
+        }
+    }
+}
+
+fn convert_relaxed_fail<U>(from: impl ToGodot + fmt::Debug)
+where
+    U: FromGodot + PartialEq + fmt::Debug,
+{
+    let variant = from.to_variant();
+    let result = variant.try_to_relaxed::<U>();
+
+    match result {
+        Ok(to) => {
+            let to_type = godot::sys::short_type_name::<U>();
+            panic!(
+                "Conversion from {from:?} to {to_type:?} unexpectedly succeeded with value: {to:?}"
+            );
+        }
+        Err(_err) => {}
+    }
+}
 
 fn truncate_bad<T>(original_value: i64)
 where

@@ -16,7 +16,7 @@ macro_rules! impl_vector_axis_enum {
         ///
         #[doc = concat!("`", stringify!($Vector), "` implements `Index<", stringify!($AxisEnum), ">` and `IndexMut<", stringify!($AxisEnum), ">`")]
         #[doc = ", so you can use this type to access a vector component as `vec[axis]`."]
-        #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+        #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
         #[repr(i32)]
         pub enum $AxisEnum {
             $(
@@ -53,6 +53,26 @@ macro_rules! impl_vector_axis_enum {
                         Self::$axis => concat!("AXIS_", stringify!($axis)),
                     )+
                 }
+            }
+
+            fn values() -> &'static [Self] {
+                // For vector axis enums, all values are distinct, so both are the same
+                &[
+                    $( $AxisEnum::$axis, )+
+                ]
+            }
+
+            fn all_constants() -> &'static [crate::meta::inspect::EnumConstant<$AxisEnum>] {
+                use crate::meta::inspect::EnumConstant;
+                const { &[
+                    $(
+                        EnumConstant::new(
+                            stringify!($axis),
+                            concat!("AXIS_", stringify!($axis)),
+                            $AxisEnum::$axis
+                        ),
+                    )+
+                ] }
             }
         }
 

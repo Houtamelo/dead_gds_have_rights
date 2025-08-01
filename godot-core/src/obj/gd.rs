@@ -11,10 +11,10 @@ use std::ops::{Deref, DerefMut};
 use godot_ffi as sys;
 use sys::{static_assert_eq_size_align, SysPtr as _};
 
-use crate::builtin::{Callable, NodePath, StringName, Variant};
+use crate::builtin::{Callable, GString, NodePath, StringName, Variant};
 use crate::meta::error::{ConvertError, FromFfiError};
 use crate::meta::{
-    ArrayElement, AsArg, CallContext, ClassName, CowArg, FromGodot, GodotConvert, GodotType,
+    ArrayElement, AsArg, ByRef, CallContext, ClassName, CowArg, FromGodot, GodotConvert, GodotType,
     ParamType, PropertyHintInfo, RefArg, ToGodot,
 };
 use crate::obj::{
@@ -89,6 +89,16 @@ use crate::{classes, out};
 /// # Conversions
 ///
 /// For type conversions, please read the [`godot::meta` module docs][crate::meta].
+///
+/// # Exporting
+///
+/// The [`Export`][crate::registry::property::Export] trait is not directly implemented for `Gd<T>`, because the editor expects object-based
+/// properties to be nullable, while `Gd<T>` can't be null. Instead, `Export` is implemented for [`OnEditor<Gd<T>>`][crate::obj::OnEditor],
+/// which validates that objects have been set by the editor. For the most flexible but least ergonomic option, you can also export
+/// `Option<Gd<T>>` fields.
+///
+/// Objects can only be exported if `T: Inherits<Node>` or `T: Inherits<Resource>`, just like GDScript.
+/// This means you cannot use `#[export]` with `OnEditor<Gd<RefCounted>>`, for example.
 ///
 /// [book]: https://godot-rust.github.io/book/godot-api/objects.html
 /// [`Object`]: classes::Object
@@ -174,7 +184,7 @@ where
     /// * If there is an ongoing function call from GDScript to Rust, which currently holds a `&mut T`
     ///   reference to the user instance. This can happen through re-entrancy (Rust -> GDScript -> Rust call).
     // Note: possible names: write/read, hold/hold_mut, r/w, r/rw, ...
-    pub fn bind(&self) -> GdRef<T> {
+    pub fn bind(&self) -> GdRef<'_, T> {
         self.raw.bind()
     }
 
@@ -191,7 +201,7 @@ where
     /// * If another `Gd` smart pointer pointing to the same Rust instance has a live `GdRef` or `GdMut` guard bound.
     /// * If there is an ongoing function call from GDScript to Rust, which currently holds a `&T` or `&mut T`
     ///   reference to the user instance. This can happen through re-entrancy (Rust -> GDScript -> Rust call).
-    pub fn bind_mut(&mut self) -> GdMut<T> {
+    pub fn bind_mut(&mut self) -> GdMut<'_, T> {
         self.raw.bind_mut()
     }
 }
@@ -294,6 +304,21 @@ impl<T: GodotClass> Gd<T> {
                 assert!(success, "failed to get class name for object {self:?}");
             })
         }
+    }
+
+    /// Returns the reference count, if the dynamic object inherits `RefCounted`; and `None` otherwise.
+    pub(crate) fn maybe_refcount(&self) -> Option<usize> {
+        // Fast check if ref-counted without downcast.
+        self.instance_id().is_ref_counted().then(|| {
+            let rc = self.raw.with_ref_counted(|refc| refc.get_reference_count());
+            rc as usize
+        })
+    }
+
+    #[cfg(feature = "trace")] // itest only.
+    #[doc(hidden)]
+    pub fn test_refcount(&self) -> Option<usize> {
+        self.maybe_refcount()
     }
 
     /// **Upcast:** convert into a smart pointer to a base class. Always succeeds.
@@ -492,6 +517,21 @@ impl<T: GodotClass> Gd<T> {
         Callable::from_object_method(self, method_name)
     }
 
+    /// Creates a new callable linked to the given object from **single-threaded** Rust function or closure.
+    /// This is shorter syntax for [`Callable::from_linked_fn()`].
+    ///
+    /// `name` is used for the string representation of the closure, which helps with debugging.
+    ///
+    /// Such a callable will be automatically invalidated by Godot when a linked Object is freed.
+    /// If you need a Callable which can live indefinitely use [`Callable::from_local_fn()`].
+    #[cfg(since_api = "4.2")]
+    pub fn linked_callable<F>(&self, method_name: impl AsArg<GString>, rust_function: F) -> Callable
+    where
+        F: 'static + FnMut(&[&Variant]) -> Result<Variant, ()>,
+    {
+        Callable::from_linked_fn(method_name, self, rust_function)
+    }
+
     pub(crate) unsafe fn from_obj_sys_or_none(
         ptr: sys::GDExtensionObjectPtr,
     ) -> Result<Self, ConvertError> {
@@ -599,6 +639,7 @@ where
         };
 
         if !self.is_instance_valid() {
+            crate::godot_warn!("Calling `free` on already freed object.");
             return;
         }
 
@@ -742,7 +783,14 @@ where
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Trait impls
 
-impl<T: GodotClass> Deref for Gd<T> {
+/// Dereferences to the nearest engine class, enabling direct calls to its `&self` methods.
+///
+/// For engine classes, returns `T` itself. For user classes, returns `T::Base` (the direct engine base class).
+/// The bound ensures that the target is always an engine-provided class.
+impl<T: GodotClass> Deref for Gd<T>
+where
+    GdDerefTarget<T>: Bounds<Declarer = bounds::DeclEngine>,
+{
     // Target is always an engine class:
     // * if T is an engine class => T
     // * if T is a user class => T::Base
@@ -753,7 +801,14 @@ impl<T: GodotClass> Deref for Gd<T> {
     }
 }
 
-impl<T: GodotClass> DerefMut for Gd<T> {
+/// Mutably dereferences to the nearest engine class, enabling direct calls to its `&mut self` methods.
+///
+/// For engine classes, returns `T` itself. For user classes, returns `T::Base` (the direct engine base class).
+/// The bound ensures that the target is always an engine-provided class.
+impl<T: GodotClass> DerefMut for Gd<T>
+where
+    GdDerefTarget<T>: Bounds<Declarer = bounds::DeclEngine>,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.raw.as_target_mut()
     }
@@ -844,30 +899,32 @@ impl<T: GodotClass> ArrayElement for Option<Gd<T>> {
     }
 }
 
-impl<'r, T: GodotClass> AsArg<Gd<T>> for &'r Gd<T> {
+/*
+// TODO find a way to generalize AsArg to derived->base conversions without breaking type inference in array![].
+// Possibly we could use a "canonical type" with unambiguous mapping (&Gd<T> -> &Gd<T>, not &Gd<T> -> &Gd<TBase>).
+// See also regression test in array_test.rs.
+
+impl<'r, T, TBase> AsArg<Gd<TBase>> for &'r Gd<T>
+where
+    T: Inherits<TBase>,
+    TBase: GodotClass,
+{
     #[doc(hidden)] // Repeated despite already hidden in trait; some IDEs suggest this otherwise.
-    fn into_arg<'cow>(self) -> CowArg<'cow, Gd<T>>
+    fn into_arg<'cow>(self) -> CowArg<'cow, Gd<TBase>>
     where
         'r: 'cow, // Original reference must be valid for at least as long as the returned cow.
     {
-        CowArg::Borrowed(self)
+        // Performance: clones unnecessarily, which has overhead for ref-counted objects.
+        // A result of being generic over base objects and allowing T: Inherits<Base> rather than just T == Base.
+        // Was previously `CowArg::Borrowed(self)`. Borrowed() can maybe be specialized for objects, or combined with AsObjectArg.
+
+        CowArg::Owned(self.clone().upcast::<TBase>())
     }
 }
+*/
 
 impl<T: GodotClass> ParamType for Gd<T> {
-    type Arg<'v> = CowArg<'v, Gd<T>>;
-
-    fn owned_to_arg<'v>(self) -> Self::Arg<'v> {
-        CowArg::Owned(self)
-    }
-
-    fn arg_to_ref<'r>(arg: &'r Self::Arg<'_>) -> &'r Self {
-        arg.cow_as_ref()
-    }
-
-    fn arg_into_owned(arg: Self::Arg<'_>) -> Self {
-        arg.cow_into_owned()
-    }
+    type ArgPassing = ByRef;
 }
 
 impl<T: GodotClass> AsArg<Option<Gd<T>>> for Option<&Gd<T>> {
@@ -881,19 +938,7 @@ impl<T: GodotClass> AsArg<Option<Gd<T>>> for Option<&Gd<T>> {
 }
 
 impl<T: GodotClass> ParamType for Option<Gd<T>> {
-    type Arg<'v> = CowArg<'v, Option<Gd<T>>>;
-
-    fn owned_to_arg<'v>(self) -> Self::Arg<'v> {
-        CowArg::Owned(self)
-    }
-
-    fn arg_to_ref<'r>(arg: &'r Self::Arg<'_>) -> &'r Self {
-        arg.cow_as_ref()
-    }
-
-    fn arg_into_owned(arg: Self::Arg<'_>) -> Self {
-        arg.cow_into_owned()
-    }
+    type ArgPassing = ByRef;
 }
 
 impl<T, B: GodotClass> Default for Gd<T>
@@ -931,6 +976,7 @@ impl<T: GodotClass> Var for Gd<T> {
     }
 }
 
+/// See [`Gd` Exporting](struct.Gd.html#exporting) section.
 impl<T> Export for Option<Gd<T>>
 where
     T: GodotClass + Bounds<Exportable = bounds::Yes>,
@@ -973,6 +1019,7 @@ where
     }
 }
 
+/// See [`Gd` Exporting](struct.Gd.html#exporting) section.
 impl<T> Export for OnEditor<Gd<T>>
 where
     Self: Var,

@@ -8,7 +8,7 @@
 use std::{fmt, ptr};
 
 use godot_ffi as sys;
-use sys::{interface_fn, GodotFfi, GodotNullableFfi, PtrcallType};
+use sys::{interface_fn, ExtVariantType, GodotFfi, GodotNullableFfi, PtrcallType};
 
 use crate::builtin::{Variant, VariantType};
 use crate::meta::error::{ConvertError, FromVariantError};
@@ -16,8 +16,9 @@ use crate::meta::{
     CallContext, ClassName, FromGodot, GodotConvert, GodotFfiVariant, GodotType, RefArg, ToGodot,
 };
 use crate::obj::bounds::{gd_is_null, Declarer, DynMemory};
+use crate::obj::casts::CastSuccess;
 use crate::obj::rtti::ObjectRtti;
-use crate::obj::{bounds, Bounds, GdDerefTarget, GdMut, GdRef, GodotClass, InstanceId};
+use crate::obj::{bounds, Bounds, Gd, GdDerefTarget, GdMut, GdRef, GodotClass, InstanceId};
 use crate::storage::{InstanceCache, InstanceStorage, Storage};
 use crate::{classes, out};
 
@@ -104,8 +105,7 @@ impl<T: GodotClass> RawGd<T> {
 
     /// Returns `true` if the object is null.
     ///
-    /// This does not check if the object is dead, for that use
-    /// [`instance_id_or_none()`](Self::instance_id_or_none).
+    /// This does not check if the object is dead. For that, use [`is_instance_valid()`](Self::is_instance_valid).
     pub(crate) fn is_null(&self) -> bool {
         gd_is_null(self.memory.obj(), self.memory.cached_rtti())
     }
@@ -124,21 +124,8 @@ impl<T: GodotClass> RawGd<T> {
     where
         U: GodotClass,
     {
-        if self.is_null() {
-            // Null can be cast to anything.
-            return true;
-        }
-
-        // SAFETY: object is forgotten below.
-        let as_obj =
-            unsafe { self.ffi_cast::<classes::Object>() }.expect("everything inherits Object");
-
-        // SAFETY: Object is always a base class.
-        let cast_is_valid = unsafe { as_obj.as_upcast_ref::<classes::Object>() }
-            .is_class(&U::class_name().to_gstring());
-
-        std::mem::forget(as_obj);
-        cast_is_valid
+        self.is_null() // Null can be cast to anything.
+            || self.as_object_ref().is_class(&U::class_name().to_gstring())
     }
 
     /// Returns `Ok(cast_obj)` on success, `Err(self)` on error
@@ -159,24 +146,25 @@ impl<T: GodotClass> RawGd<T> {
         // The Deref/DerefMut impls for T implement an "implicit upcast" on the object (not Gd) level and
         // rely on this (e.g. &Node3D -> &Node).
 
-        let result = unsafe { self.ffi_cast::<U>() };
-        match result {
-            Some(cast_obj) => {
-                // duplicated ref, one must be wiped
-                std::mem::forget(self);
-                Ok(cast_obj)
-            }
-            None => Err(self),
+        match self.ffi_cast::<U>() {
+            Ok(success) => Ok(success.into_dest(self)),
+            Err(_) => Err(self),
         }
     }
 
-    /// # Safety
-    /// Does not transfer ownership and is thus unsafe. Also operates on shared ref. Either the parameter or
-    /// the return value *must* be forgotten (since reference counts are not updated).
-    pub(super) unsafe fn ffi_cast<U>(&self) -> Option<RawGd<U>>
+    /// Low-level cast that allows selective use of either input or output type.
+    ///
+    /// On success, you'll get a `CastSuccess<T, U>` instance, which holds a weak `RawGd<U>`. You can only extract that one by trading
+    /// a strong `RawGd<T>` for it, to maintain the balance.
+    ///
+    /// This function is unreliable when invoked _during_ destruction (e.g. C++ `~RefCounted()` destructor). This can occur when debug-logging
+    /// instances during cleanups. `Object::object_cast_to()` is a virtual function, but virtual dispatch during destructor doesn't work in C++.
+    pub(super) fn ffi_cast<U>(&self) -> Result<CastSuccess<T, U>, ()>
     where
         U: GodotClass,
     {
+        //eprintln!("ffi_cast: {} (dyn {}) -> {}", T::class_name(), self.as_non_null().dynamic_class_string(), U::class_name());
+
         // `self` may be null when we convert a null-variant into a `Option<Gd<T>>`, since we use `ffi_cast`
         // in the `ffi_from_variant` conversion function to ensure type-correctness. So the chain would be as follows:
         // - Variant::nil()
@@ -186,7 +174,7 @@ impl<T: GodotClass> RawGd<T> {
         if self.is_null() {
             // Null can be cast to anything.
             // Forgetting a null doesn't do anything, since dropping a null also does nothing.
-            return Some(RawGd::null());
+            return Ok(CastSuccess::null());
         }
 
         // Before Godot API calls, make sure the object is alive (and in Debug mode, of the correct type).
@@ -195,29 +183,71 @@ impl<T: GodotClass> RawGd<T> {
         // a bug that must be solved by the user.
         self.check_rtti("ffi_cast");
 
-        let class_tag = interface_fn!(classdb_get_class_tag)(U::class_name().string_sys());
-        let cast_object_ptr = interface_fn!(object_cast_to)(self.obj_sys(), class_tag);
+        let cast_object_ptr = unsafe {
+            let class_tag = interface_fn!(classdb_get_class_tag)(U::class_name().string_sys());
+            interface_fn!(object_cast_to)(self.obj_sys(), class_tag)
+        };
+
+        if cast_object_ptr.is_null() {
+            return Err(());
+        }
 
         // Create weak object, as ownership will be moved and reference-counter stays the same.
-        sys::ptr_then(cast_object_ptr, |ptr| RawGd::from_obj_sys_weak(ptr))
+        let weak = unsafe { RawGd::from_obj_sys_weak(cast_object_ptr) };
+        Ok(CastSuccess::from_weak(weak))
     }
 
+    /// Executes a function, assuming that `self` inherits `RefCounted`.
+    ///
+    /// This function is unreliable when invoked _during_ destruction (e.g. C++ `~RefCounted()` destructor). This can occur when debug-logging
+    /// instances during cleanups. `Object::object_cast_to()` is a virtual function, but virtual dispatch during destructor doesn't work in C++.
+    ///
+    /// # Panics
+    /// If `self` does not inherit `RefCounted` or is null.
     pub(crate) fn with_ref_counted<R>(&self, apply: impl Fn(&mut classes::RefCounted) -> R) -> R {
         // Note: this previously called Declarer::scoped_mut() - however, no need to go through bind() for changes in base RefCounted.
         // Any accesses to user objects (e.g. destruction if refc=0) would bind anyway.
+        //
+        // Might change implementation as follows -- but last time caused UB; investigate.
+        // pub(crate) unsafe fn as_ref_counted_unchecked(&mut self) -> &mut classes::RefCounted {
+        //     self.as_target_mut()
+        // }
 
-        let tmp = unsafe { self.ffi_cast::<classes::RefCounted>() };
-        let mut tmp = tmp.expect("object expected to inherit RefCounted");
-        let return_val = apply(tmp.as_target_mut());
+        let mut ref_counted = match self.ffi_cast::<classes::RefCounted>() {
+            Ok(cast_success) => cast_success,
+            Err(()) if self.is_null() => {
+                panic!("RawGd::with_ref_counted(): expected to inherit RefCounted, encountered null pointer");
+            }
+            Err(()) => {
+                // SAFETY: this branch implies non-null.
+                let gd_ref = unsafe { self.as_non_null() };
+                let class = gd_ref.dynamic_class_string();
 
-        std::mem::forget(tmp); // no ownership transfer
+                // One way how this may panic is when invoked during destruction of a RefCounted object. The C++ `Object::object_cast_to()`
+                // function is virtual but cannot be dynamically dispatched in a C++ destructor.
+                panic!("RawGd::with_ref_counted(): expected to inherit RefCounted, but encountered {class}");
+            }
+        };
+
+        let return_val = apply(ref_counted.as_dest_mut().as_target_mut());
+
+        // CastSuccess is forgotten when dropped, so no ownership transfer.
         return_val
     }
 
-    // TODO replace the above with this -- last time caused UB; investigate.
-    // pub(crate) unsafe fn as_ref_counted_unchecked(&mut self) -> &mut classes::RefCounted {
-    //     self.as_target_mut()
-    // }
+    /// Enables outer `Gd` APIs or bypasses additional null checks, in cases where `RawGd` is guaranteed non-null.
+    ///
+    /// # Safety
+    /// `self` must not be null.
+    pub(crate) unsafe fn as_non_null(&self) -> &Gd<T> {
+        debug_assert!(
+            !self.is_null(),
+            "RawGd::as_non_null() called on null pointer; this is UB"
+        );
+
+        // SAFETY: layout of Gd<T> is currently equivalent to RawGd<T>.
+        unsafe { std::mem::transmute::<&RawGd<T>, &Gd<T>>(self) }
+    }
 
     pub(crate) fn as_object_ref(&self) -> &classes::Object {
         // SAFETY: Object is always a valid upcast target.
@@ -240,7 +270,8 @@ impl<T: GodotClass> RawGd<T> {
     /// Bounds should be added on user-facing safe APIs.
     pub(super) unsafe fn as_upcast_ref<Base>(&self) -> &Base
     where
-        Base: GodotClass,
+        // DeclEngine needed for sound transmute; in case we add Rust-defined base classes.
+        Base: GodotClass + Bounds<Declarer = bounds::DeclEngine>,
     {
         self.ensure_valid_upcast::<Base>();
 
@@ -278,7 +309,8 @@ impl<T: GodotClass> RawGd<T> {
     /// Bounds should be added on user-facing safe APIs.
     pub(super) unsafe fn as_upcast_mut<Base>(&mut self) -> &mut Base
     where
-        Base: GodotClass,
+        // DeclEngine needed for sound transmute; in case we add Rust-defined base classes.
+        Base: GodotClass + Bounds<Declarer = bounds::DeclEngine>,
     {
         self.ensure_valid_upcast::<Base>();
 
@@ -294,7 +326,10 @@ impl<T: GodotClass> RawGd<T> {
 
     /// # Panics
     /// If this `RawGd` is null.
-    pub(super) fn as_target(&self) -> &GdDerefTarget<T> {
+    pub(super) fn as_target(&self) -> &GdDerefTarget<T>
+    where
+        GdDerefTarget<T>: Bounds<Declarer = bounds::DeclEngine>,
+    {
         // SAFETY: There are two possible Declarer::DerefTarget types:
         // - T, if T is an engine class
         // - T::Base, if T is a user class
@@ -304,7 +339,10 @@ impl<T: GodotClass> RawGd<T> {
 
     /// # Panics
     /// If this `RawGd` is null.
-    pub(super) fn as_target_mut(&mut self) -> &mut GdDerefTarget<T> {
+    pub(super) fn as_target_mut(&mut self) -> &mut GdDerefTarget<T>
+    where
+        GdDerefTarget<T>: Bounds<Declarer = bounds::DeclEngine>,
+    {
         // SAFETY: See as_target().
         unsafe { self.as_upcast_mut::<GdDerefTarget<T>>() }
     }
@@ -323,21 +361,21 @@ impl<T: GodotClass> RawGd<T> {
         #[cfg(debug_assertions)]
         {
             // SAFETY: we forget the object below and do not leave the function before.
-            let ffi_ref: RawGd<Base> =
-                unsafe { self.ffi_cast::<Base>().expect("failed FFI upcast") };
+            let ffi_dest = self.ffi_cast::<Base>().expect("failed FFI upcast");
 
             // The ID check is not that expressive; we should do a complete comparison of the ObjectRtti, but currently the dynamic types can
             // be different (see comment in ObjectRtti struct). This at least checks that the transmuted object is not complete garbage.
             // We get direct_id from Self and not Base because the latter has no API with current bounds; but this equivalence is tested in Deref.
             let direct_id = self.instance_id_unchecked().expect("direct_id null");
-            let ffi_id = ffi_ref.instance_id_unchecked().expect("ffi_id null");
+            let ffi_id = ffi_dest
+                .as_dest_ref()
+                .instance_id_unchecked()
+                .expect("ffi_id null");
 
             assert_eq!(
                 direct_id, ffi_id,
-                "upcast_ref: direct and FFI IDs differ. This is a bug, please report to gdext maintainers."
+                "upcast_ref: direct and FFI IDs differ. This is a bug, please report to godot-rust maintainers."
             );
-
-            std::mem::forget(ffi_ref);
         }
     }
 
@@ -384,7 +422,7 @@ where
     ///
     /// See [`crate::obj::Gd::bind()`] for a more in depth explanation.
     // Note: possible names: write/read, hold/hold_mut, r/w, r/rw, ...
-    pub(crate) fn bind(&self) -> GdRef<T> {
+    pub(crate) fn bind(&self) -> GdRef<'_, T> {
         self.check_rtti("bind");
         GdRef::from_guard(self.storage().unwrap().get())
     }
@@ -392,7 +430,7 @@ where
     /// Hands out a guard for an exclusive borrow, through which the user instance can be read and written.
     ///
     /// See [`crate::obj::Gd::bind_mut()`] for a more in depth explanation.
-    pub(crate) fn bind_mut(&mut self) -> GdMut<T> {
+    pub(crate) fn bind_mut(&mut self) -> GdMut<'_, T> {
         self.check_rtti("bind_mut");
         GdMut::from_guard(self.storage().unwrap().get_mut())
     }
@@ -434,8 +472,19 @@ where
         }
     }
 
-    // TODO: document unsafety in this function, and double check that it actually needs to be unsafe.
-    unsafe fn resolve_instance_ptr(&self) -> sys::GDExtensionClassInstancePtr {
+    /// Retrieves and caches pointer to this class instance if `self.obj` is non-null.
+    /// Returns a null pointer otherwise.
+    ///
+    /// Note: The returned pointer to the GDExtensionClass instance (even when `self.obj` is non-null)
+    /// might still be null when:
+    /// - The class isn't instantiable in the current context.
+    /// - The instance is a placeholder (e.g., non-`tool` classes in the editor).
+    ///
+    /// However, null pointers might also occur in other, undocumented contexts.
+    ///
+    /// # Panics
+    /// In Debug mode, if binding is null.
+    fn resolve_instance_ptr(&self) -> sys::GDExtensionClassInstancePtr {
         if self.is_null() {
             return ptr::null_mut();
         }
@@ -446,16 +495,21 @@ where
         }
 
         let callbacks = crate::storage::nop_instance_callbacks();
-        let token = sys::get_library() as *mut std::ffi::c_void;
-        let binding = interface_fn!(object_get_instance_binding)(self.obj_sys(), token, &callbacks);
 
-        debug_assert!(
-            !binding.is_null(),
-            "Class {} -- null instance; does the class have a Godot creator function?",
-            std::any::type_name::<T>()
-        );
+        // SAFETY: library is already initialized.
+        let token = unsafe { sys::get_library() };
+        let token = token.cast::<std::ffi::c_void>();
 
-        let ptr = binding as sys::GDExtensionClassInstancePtr;
+        // SAFETY: ensured that `self.obj` is non-null and valid.
+        let binding = unsafe {
+            interface_fn!(object_get_instance_binding)(self.obj_sys(), token, &callbacks)
+        };
+
+        let ptr: sys::GDExtensionClassInstancePtr = binding.cast();
+
+        #[cfg(debug_assertions)]
+        crate::classes::ensure_binding_not_null::<T>(ptr);
+
         self.cached_storage_ptr.set(ptr);
         ptr
     }
@@ -475,7 +529,7 @@ where
 {
     // If anything changes here, keep in sync with ObjectArg impl.
 
-    const VARIANT_TYPE: VariantType = VariantType::OBJECT;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::OBJECT);
 
     unsafe fn new_from_sys(ptr: sys::GDExtensionConstTypePtr) -> Self {
         Self::from_obj_sys_weak(ptr as sys::GDExtensionObjectPtr)
@@ -646,7 +700,7 @@ impl<T: GodotClass> GodotNullableFfi for RawGd<T> {
 
 impl<T: GodotClass> Clone for RawGd<T> {
     fn clone(&self) -> Self {
-        out!("RawGd::clone");
+        out!("RawGd::clone:     {self:?}  (before clone)");
 
         if self.is_null() || !self.is_instance_valid() {
             Self::null()
@@ -665,12 +719,7 @@ impl<T: GodotClass> Clone for RawGd<T> {
 
 impl<T: GodotClass> fmt::Debug for RawGd<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_null() {
-            return write!(f, "{} {{ null obj }}", std::any::type_name::<T>());
-        }
-
-        let gd = super::Gd::from_ffi(self.clone());
-        write!(f, "{gd:?}")
+        classes::debug_string_nullable(self, f, "RawGd")
     }
 }
 

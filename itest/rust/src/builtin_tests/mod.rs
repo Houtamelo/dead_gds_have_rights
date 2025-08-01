@@ -30,6 +30,7 @@ mod containers {
     mod dictionary_test;
     mod packed_array_test;
     mod rid_test;
+    mod signal_disconnect_test;
     mod signal_test;
     mod variant_test;
 }
@@ -48,6 +49,8 @@ mod script {
 mod color_test;
 
 mod convert_test;
+
+mod common;
 
 #[cfg(feature = "serde")]
 mod serde_test;

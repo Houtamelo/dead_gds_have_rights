@@ -12,6 +12,8 @@
 //! * [`Gd`], a smart pointer that manages instances of Godot classes.
 
 mod base;
+mod call_deferred;
+mod casts;
 mod dyn_gd;
 mod gd;
 mod guards;
@@ -24,6 +26,7 @@ mod traits;
 pub(crate) mod rtti;
 
 pub use base::*;
+pub use call_deferred::WithDeferredCall;
 pub use dyn_gd::DynGd;
 pub use gd::*;
 pub use guards::{BaseMut, BaseRef, DynGdMut, DynGdRef, GdMut, GdRef};
@@ -39,4 +42,9 @@ pub use bounds::private::Bounds;
 
 // Do not re-export rtti here.
 
+/// Resolves the type to which a `Gd<T>` dereferences.
+///
+/// This type alias abstracts over the two `Declarer` options for Godot objects:
+/// - [`bounds::DeclEngine`]: for all engine-provided classes, `DerefTarget<T>` is `T`.
+/// - [`bounds::DeclUser`]: for Rust-defined user classes, `DerefTarget<T>` is `T::Base`.
 type GdDerefTarget<T> = <<T as Bounds>::Declarer as bounds::Declarer>::DerefTarget<T>;

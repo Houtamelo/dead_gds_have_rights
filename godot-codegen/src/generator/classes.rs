@@ -15,7 +15,7 @@ use crate::models::domain::{
     ModName, TyName,
 };
 use crate::util::{ident, make_string_name};
-use crate::{conv, util, SubmitFn};
+use crate::{util, SubmitFn};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use std::path::Path;
@@ -45,6 +45,7 @@ pub fn generate_class_files(
             own_notification_enum_name: generated_class.notification_enum.try_to_own_name(),
             inherits_macro_ident: generated_class.inherits_macro_ident,
             is_pub_sidecar: generated_class.has_sidecar_module,
+            has_interface_trait: generated_class.has_interface_trait,
         });
     }
 
@@ -60,17 +61,26 @@ pub fn generate_class_files(
 struct GeneratedClass {
     code: TokenStream,
     notification_enum: NotificationEnum,
-    inherits_macro_ident: Ident,
+    inherits_macro_ident: Option<Ident>,
     /// Sidecars are the associated modules with related enum/flag types, such as `node_3d` for `Node3D` class.
     has_sidecar_module: bool,
+    has_interface_trait: bool,
 }
 
 struct GeneratedClassModule {
     class_name: TyName,
     module_name: ModName,
     own_notification_enum_name: Option<Ident>,
-    inherits_macro_ident: Ident,
+    inherits_macro_ident: Option<Ident>,
     is_pub_sidecar: bool,
+    has_interface_trait: bool,
+}
+
+struct Construction {
+    constructor: TokenStream,
+    construct_doc: &'static str,
+    final_doc: Option<&'static str>,
+    godot_default_impl: TokenStream,
 }
 
 fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClass {
@@ -79,19 +89,25 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
     // Strings
     let godot_class_str = &class_name.godot_ty;
     let class_name_cstr = util::c_str(godot_class_str);
-    let virtual_trait_str = class_name.virtual_trait_name();
 
     // Idents and tokens
-    let (base_ty, base_ident_opt) = match class.inherits.as_ref() {
-        Some(base) => {
-            let base = ident(&conv::to_pascal_case(base));
-            (quote! { crate::classes::#base }, Some(base))
+    let (base_ty, base_ident_opt) = match class.base_class.as_ref() {
+        Some(TyName { rust_ty, .. }) => {
+            (quote! { crate::classes::#rust_ty }, Some(rust_ty.clone()))
         }
         None => (quote! { crate::obj::NoBase }, None),
     };
 
-    let (constructor, construct_doc, godot_default_impl) = make_constructor_and_default(class, ctx);
-    let construct_doc = construct_doc.replace("Self", &class_name.rust_ty.to_string());
+    let Construction {
+        constructor,
+        construct_doc,
+        final_doc,
+        godot_default_impl,
+    } = make_constructor_and_default(class, ctx);
+
+    let mut extended_class_doc = construct_doc.replace("Self", &class_name.rust_ty.to_string());
+    extended_class_doc.push_str(final_doc.unwrap_or_default());
+
     let api_level = class.api_level;
     let init_level = api_level.to_init_level();
 
@@ -130,10 +146,10 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
 
     let enums = enums::make_enums(&class.enums, &cfg_attributes);
     let constants = constants::make_constants(&class.constants);
-    let inherits_macro = format_ident!("unsafe_inherits_transitive_{}", class_name.rust_ty);
     let deref_impl = make_deref_impl(class_name, &base_ty);
 
     let all_bases = ctx.inheritance_tree().collect_all_bases(class_name);
+    let (inherits_macro_ident, inherits_macro_code) = make_inherits_macro(class, &all_bases);
     let (notification_enum, notification_enum_name) =
         notifications::make_notification_enum(class_name, &all_bases, &cfg_attributes, ctx);
 
@@ -142,23 +158,30 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
     // This checks if token streams (i.e. code) is empty.
     let has_sidecar_module = !enums.is_empty() || !builders.is_empty() || has_own_signals;
 
+    let module_doc = docs::make_module_doc(class_name);
+
+    // Classes that can't be inherited from don't need to provide an interface with overridable virtual methods.
+    let has_interface_trait = !class.is_final;
+    let interface_trait = if has_interface_trait {
+        virtual_traits::make_virtual_methods_trait(
+            class,
+            &all_bases,
+            &notification_enum_name,
+            &cfg_attributes,
+            view,
+            ctx,
+        )
+    } else {
+        TokenStream::new()
+    };
+
     let class_doc = docs::make_class_doc(
         class_name,
         base_ident_opt,
         notification_enum.is_some(),
         has_sidecar_module,
+        has_interface_trait,
         has_own_signals,
-    );
-
-    let module_doc = docs::make_module_doc(class_name);
-
-    let virtual_trait = virtual_traits::make_virtual_methods_trait(
-        class,
-        &all_bases,
-        &virtual_trait_str,
-        &notification_enum_name,
-        &cfg_attributes,
-        view,
     );
 
     // notify() and notify_reversed() are added after other methods, to list others first in docs.
@@ -180,11 +203,6 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
         }
     };
 
-    let inherits_macro_safety_doc = format!(
-        "The provided class must be a subclass of all the superclasses of [`{}`]",
-        class_name.rust_ty
-    );
-
     // mod re_export needed, because class should not appear inside the file module, and we can't re-export private struct as pub.
     let imports = util::make_imports();
     let tokens = quote! {
@@ -199,7 +217,7 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
             use super::*;
 
             #[doc = #class_doc]
-            #[doc = #construct_doc]
+            #[doc = #extended_class_doc]
             #cfg_attributes
             #[derive(Debug)]
             #[repr(C)]
@@ -210,7 +228,7 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
                 // The RawGd<T>'s identity field can be None because of generality (it can represent null pointers, as opposed to Gd<T>).
                 rtti: Option<crate::private::ObjectRtti>,
             }
-            #virtual_trait
+            #interface_trait
             #notification_enum
             impl #class_name {
                 #constructor
@@ -247,20 +265,7 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
 
             #godot_default_impl
             #deref_impl
-
-            /// # Safety
-            ///
-            #[doc = #inherits_macro_safety_doc]
-            #[macro_export]
-            #[allow(non_snake_case)]
-            macro_rules! #inherits_macro {
-                ($Class:ident) => {
-                    unsafe impl ::godot::obj::Inherits<::godot::classes::#class_name> for $Class {}
-                    #(
-                        unsafe impl ::godot::obj::Inherits<::godot::classes::#all_bases> for $Class {}
-                    )*
-                }
-            }
+            #inherits_macro_code
         }
 
         #builders
@@ -275,9 +280,68 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
             name: notification_enum_name,
             declared_by_own_class: notification_enum.is_some(),
         },
-        inherits_macro_ident: inherits_macro,
+        inherits_macro_ident,
         has_sidecar_module,
+        has_interface_trait,
     }
+}
+
+/// If the class can be inherited from (non-final), create a macro that can be accessed in subclasses to implement the `Inherits` trait.
+///
+/// Returns empty tokens if the class is final.
+fn make_inherits_macro(class: &Class, all_bases: &[TyName]) -> (Option<Ident>, TokenStream) {
+    let class_name = class.name();
+
+    // Create a macro that can be accessed in subclasses to implement the Inherits trait.
+    // Use this name because when typing a non-existent class, users will be met with the following error:
+    //    could not find `inherit_from_OS__ensure_class_exists` in `class_macros`
+    //
+    // Former macro name was `unsafe_inherits_transitive_*`.
+    let inherits_macro_ident =
+        format_ident!("inherit_from_{}__ensure_class_exists", class_name.rust_ty);
+
+    // For final classes, we can directly create a meaningful compile error.
+    if class.is_final {
+        let error_msg = format!(
+            "Class `{}` is final, meaning it cannot be inherited in GDExtension or GDScript.",
+            class_name.rust_ty
+        );
+
+        let code = quote! {
+            #[macro_export]
+            #[allow(non_snake_case)]
+            macro_rules! #inherits_macro_ident {
+                ($Class:ident) => {
+                    compile_error!(#error_msg);
+                }
+            }
+        };
+
+        return (None, code);
+    }
+
+    let inherits_macro_safety_doc = format!(
+        "The provided class must be a subclass of all the superclasses of [`{}`]",
+        class_name.rust_ty
+    );
+
+    let code = quote! {
+        /// # Safety
+        ///
+        #[doc = #inherits_macro_safety_doc]
+        #[macro_export]
+        #[allow(non_snake_case)]
+        macro_rules! #inherits_macro_ident {
+            ($Class:ident) => {
+                unsafe impl ::godot::obj::Inherits<::godot::classes::#class_name> for $Class {}
+                #(
+                    unsafe impl ::godot::obj::Inherits<::godot::classes::#all_bases> for $Class {}
+                )*
+            }
+        }
+    };
+
+    (Some(inherits_macro_ident), code)
 }
 
 fn make_class_module_file(classes_and_modules: Vec<GeneratedClassModule>) -> TokenStream {
@@ -296,10 +360,14 @@ fn make_class_module_file(classes_and_modules: Vec<GeneratedClassModule>) -> Tok
 
         let vis = is_pub.then_some(quote! { pub });
 
+        let interface_reexport = m.has_interface_trait.then(|| {
+            quote! { pub use #module_name::re_export::#virtual_trait_name; }
+        });
+
         let class_decl = quote! {
             #vis mod #module_name;
             pub use #module_name::re_export::#class_name;
-            pub use #module_name::re_export::#virtual_trait_name;
+            #interface_reexport
         };
         class_decls.push(class_decl);
 
@@ -317,6 +385,11 @@ fn make_class_module_file(classes_and_modules: Vec<GeneratedClassModule>) -> Tok
             inherits_macro_ident,
             ..
         } = m;
+
+        // For final classes, do nothing.
+        let Some(inherits_macro_ident) = inherits_macro_ident else {
+            return TokenStream::new();
+        };
 
         // We cannot re-export the following, because macro is in the crate root
         // pub use #module_ident::re_export::#inherits_macro_ident;
@@ -341,17 +414,15 @@ fn make_class_module_file(classes_and_modules: Vec<GeneratedClassModule>) -> Tok
     }
 }
 
-fn make_constructor_and_default(
-    class: &Class,
-    ctx: &Context,
-) -> (TokenStream, &'static str, TokenStream) {
-    let godot_class_name = &class.name().godot_ty;
-    let godot_class_stringname = make_string_name(godot_class_name);
-    // Note: this could use class_name() but is not yet done due to upcoming lazy-load refactoring.
+fn make_constructor_and_default(class: &Class, ctx: &Context) -> Construction {
+    let class_name = class.name();
+
+    let godot_class_stringname = make_string_name(&class_name.godot_ty);
+    // Note: this could use class_name() but is not yet done due to potential future lazy-load refactoring.
     //let class_name_obj = quote! { <Self as crate::obj::GodotClass>::class_name() };
 
     let (constructor, construct_doc, has_godot_default_impl);
-    if ctx.is_singleton(godot_class_name) {
+    if ctx.is_singleton(class_name) {
         // Note: we cannot return &'static mut Self, as this would be very easy to mutably alias.
         // &'static Self would be possible, but we would lose the whole mutability information (even if that is best-effort and
         // not strict Rust mutability, it makes the API much more usable).
@@ -391,6 +462,16 @@ fn make_constructor_and_default(
         has_godot_default_impl = true;
     }
 
+    let final_doc = if class.is_final {
+        Some(
+            "\n\n# Final class\n\n\
+            This class is _final_, meaning you cannot inherit from it, and it comes without `I*` interface trait. \
+            It is still possible that other Godot classes inherit from it, but that is limited to the engine itself.",
+        )
+    } else {
+        None
+    };
+
     let godot_default_impl = if has_godot_default_impl {
         let class_name = &class.name().rust_ty;
         quote! {
@@ -404,7 +485,12 @@ fn make_constructor_and_default(
         TokenStream::new()
     };
 
-    (constructor, construct_doc, godot_default_impl)
+    Construction {
+        constructor,
+        construct_doc,
+        final_doc,
+        godot_default_impl,
+    }
 }
 
 fn make_deref_impl(class_name: &TyName, base_ty: &TokenStream) -> TokenStream {

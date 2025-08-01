@@ -16,7 +16,6 @@ use godot::classes::{
     file_access, Engine, FileAccess, IRefCounted, Node, Node2D, Node3D, Object, RefCounted,
 };
 #[allow(deprecated)]
-use godot::global::instance_from_id;
 use godot::meta::{FromGodot, GodotType, ToGodot};
 use godot::obj::{Base, Gd, Inherits, InstanceId, NewAlloc, NewGd, RawGd};
 use godot::register::{godot_api, GodotClass};
@@ -183,36 +182,6 @@ fn object_from_invalid_instance_id() {
         .expect_err("invalid instance id should not return a valid object");
 }
 
-// `instance_from_id` is a normal FFI call, so works slightly differently from `Gd::try_from_instance_id`.
-#[itest]
-fn object_instance_from_id() {
-    let node = Node::new_alloc();
-
-    assert!(node.is_instance_valid());
-
-    let instance_id = node.instance_id();
-
-    #[allow(deprecated)]
-    let gd_from_instance_id = instance_from_id(instance_id.to_i64())
-        .expect("instance should be valid")
-        .cast::<Node>();
-
-    assert_eq!(gd_from_instance_id, node);
-
-    node.free();
-}
-
-#[itest]
-fn object_instance_from_invalid_id() {
-    #[allow(deprecated)]
-    let gd_from_instance_id = instance_from_id(0);
-
-    assert!(
-        gd_from_instance_id.is_none(),
-        "instance id 0 should never be valid"
-    );
-}
-
 #[itest]
 fn object_from_instance_id_inherits_type() {
     let descr = GString::from("some very long description");
@@ -285,7 +254,14 @@ fn object_user_free_during_bind() {
         obj.is_instance_valid(),
         "object lives on after failed free()"
     );
+
+    let copy = obj.clone();
     obj.free(); // now succeeds
+
+    assert!(
+        !copy.is_instance_valid(),
+        "object is finally destroyed after successful free()"
+    );
 }
 
 #[itest]
@@ -517,14 +493,19 @@ fn object_engine_convert_variant_nil() {
 fn object_engine_convert_variant_error() {
     let refc = RefCounted::new_gd();
     let variant = refc.to_variant();
+    assert_eq!(refc.test_refcount(), Some(2));
 
     let err = Gd::<Node2D>::try_from_variant(&variant)
         .expect_err("`Gd<RefCounted>` should not convert to `Gd<Node2D>`");
 
-    assert_eq!(
-        err.to_string(),
-        format!("cannot convert to class Node2D: {refc:?}")
+    // ConvertError::Err holds a copy of the value, i.e. refcount is +1.
+    assert_eq!(refc.test_refcount(), Some(3));
+
+    let expected_debug = format!(
+        "cannot convert to class Node2D: VariantGd {{ id: {}, class: RefCounted, refc: 3 }}",
+        refc.instance_id().to_i64()
     );
+    assert_eq!(err.to_string(), expected_debug);
 }
 
 #[itest]
@@ -917,7 +898,8 @@ impl ObjPayload {
 
     #[func]
     fn do_panic(&self) {
-        panic!("do_panic exploded");
+        // Unicode character as regression test for https://github.com/godot-rust/gdext/issues/384.
+        panic!("do_panic exploded 💥");
     }
 
     // Obtain the line number of the panic!() call above; keep equidistant to do_panic() method.
@@ -1036,6 +1018,14 @@ pub mod object_test_gd {
         #[func]
         fn return_nested_self() -> Array<Gd<<Self as GodotClass>::Base>> {
             array![&Self::return_self().upcast()]
+        }
+
+        #[func]
+        fn pass_i32(&self, _i: i32) {}
+
+        #[func]
+        fn cause_panic(&self) -> Vector3 {
+            panic!("Rust panics")
         }
     }
 

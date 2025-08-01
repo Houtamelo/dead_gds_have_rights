@@ -7,7 +7,7 @@
 
 use core::cmp::Ordering;
 use godot_ffi as sys;
-use sys::{ffi_methods, GodotFfi};
+use sys::{ffi_methods, ExtVariantType, GodotFfi};
 
 use crate::builtin::math::{GlamConv, GlamType};
 use crate::builtin::{inner, real, RVec4, Vector4, Vector4Axis};
@@ -73,12 +73,6 @@ impl_vector_fns!(Vector4i, glam::IVec4, i32, (x, y, z, w));
 impl Vector4i {
     inline_impl_integer_vector_fns!(Vector4, x, y, z, w);
 
-    #[deprecated = "Moved to `Vector4::cast_int()`"]
-    #[inline]
-    pub const fn from_vector4(v: Vector4) -> Self {
-        v.cast_int()
-    }
-
     /// Converts `self` to the corresponding [`real`] `glam` type.
     #[doc(hidden)]
     #[inline]
@@ -93,7 +87,7 @@ impl Vector4i {
 
     #[doc(hidden)]
     #[inline]
-    pub fn as_inner(&self) -> inner::InnerVector4i {
+    pub fn as_inner(&self) -> inner::InnerVector4i<'_> {
         inner::InnerVector4i::from_outer(self)
     }
 }
@@ -111,7 +105,7 @@ impl fmt::Display for Vector4i {
 // SAFETY:
 // This type is represented as `Self` in Godot, so `*mut Self` is sound.
 unsafe impl GodotFfi for Vector4i {
-    const VARIANT_TYPE: sys::VariantType = sys::VariantType::VECTOR4I;
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::VECTOR4I);
 
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }

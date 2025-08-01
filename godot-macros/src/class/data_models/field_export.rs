@@ -9,7 +9,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use std::collections::{HashMap, HashSet};
 
-use crate::util::{KvParser, ListParser};
+use crate::util::{ident, KvParser, ListParser};
 use crate::ParseResult;
 
 pub struct FieldExport {
@@ -27,6 +27,10 @@ impl FieldExport {
     pub fn to_export_hint(&self) -> Option<TokenStream> {
         self.export_type.to_export_hint()
     }
+
+    pub fn to_export_usage(&self) -> Option<Ident> {
+        self.export_type.to_export_usage()
+    }
 }
 
 /// Store info from `#[export]` attribute.
@@ -39,6 +43,20 @@ pub enum ExportType {
     ///
     /// Can become other property hints, depends on context.
     Default,
+
+    /// ### GDScript annotations
+    /// - `@export_storage`
+    ///
+    /// ### Property hints
+    /// - `NONE`
+    ///
+    /// ### Property usage
+    /// - `STORAGE`
+    ///
+    /// This is used to indicate that the property should be exported
+    /// but should not be visible in the editor. Therefore, it does not
+    /// have a property hint, but uses the `STORAGE` property usage.
+    Storage,
 
     /// ### GDScript annotations
     /// - `@export_range`
@@ -150,6 +168,10 @@ impl ExportType {
     ///   becomes
     ///   `#[export(flags/enum = (elem1, elem2 = key2, ...))]`
     pub(crate) fn new_from_kv(parser: &mut KvParser) -> ParseResult<Self> {
+        if parser.handle_alone("storage")? {
+            return Self::new_storage();
+        }
+
         if let Some(list_parser) = parser.handle_list("range")? {
             return Self::new_range_list(list_parser);
         }
@@ -273,6 +295,10 @@ impl ExportType {
         Ok(Self::Default)
     }
 
+    fn new_storage() -> ParseResult<Self> {
+        Ok(Self::Storage)
+    }
+
     fn new_range_list(mut parser: ListParser) -> ParseResult<Self> {
         const FLAG_OPTIONS: [&str; 7] = [
             "or_greater",
@@ -388,13 +414,23 @@ macro_rules! quote_export_func {
         Some(quote! {
             ::godot::register::property::export_info_functions::$function_name($($tt)*)
         })
-    }
+    };
+
+    // Passes in a previously declared local `type FieldType = ...` as first generic argument.
+    // Doesn't work if function takes other generic arguments -- in that case it could be converted to a Type<...> parameter.
+    ($function_name:ident < T > ($($tt:tt)*)) => {
+        Some(quote! {
+            ::godot::register::property::export_info_functions::$function_name::<FieldType>($($tt)*)
+        })
+    };
 }
 
 impl ExportType {
     pub fn to_export_hint(&self) -> Option<TokenStream> {
         match self {
             Self::Default => None,
+
+            Self::Storage => quote_export_func! { export_storage() },
 
             Self::Range {
                 min,
@@ -487,22 +523,19 @@ impl ExportType {
             } => quote_export_func! { export_flags_3d_navigation() },
 
             Self::File {
-                global: false,
+                global,
                 kind: FileKind::Dir,
-            } => quote_export_func! { export_dir() },
-
-            Self::File {
-                global: true,
-                kind: FileKind::Dir,
-            } => quote_export_func! { export_global_dir() },
+            } => {
+                let filter = quote! { "" };
+                quote_export_func! { export_file_or_dir<T>(false, #global, #filter) }
+            }
 
             Self::File {
                 global,
                 kind: FileKind::File { filter },
             } => {
                 let filter = filter.clone().unwrap_or(quote! { "" });
-
-                quote_export_func! { export_file_inner(#global, #filter) }
+                quote_export_func! { export_file_or_dir<T>(true, #global, #filter) }
             }
 
             Self::Multiline => quote_export_func! { export_multiline() },
@@ -510,7 +543,16 @@ impl ExportType {
             Self::PlaceholderText { placeholder } => quote_export_func! {
                 export_placeholder(#placeholder)
             },
+
             Self::ColorNoAlpha => quote_export_func! { export_color_no_alpha() },
+        }
+    }
+
+    /// Returns a `PropertyUsageFlags` identifier if this export type has a _usage_.
+    pub fn to_export_usage(&self) -> Option<Ident> {
+        match self {
+            Self::Storage => Some(ident("STORAGE")),
+            _ => None,
         }
     }
 }

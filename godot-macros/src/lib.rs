@@ -139,9 +139,9 @@ use crate::util::{bail, ident, KvParser};
 /// (fields annotated with `@export`). In the gdext API, these two concepts are represented with `#[var]` and `#[export]` attributes respectively,
 /// which in turn are backed by the [`Var`](../register/property/trait.Var.html) and [`Export`](../register/property/trait.Export.html) traits.
 ///
-/// ## Property registration
+/// ## Register properties -- `#[var]`
 ///
-/// To create a property, you can use the `#[var]` annotation:
+/// To create a property, you can use the `#[var]` annotation, which supports types implementing [`Var`](../register/property/trait.Var.html).
 ///
 /// ```
 /// # use godot::prelude::*;
@@ -207,9 +207,10 @@ use crate::util::{bail, ident, KvParser};
 /// }
 /// ```
 ///
-/// ## Property exports
+/// ## Export properties -- `#[export]`
 ///
-/// For exporting properties to the editor, you can use the `#[export]` attribute:
+/// To export properties to the editor, you can use the `#[export]` attribute, which supports types implementing
+/// [`Export`](../register/property/trait.Export.html):
 ///
 /// ```
 /// # use godot::prelude::*;
@@ -221,19 +222,21 @@ use crate::util::{bail, ident, KvParser};
 /// }
 /// ```
 ///
-/// If you don't also include a `#[var]` attribute, then a default one will be generated.
-/// `#[export]` also supports all of GDScript's annotations, in a slightly different format. The format is
+/// If you don't include an additional `#[var]` attribute, then a default one will be generated.
+///
+/// `#[export]` also supports all of [GDScript's annotations][gdscript-annotations], in a slightly different format. The format is
 /// translated from an annotation by following these four rules:
 ///
-/// - `@export` becomes `#[export]`
-/// - `@export_{name}` becomes `#[export(name)]`
-/// - `@export_{name}(elem1, ...)` becomes `#[export(name = (elem1, ...))]`
-/// - `@export_{flags/enum}("elem1", "elem2:key2", ...)`
-///   becomes
-///   `#[export(flags/enum = (elem1, elem2 = key2, ...))]`
+/// [gdscript-annotations]: https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/gdscript_exports.html
 ///
+/// | GDScript annotation                         | Rust attribute                                 |
+/// |---------------------------------------------|-------------------------------------------------|
+/// | `@export`                                   | `#[export]`                                     |
+/// | `@export_key`                               | `#[export(key)]`                                |
+/// | `@export_key(elem1, ...)`                   | `#[export(key = (elem1, ...))]`                 |
+/// | `@export_flags("elem1", "elem2:val2", ...)`<br>`@export_enum("elem1", "elem2:val2", ...)` | `#[export(flags = (elem1, elem2 = val2, ...))]`<br>`#[export(enum = (elem1, elem2 = val2, ...))]` |
 ///
-/// As an example of some different export attributes:
+/// As an example of different export attributes:
 ///
 /// ```
 /// # use godot::prelude::*;
@@ -243,7 +246,11 @@ use crate::util::{bail, ident, KvParser};
 ///     // @export
 ///     #[export]
 ///     float: f64,
-///     
+///
+///     // @export_storage
+///     #[export(storage)]
+///     hidden_string: GString,
+///
 ///     // @export_range(0.0, 10.0, or_greater)
 ///     #[export(range = (0.0, 10.0, or_greater))]
 ///     range_f64: f64,
@@ -275,9 +282,8 @@ use crate::util::{bail, ident, KvParser};
 ///
 /// ```
 ///
-/// Most values in expressions like `key = value`, can be an arbitrary expression that evaluates to the
-/// right value. Meaning you can use constants or variables, as well as any other rust syntax you'd like in
-/// the export attributes.
+/// Most values in syntax such as `key = value` can be arbitrary expressions. For example, you can use constants, function calls or
+/// other Rust expressions that are valid in that context.
 ///
 /// ```
 /// # use godot::prelude::*;
@@ -294,18 +300,81 @@ use crate::util::{bail, ident, KvParser};
 /// }
 /// ```
 ///
-/// You can specify custom property hints, hint strings, and usage flags in a `#[var]` attribute using the
-/// `hint`, `hint_string`, and `usage_flags` keys in the attribute. These are constants in the `PropertyHint`
-/// and `PropertyUsageFlags` enums, respectively.
+/// It is possible to group your exported properties inside the Inspector with the `#[export_group(name = "...", prefix =  "...")]` attribute.
+/// Every exported property after this attribute will be added to the group. Start a new group or use `#[export_group(name = "")]` (with an empty name) to break out.
 ///
-/// ```
+/// Groups cannot be nested but subgroups can be declared with an `#[export_subgroup]` attribute.
+///
+/// GDExtension groups and subgroups follow the same rules as the gdscript ones.
+///
+/// <div class="warning">
+/// Nesting subgroups with the slash separator `/` <strong>outside</strong> the group is not supported and might crash the editor.
+/// </div>
+///
+/// See also in Godot docs:
+/// [Grouping Exports](https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/gdscript_exports.html#grouping-exports)
+///
+///```
+/// # use godot::prelude::*;
+/// const MAX_HEALTH: f64 = 100.0;
+///
+/// #[derive(GodotClass)]
+/// # #[class(init)]
+/// struct MyStruct {
+///     // @export_group("Group 1")
+///     // @export var group_1_field: int
+///     #[export]
+///     #[export_group(name = "Group 1")]
+///     group_1_field: i32,
+///
+///     // @export var group_1_field2: int
+///     #[export]
+///     group_1_field2: i32,
+///
+///     // @export_group("my group", "grouped_")
+///     // @export var grouped_field: int
+///     #[export_group(name = "my group", prefix = "grouped_")]
+///     #[export]
+///     grouped_field: u32,
+///
+///     // @export_subgroup("my subgroup")
+///     // @export var sub_field: int
+///     #[export_subgroup(name = "my subgroup")]
+///     #[export]
+///     sub_field: u32,
+///
+///     // Breaks out of subgroup `"my subgroup"`.
+///     // @export_subgroup("")
+///     // @export var grouped_field2: int
+///     #[export_subgroup(name = "")]
+///     #[export]
+///     grouped_field2: u32,
+///
+///     // @export var ungrouped_field: int
+///     #[export]
+///     ungrouped_field: i64,
+/// }
+///```
+///
+///
+/// ## Low-level property hints and usage
+///
+/// You can specify custom property hints, hint strings, and usage flags in a `#[var]` attribute using the `hint`, `hint_string`
+/// and `usage_flags` keys in the attribute. Hint and usage flags are constants in the [`PropertyHint`] and [`PropertyUsageFlags`] enums,
+/// while hint strings are dependent on the hint, property type and context. Using these low-level keys is rarely necessary, as most common
+/// combinations are covered by `#[var]` and `#[export]` already.
+///
+/// [`PropertyHint`]: ../global/struct.PropertyHint.html
+/// [`PropertyUsageFlags`]: ../global/struct.PropertyUsageFlags.html
+///
+/// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// # #[class(init)]
 /// struct MyStruct {
-///     // Treated as an enum with two values: "One" and "Two"
-///     // Displayed in the editor
-///     // Treated as read-only by the editor
+///     // Treated as an enum with two values: "One" and "Two",
+///     // displayed in the editor,
+///     // treated as read-only by the editor.
 ///     #[var(
 ///         hint = ENUM,
 ///         hint_string = "One,Two",
@@ -315,9 +384,10 @@ use crate::util::{bail, ident, KvParser};
 /// }
 /// ```
 ///
+///
 /// # Further class customization
 ///
-/// ## Running code in the editor
+/// ## Running code in the editor (tool)
 ///
 /// If you annotate a class with `#[class(tool)]`, its lifecycle methods (`ready()`, `process()` etc.) will be invoked in the editor. This
 /// is useful for writing custom editor plugins, as opposed to classes running simply in-game.
@@ -325,21 +395,33 @@ use crate::util::{bail, ident, KvParser};
 /// See [`ExtensionLibrary::editor_run_behavior()`](../init/trait.ExtensionLibrary.html#method.editor_run_behavior)
 /// for more information and further customization.
 ///
-/// This is very similar to [GDScript's `@tool` feature](https://docs.godotengine.org/en/stable/tutorials/plugins/running_code_in_the_editor.html).
+/// This behaves similarly to [GDScript's `@tool` feature](https://docs.godotengine.org/en/stable/tutorials/plugins/running_code_in_the_editor.html).
+///
+/// **Note**: As in GDScript, the class must be marked as a `tool` to be accessible in the editor (e.g., for use by editor plugins and inspectors).
 ///
 /// ## Editor plugins
 ///
-/// If you annotate a class with `#[class(editor_plugin)]`, it will be turned into an editor plugin. The
-/// class must then inherit from `EditorPlugin`, and an instance of that class will be automatically added
+/// Classes inheriting `EditorPlugin` will be automatically instantiated and added
 /// to the editor when launched.
 ///
 /// See [Godot's documentation of editor plugins](https://docs.godotengine.org/en/stable/tutorials/plugins/editor/index.html)
 /// for more information about editor plugins. But note that you do not need to create and enable the plugin
-/// through Godot's `Create New Plugin` menu for it to work, simply annotating the class with `editor_plugin`
+/// through Godot's `Create New Plugin` menu for it to work, simply creating the class which inherits `EditorPlugin`
 /// automatically enables it when the library is loaded.
 ///
 /// This should usually be combined with `#[class(tool)]` so that the code you write will actually run in the
 /// editor.
+///
+/// ### Editor plugins -- hot reload interaction
+///
+/// During hot reload, Godot firstly unloads `EditorPlugin`s, then changes all alive GDExtension classes instances into their base objects
+/// (classes inheriting `Resource` become `Resource`, classes inheriting `Node` become `Node` and so on), then reloads all the classes,
+/// and finally changes said instances back into their proper classes.
+///
+/// `EditorPlugin` will be re-added to the editor before the last step (changing instances from base classes to extension classes) is finished,
+/// which might cause issues with loading already cached resources and instantiated nodes.
+///
+/// In such a case, await one frame until extension is properly hot-reloaded (See: [`godot::task::spawn()`](../task/fn.spawn.html)).
 ///
 /// ## Class renaming
 ///
@@ -457,7 +539,10 @@ use crate::util::{bail, ident, KvParser};
     alias = "tool",
     alias = "rename"
 )]
-#[proc_macro_derive(GodotClass, attributes(class, base, hint, var, export, init))]
+#[proc_macro_derive(
+    GodotClass,
+    attributes(class, base, hint, var, export, export_group, export_subgroup, init)
+)]
 pub fn derive_godot_class(input: TokenStream) -> TokenStream {
     translate(input, class::derive_godot_class)
 }
@@ -761,7 +846,6 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 ///
 /// [`WithSignals`]: ../obj/trait.WithSignals.html
 /// [`TypedSignal`]: ../register/struct.TypedSignal.html
-///
 ///
 /// # Constants
 ///

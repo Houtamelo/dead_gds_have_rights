@@ -16,8 +16,8 @@ pub use super::meta::error::{ConvertError, IoError};
 pub use super::meta::{FromGodot, GodotConvert, ToGodot};
 
 pub use super::classes::{
-    INode, INode2D, INode3D, IObject, IPackedScene, IRefCounted, IResource, ISceneTree, Node,
-    Node2D, Node3D, Object, PackedScene, RefCounted, Resource, SceneTree,
+    match_class, INode, INode2D, INode3D, IObject, IPackedScene, IRefCounted, IResource,
+    ISceneTree, Node, Node2D, Node3D, Object, PackedScene, RefCounted, Resource, SceneTree,
 };
 pub use super::global::{
     godot_error, godot_print, godot_print_rich, godot_script_error, godot_warn,
@@ -36,5 +36,6 @@ pub use super::obj::EngineEnum as _;
 pub use super::obj::NewAlloc as _;
 pub use super::obj::NewGd as _;
 pub use super::obj::WithBaseField as _; // base(), base_mut(), to_gd()
+pub use super::obj::WithDeferredCall as _; // apply_deferred()
 pub use super::obj::WithSignals as _; // Gd::signals()
 pub use super::obj::WithUserSignals as _; // self.signals()

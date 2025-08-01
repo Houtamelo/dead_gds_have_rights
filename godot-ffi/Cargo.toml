@@ -1,8 +1,8 @@
 [package]
 name = "godot-ffi"
-version = "0.2.4"
+version = "0.3.4"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MPL-2.0"
 keywords = ["gamedev", "godot", "engine", "ffi"]
 categories = ["game-engines", "graphics"]
@@ -19,6 +19,7 @@ experimental-wasm-nothreads = ["godot-bindings/experimental-wasm-nothreads"]
 debug-log = []
 
 api-custom = ["godot-bindings/api-custom"]
+api-custom-json = ["godot-bindings/api-custom-json"]
 # [version-sync] [[
 #  [line] api-$kebabVersion = ["godot-bindings/api-$kebabVersion"]
 api-4-1 = ["godot-bindings/api-4-1"]
@@ -40,16 +41,17 @@ libc = { workspace = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 # Only needed for WASM identifier generation.
-godot-macros = { path = "../godot-macros", version = "=0.2.4", features = ["experimental-wasm"] }
+godot-macros = { path = "../godot-macros", version = "=0.3.4", features = ["experimental-wasm"] }
 
 [build-dependencies]
-godot-bindings = { path = "../godot-bindings", version = "=0.2.4" }
-godot-codegen = { path = "../godot-codegen", version = "=0.2.4" }
+godot-bindings = { path = "../godot-bindings", version = "=0.3.4" }
+godot-codegen = { path = "../godot-codegen", version = "=0.3.4" }
 
 # https://docs.rs/about/metadata
 [package.metadata.docs.rs]
 features = ["experimental-godot-api"]
 rustdoc-args = ["--cfg", "published_docs"]
+rustc-args = ["--cfg", "published_docs"]
 
 # Currently causes "unused manifest key" warnings. Maybe re-enable in the future, to make `published_docs` known.
 #[lints.rust]
