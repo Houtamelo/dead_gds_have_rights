@@ -217,6 +217,7 @@ fn make_native_structure_field_and_accessor(
 
                 let obj = #snake_field_name.upcast();
 
+                #[cfg(debug_assertions)]
                 assert!(obj.is_instance_valid(), "provided node is dead");
 
                 let id = obj.instance_id().to_u64();

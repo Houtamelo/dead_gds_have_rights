@@ -381,10 +381,13 @@ impl<T: GodotClass> RawGd<T> {
 
     /// Verify that the object is non-null and alive. In Debug mode, additionally verify that it is of type `T` or derived.
     pub(crate) fn check_rtti(&self, method_name: &'static str) {
-        let call_ctx = CallContext::gd::<T>(method_name);
+        #[cfg(debug_assertions)]
+        {
+            let call_ctx = CallContext::gd::<T>(method_name);
 
-        let instance_id = self.check_dynamic_type(&call_ctx);
-        classes::ensure_object_alive(instance_id, self.obj_sys(), &call_ctx);
+            let instance_id = self.check_dynamic_type(&call_ctx);
+            classes::ensure_object_alive(instance_id, self.obj_sys(), &call_ctx);
+        }
     }
 
     /// Checks only type, not alive-ness. Used in Gd<T> in case of `free()`.
@@ -705,6 +708,7 @@ impl<T: GodotClass> Clone for RawGd<T> {
         if self.is_null() || !self.is_instance_valid() {
             Self::null()
         } else {
+            #[cfg(debug_assertions)]
             self.check_rtti("clone");
 
             // Create new object, adopt cached fields.

@@ -47,12 +47,14 @@ impl<T: GodotClass, U: GodotClass> CastSuccess<T, U> {
 
     /// Access shared reference to destination, without consuming object.
     pub fn as_dest_ref(&self) -> &RawGd<U> {
+        #[cfg(debug_assertions)]
         self.check_validity();
         &self.dest
     }
 
     /// Access exclusive reference to destination, without consuming object.
     pub fn as_dest_mut(&mut self) -> &mut RawGd<U> {
+        #[cfg(debug_assertions)]
         self.check_validity();
         &mut self.dest
     }
@@ -67,6 +69,7 @@ impl<T: GodotClass, U: GodotClass> CastSuccess<T, U> {
             self.dest.instance_id_unchecked(),
             "traded_source must point to the same object as the destination"
         );
+        #[cfg(debug_assertions)]
         self.check_validity();
 
         std::mem::forget(traded_source);

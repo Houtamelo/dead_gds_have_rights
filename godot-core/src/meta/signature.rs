@@ -303,6 +303,7 @@ impl<Params: OutParamTuple, Ret: FromGodot> Signature<Params, Ret> {
         let call_ctx = CallContext::outbound(class_name, method_name);
         // $crate::out!("out_class_ptrcall: {call_ctx}");
 
+        #[cfg(debug_assertions)]
         if let Some(instance_id) = maybe_instance_id {
             crate::classes::ensure_object_alive(instance_id, object_ptr, &call_ctx);
         }

@@ -823,6 +823,7 @@ impl<T: GodotClass> ToGodot for Gd<T> {
     type ToVia<'v> = Gd<T>;
 
     fn to_godot(&self) -> Self::ToVia<'_> {
+        #[cfg(debug_assertions)]
         self.raw.check_rtti("to_godot");
         self.clone()
     }
