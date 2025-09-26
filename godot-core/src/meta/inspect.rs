@@ -23,7 +23,7 @@ where
     T: Copy + Eq + PartialEq + 'static,
 {
     /// Creates a new enum constant metadata entry.
-    pub(crate) const fn new(rust_name: &'static str, godot_name: &'static str, value: T) -> Self {
+    pub const fn new(rust_name: &'static str, godot_name: &'static str, value: T) -> Self {
         Self {
             rust_name,
             godot_name,
