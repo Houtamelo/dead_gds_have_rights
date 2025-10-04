@@ -16,7 +16,7 @@ use crate::obj::GodotClass;
 #[derive(Debug)]
 pub struct DocsPlugin {
     /// The name of the class to register docs for.
-    pub(crate) class_name: ClassId,
+    pub(crate) class_name: ClassName,
 
     /// The actual item being registered.
     pub item: DocsItem,
@@ -26,7 +26,7 @@ impl DocsPlugin {
     /// Creates a new `DocsPlugin`, automatically setting the `class_name` to the values defined in [`GodotClass`].
     pub fn new<T: GodotClass>(item: DocsItem) -> Self {
         Self {
-            class_name: T::class_id(),
+            class_name: T::class_name(),
             item,
         }
     }

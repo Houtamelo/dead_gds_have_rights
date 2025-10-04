@@ -17,6 +17,9 @@ pub use crate::registry::signal::priv_re_export::*;
 pub use crate::storage::{as_storage, Storage};
 pub use sys::out;
 
+#[cfg(all(since_api = "4.3", feature = "register-docs"))]
+pub use crate::possibly_docs::*;
+
 #[cfg(feature = "trace")]
 pub use crate::meta::trace;
 #[cfg(debug_assertions)]
