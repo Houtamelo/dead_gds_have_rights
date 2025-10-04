@@ -19,10 +19,11 @@ pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<Toke
 
     let prv = quote! { ::godot::private };
 
-    #[cfg(all(feature = "register-docs", since_api = "4.3"))]
-    let docs = crate::docs::document_interface_trait_impl(&original_impl.body_items);
-    #[cfg(not(all(feature = "register-docs", since_api = "4.3")))]
-    let docs = quote! {};
+    let register_docs = crate::docs::make_interface_impl_docs_registration(
+        &original_impl.body_items,
+        &class_name,
+        &prv,
+    );
 
     let mut decls = IDecls::default();
 
@@ -128,7 +129,7 @@ pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<Toke
 
     let item_constructor = quote! {
         {
-            let mut item = #prv::ITraitImpl::new::<#class_name>(#docs);
+            let mut item = #prv::ITraitImpl::new::<#class_name>();
             #(#modifications)*
             item
         }
@@ -172,6 +173,8 @@ pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<Toke
         ::godot::sys::plugin_add!(#prv::__GODOT_PLUGIN_REGISTRY; #prv::ClassPlugin::new::<#class_name>(
             #prv::PluginItem::ITraitImpl(#item_constructor)
         ));
+
+        #register_docs
     };
 
     // Not in upper quote!, because #decls still holds holds a mutable borrow to `original_impl`, so we can't also borrow `original_impl`

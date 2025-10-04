@@ -5,16 +5,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-#[cfg(all(since_api = "4.3", feature = "register-docs"))]
-use crate::docs::*;
+use std::any::Any;
+use std::{any, fmt};
+
 use crate::init::InitLevel;
 use crate::meta::ClassName;
 use crate::obj::{bounds, cap, Bounds, DynGd, Gd, GodotClass, Inherits, UserClass};
 use crate::registry::callbacks;
 use crate::registry::class::GodotGetVirtual;
 use crate::{classes, sys};
-use std::any::Any;
-use std::{any, fmt};
 
 // TODO(bromeon): some information coming from the proc-macro API is deferred through PluginItem, while others is directly
 // translated to code. Consider moving more code to the PluginItem, which allows for more dynamic registration and will
@@ -190,16 +189,10 @@ pub struct Struct {
 
     /// Whether the class has a default constructor.
     pub(crate) is_instantiable: bool,
-
-    /// Documentation extracted from the struct's RustDoc.
-    #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-    pub(crate) docs: StructDocs,
 }
 
 impl Struct {
-    pub fn new<T: GodotClass + cap::ImplementsGodotExports>(
-        #[cfg(all(since_api = "4.3", feature = "register-docs"))] docs: StructDocs,
-    ) -> Self {
+    pub fn new<T: GodotClass + cap::ImplementsGodotExports>() -> Self {
         Self {
             base_class_name: T::Base::class_name(),
             generated_create_fn: None,
@@ -213,8 +206,6 @@ impl Struct {
             is_editor_plugin: false,
             is_internal: false,
             is_instantiable: false,
-            #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-            docs,
         }
     }
 
@@ -284,9 +275,6 @@ pub struct InherentImpl {
     // This field is only used during codegen-full.
     #[cfg_attr(not(feature = "codegen-full"), expect(dead_code))]
     pub(crate) register_rpcs_fn: Option<ErasedRegisterRpcsFn>,
-
-    #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-    pub docs: InherentImplDocs,
 }
 
 impl InherentImpl {
@@ -298,18 +286,12 @@ impl InherentImpl {
             register_rpcs_fn: Some(ErasedRegisterRpcsFn {
                 raw: callbacks::register_user_rpcs::<T>,
             }),
-            #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-            docs: Default::default(),
         }
     }
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct ITraitImpl {
-    #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-    /// Virtual method documentation.
-    pub(crate) virtual_method_docs: &'static str,
-
     /// Callback to user-defined `register_class` function.
     pub(crate) user_register_fn: Option<ErasedRegisterFn>,
 
@@ -429,12 +411,8 @@ pub struct ITraitImpl {
 }
 
 impl ITraitImpl {
-    pub fn new<T: GodotClass + cap::ImplementsGodotVirtual>(
-        #[cfg(all(since_api = "4.3", feature = "register-docs"))] virtual_method_docs: &'static str,
-    ) -> Self {
+    pub fn new<T: GodotClass + cap::ImplementsGodotVirtual>() -> Self {
         Self {
-            #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-            virtual_method_docs,
             get_virtual_fn: Some(callbacks::get_virtual::<T>),
             ..Default::default()
         }

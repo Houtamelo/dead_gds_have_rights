@@ -116,10 +116,7 @@ impl ClassRegistrationInfo {
         // Note: when changing this match, make sure the array has sufficient size.
         let index = match item {
             PluginItem::Struct { .. } => 0,
-            PluginItem::InherentImpl(_) => {
-                // Inherent impls don't need to be unique.
-                return;
-            }
+            PluginItem::InherentImpl(_) => 1,
             PluginItem::ITraitImpl { .. } => 2,
 
             // Multiple dyn traits can be registered, thus don't validate for uniqueness.
@@ -428,8 +425,6 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             is_editor_plugin,
             is_internal,
             is_instantiable,
-            #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-                docs: _,
         }) => {
             c.parent_class_name = Some(base_class_name);
             c.default_virtual_fn = default_get_virtual_fn;
@@ -481,8 +476,6 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
         PluginItem::InherentImpl(InherentImpl {
             register_methods_constants_fn,
             register_rpcs_fn: _,
-            #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-                docs: _,
         }) => {
             c.register_methods_constants_fn = Some(register_methods_constants_fn);
         }
@@ -500,8 +493,6 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             user_free_property_list_fn,
             user_property_can_revert_fn,
             user_property_get_revert_fn,
-            #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-                virtual_method_docs: _,
             #[cfg(since_api = "4.2")]
             validate_property_fn,
         }) => {
