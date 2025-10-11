@@ -15,7 +15,7 @@ use std::fmt;
 ///
 /// We ignore the `script` parameter because it has no impact on typing in Godot.
 #[derive(Eq, PartialEq)]
-pub(crate) struct ArrayTypeInfo {
+pub struct ArrayTypeInfo {
     /// The builtin type; always set.
     pub variant_type: VariantType,
 

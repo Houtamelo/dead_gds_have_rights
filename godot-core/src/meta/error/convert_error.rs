@@ -157,7 +157,7 @@ impl Error for ErasedConvertError {
 }
 
 #[derive(Debug)]
-pub(crate) enum ErrorKind {
+pub enum ErrorKind {
     FromGodot(FromGodotError),
     FromFfi(FromFfiError),
     FromVariant(FromVariantError),
@@ -177,7 +177,7 @@ impl fmt::Display for ErrorKind {
 
 /// Conversion failed during a [`FromGodot`](crate::meta::FromGodot) call.
 #[derive(Eq, PartialEq, Debug)]
-pub(crate) enum FromGodotError {
+pub enum FromGodotError {
     /// Destination `Array<T>` has different type than source's runtime type.
     BadArrayType {
         expected: ArrayTypeInfo,
@@ -277,7 +277,7 @@ impl fmt::Display for FromGodotError {
 /// Conversion failed during a [`GodotType::try_from_ffi()`](crate::meta::GodotType::try_from_ffi()) call.
 #[derive(Eq, PartialEq, Debug)]
 #[non_exhaustive]
-pub(crate) enum FromFfiError {
+pub enum FromFfiError {
     NullRawGd,
     WrongObjectType,
     I8,
@@ -319,7 +319,7 @@ impl fmt::Display for FromFfiError {
 }
 
 #[derive(Eq, PartialEq, Debug)]
-pub(crate) enum FromVariantError {
+pub enum FromVariantError {
     /// Variant type does not match expected type.
     BadType {
         expected: VariantType,
