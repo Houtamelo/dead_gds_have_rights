@@ -160,6 +160,18 @@ impl ClassName {
     }
 
     #[doc(hidden)]
+    pub fn alloc_next_ascii_rust_str(class_name_rust_str: &'static str) -> Self {
+        assert!(
+            class_name_rust_str.is_ascii(),
+            "ClassName::alloc_next_ascii_rust_str() with non-ASCII Unicode string '{class_name_rust_str}'",
+        );
+
+        let global_index = insert_class(ClassNameSource::Owned(class_name_rust_str.to_owned()));
+
+        Self { global_index }
+    }
+
+    #[doc(hidden)]
     pub fn alloc_next_unicode(class_name_str: &'static str) -> Self {
         assert!(
             cfg!(since_api = "4.4"),
