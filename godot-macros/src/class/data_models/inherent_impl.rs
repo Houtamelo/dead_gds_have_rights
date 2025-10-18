@@ -146,11 +146,11 @@ pub fn transform_inherent_impl(
         let storage = quote! {
             #[allow(non_upper_case_globals)]
             #[doc(hidden)]
-            static #method_storage_name: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
+            pub(crate) static #method_storage_name: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
 
             #[allow(non_upper_case_globals)]
             #[doc(hidden)]
-            static #constants_storage_name: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
+            pub(crate) static #constants_storage_name: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
         };
 
         let trait_impl = quote! {
