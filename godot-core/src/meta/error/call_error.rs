@@ -115,7 +115,7 @@ impl CallError {
 
     /// Checks whether number of arguments matches the number of parameters.
     #[allow(clippy::result_large_err)]
-    pub(crate) fn check_arg_count(
+    pub fn check_arg_count(
         call_ctx: &CallContext,
         arg_count: usize,
         param_count: usize,
