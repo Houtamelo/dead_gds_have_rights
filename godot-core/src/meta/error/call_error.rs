@@ -125,9 +125,7 @@ impl CallError {
             return Ok(());
         }
 
-        let call_error = Self::failed_param_count(call_ctx, arg_count, param_count);
-
-        Err(call_error)
+        Err(Self::failed_param_count(call_ctx, arg_count, param_count))
     }
 
     /// Checks the Godot side of a varcall (low-level `sys::GDExtensionCallError`).
@@ -223,7 +221,7 @@ impl CallError {
         )
     }
 
-    fn failed_param_count(
+    pub fn failed_param_count(
         call_ctx: &CallContext,
         arg_count: usize,
         param_count: usize,

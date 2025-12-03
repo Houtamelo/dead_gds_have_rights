@@ -12,6 +12,8 @@ use godot_ffi as sys;
 
 mod impls;
 
+pub use impls::varcall_arg;
+
 /// Represents a parameter list as Rust tuple where each tuple element is one parameter.
 ///
 /// This trait only contains metadata for the parameter list, the actual functionality is contained in [`InParamTuple`] and

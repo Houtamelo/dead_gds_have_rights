@@ -402,7 +402,8 @@ impl<Params: OutParamTuple, Ret: FromGodot> Signature<Params, Ret> {
 /// - `ret` must be a pointer to an initialized `Variant`.
 /// - It must be safe to write a `Variant` once to `ret`.
 /// - It must be safe to write a `sys::GDExtensionCallError` once to `err`.
-unsafe fn varcall_return<R: ToGodot>(
+#[doc(hidden)]
+pub unsafe fn varcall_return<R: ToGodot>(
     ret_val: R,
     ret: sys::GDExtensionVariantPtr,
     err: *mut sys::GDExtensionCallError,

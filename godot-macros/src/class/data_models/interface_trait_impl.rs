@@ -479,17 +479,33 @@ fn handle_regular_virtual_fn<'a>(
     let mut updated_function = None;
 
     // If there was a signature change (e.g. f32 -> f64 in process/physics_process), apply to new function tokens.
-    if !signature_info.modified_param_types.is_empty() {
+    let any_modified_params = signature_info
+        .std_params
+        .iter()
+        .chain(signature_info.default_params.iter().map(|(p, _)| p))
+        .any(|p| p.modified_ty.is_some());
+
+    if any_modified_params {
         let mut param_name = None;
 
         let mut new_params = original_method.params.clone();
-        for (index, new_ty) in signature_info.modified_param_types.iter() {
-            let venial::FnParam::Typed(typed) = &mut new_params.inner[*index].0 else {
-                panic!("unexpected parameter type: {new_params:?}");
-            };
 
-            typed.ty = new_ty.clone();
-            param_name = Some(typed.name.clone());
+        let modified_params = signature_info
+            .std_params
+            .iter()
+            .chain(signature_info.default_params.iter().map(|(p, _)| p))
+            .filter_map(|p| p.modified_ty.as_ref());
+
+        for (index, new_ty) in modified_params {
+            if let venial::FnParam::Typed(typed) = &mut new_params.inner[*index].0 {
+                typed.ty = new_ty.clone();
+                param_name = Some(typed.name.clone());
+            } else {
+                panic!(
+                    "unexpected parameter type: {:?}",
+                    new_params.inner[*index].0
+                );
+            }
         }
 
         let original_body = &original_method.body;

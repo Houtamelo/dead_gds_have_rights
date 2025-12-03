@@ -16,9 +16,10 @@ use crate::util::{
 };
 use crate::{handle_mutually_exclusive_keys, util, ParseResult};
 
-use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream};
+use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
 use quote::spanned::Spanned;
 use quote::{format_ident, quote, ToTokens};
+use venial::FnParam;
 
 /// Attribute for user-declared function.
 enum ItemAttrType {
@@ -310,6 +311,26 @@ fn process_godot_fns(
                 let signature_info =
                     into_signature_info(signature.clone(), class_name, gd_self_parameter.is_some());
 
+                for (param, _) in function
+                    .params
+                    .iter_mut()
+                    .rev()
+                    .take(signature_info.default_params.len())
+                {
+                    let attrs = match param {
+                        FnParam::Receiver(recv) => &mut recv.attributes,
+                        FnParam::Typed(typed) => &mut typed.attributes,
+                    };
+
+                    attrs.retain_mut(|attr| {
+                        if let Some(TokenTree::Ident(ident)) = attr.path.first() {
+                            ident != "default"
+                        } else {
+                            true
+                        }
+                    });
+                }
+
                 // For virtual methods, rename/mangle existing user method and create a new method with the original name,
                 // which performs a dynamic dispatch.
                 let registered_name = if func.is_virtual {
@@ -445,7 +466,8 @@ fn add_virtual_script_call(
 
     // Update parameter names, so they can be forwarded (e.g. a "_" declared by the user cannot).
     let is_params = function.params.iter_mut().skip(1); // skip receiver.
-    let should_param_names = signature_info.param_idents.iter();
+    let should_param_names = signature_info.param_idents();
+
     is_params
         .zip(should_param_names)
         .for_each(|(param, should_param_name)| {
@@ -463,9 +485,9 @@ fn add_virtual_script_call(
     };
     let method_name_cstr = c_str(&method_name_str);
 
-    let call_params = signature_info.params_type();
+    let call_params = signature_info.param_types_tuple();
     let call_ret = &signature_info.return_type;
-    let arg_names = &signature_info.param_idents;
+    let arg_names = signature_info.param_idents().collect::<Vec<_>>();
 
     let (object_ptr, receiver);
     if let Some(gd_self_parameter) = gd_self_parameter {
