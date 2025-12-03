@@ -234,6 +234,14 @@ impl SignatureInfo {
         quote! { ( #(#std_params,)* ) }
     }
 
+    #[allow(unused)]
+    pub fn param_types(&self) -> impl Iterator<Item = &venial::TypeExpr> {
+        self.std_params
+            .iter()
+            .map(|p| &p.ty)
+            .chain(self.default_params.iter().map(|(p, _)| &p.ty))
+    }
+
     pub fn param_idents(&self) -> impl Iterator<Item = &Ident> {
         self.std_params
             .iter()

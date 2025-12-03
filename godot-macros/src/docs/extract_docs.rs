@@ -359,7 +359,7 @@ fn format_method_xml(method: &FuncDefinition) -> Option<String> {
     let return_ty = signature.return_type.to_token_stream().to_string();
     let return_ty = xml_escape(return_ty);
 
-    let param_names_and_types = signature.param_idents.iter().zip(&signature.param_types);
+    let param_names_and_types = signature.param_idents().zip(signature.param_types());
     let params = format_params_xml(param_names_and_types);
 
     Some(format!(
