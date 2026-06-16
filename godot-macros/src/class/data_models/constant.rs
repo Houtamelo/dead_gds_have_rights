@@ -5,10 +5,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::util::bail;
-use crate::{util, ParseResult};
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
+
+use crate::util::bail;
+use crate::{ParseResult, util};
 
 pub struct ConstDefinition {
     pub raw_constant: venial::Constant,
@@ -47,7 +48,7 @@ pub fn make_constant_registration(
     let tokens = if !integer_constant_names.is_empty() {
         quote! {
             use ::godot::register::private::constant::*;
-            use ::godot::meta::ClassName;
+            use ::godot::meta::ClassId;
             use ::godot::builtin::StringName;
 
             #(

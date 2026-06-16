@@ -6,13 +6,11 @@
  */
 
 use crate::builtin::{Array, Variant};
-use crate::meta::error::{ConvertError, ErrorKind, FromFfiError, FromVariantError};
-use crate::meta::{
-    ArrayElement, ClassName, FromGodot, GodotConvert, GodotNullableFfi, GodotType,
-    PropertyHintInfo, PropertyInfo, ToGodot,
-};
-use crate::registry::method::MethodParamOrReturnInfo;
-use godot_ffi as sys;
+use crate::meta;
+use crate::meta::error::{ConvertError, ErrorKind, FromFfiError};
+use crate::meta::shape::GodotShape;
+use crate::meta::{Element, FromGodot, GodotConvert, GodotNullableFfi, GodotType, ToGodot};
+use crate::registry::info::ParamMetadata;
 
 // The following ToGodot/FromGodot/Convert impls are auto-generated for each engine type, co-located with their definitions:
 // - enum
@@ -55,59 +53,63 @@ where
         Some(GodotType::from_ffi(ffi))
     }
 
-    fn param_metadata() -> sys::GDExtensionClassMethodArgumentMetadata {
-        T::param_metadata()
-    }
-
-    fn class_name() -> ClassName {
-        T::class_name()
-    }
-
-    fn property_info(property_name: &str) -> PropertyInfo {
-        T::property_info(property_name)
-    }
-
-    fn property_hint_info() -> PropertyHintInfo {
-        T::property_hint_info()
-    }
-
-    fn argument_info(property_name: &str) -> MethodParamOrReturnInfo {
-        T::argument_info(property_name)
-    }
-
-    fn return_info() -> Option<MethodParamOrReturnInfo> {
-        T::return_info()
-    }
-
-    fn godot_type_name() -> String {
-        T::godot_type_name()
+    // Only relevant for object types T.
+    fn as_object_arg(&self) -> meta::ObjectArg<'_> {
+        match self {
+            Some(inner) => inner.as_object_arg(),
+            None => meta::ObjectArg::null(),
+        }
     }
 }
 
-impl<T: GodotConvert> GodotConvert for Option<T>
+impl<T> GodotConvert for Option<T>
 where
+    T: GodotConvert,
     Option<T::Via>: GodotType,
 {
     type Via = Option<T::Via>;
+
+    fn godot_shape() -> GodotShape {
+        // Option<Gd<T>> is nullable, so param metadata will return NONE instead of OBJECT_IS_REQUIRED.
+        match T::godot_shape() {
+            GodotShape::Class {
+                class_id, heritage, ..
+            } => GodotShape::Class {
+                class_id,
+                heritage,
+                is_nullable: true,
+            },
+            other => other,
+        }
+    }
 }
 
-impl<T: ToGodot> ToGodot for Option<T>
+impl<T> ToGodot for Option<T>
 where
-    Option<T::Via>: GodotType,
-    for<'v, 'f> T::ToVia<'v>: GodotType<
-        // Associated types need to be nullable.
-        Ffi: GodotNullableFfi,
-        ToFfi<'f>: GodotNullableFfi,
-    >,
+    // Currently limited to holding objects -> needed to establish to_godot() relation T::to_godot() = Option<&T::Via>.
+    T: ToGodot<Pass = meta::ByObject>,
+    // Extra Clone bound for to_godot_owned(); might be extracted in the future.
+    T::Via: Clone,
+    // T::Via must be a Godot nullable type (to support the None case).
+    for<'f> T::Via: GodotType<
+            // Associated types need to be nullable.
+            Ffi: GodotNullableFfi,
+            ToFfi<'f>: GodotNullableFfi,
+        >,
+    // Previously used bound, not needed right now but don't remove: Option<T::Via>: GodotType,
 {
-    type ToVia<'v>
-        = Option<T::ToVia<'v>>
-    // type ToVia<'v> = Self::Via
-    where
-        Self: 'v;
+    // Basically ByRef, but allows Option<T> -> Option<&T::Via> conversion.
+    type Pass = meta::ByOption<T::Via>;
 
-    fn to_godot(&self) -> Self::ToVia<'_> {
-        self.as_ref().map(ToGodot::to_godot)
+    fn to_godot(&self) -> Option<&T::Via> {
+        self.as_ref().map(T::to_godot)
+    }
+
+    fn to_godot_owned(&self) -> Option<T::Via>
+    where
+        Self::Via: Clone,
+    {
+        self.as_ref().map(T::to_godot_owned)
     }
 
     fn to_variant(&self) -> Variant {
@@ -161,7 +163,7 @@ where
 // Scalars
 
 macro_rules! impl_godot_scalar {
-    ($T:ty as $Via:ty, $err:path, $param_metadata:expr) => {
+    ($T:ty as $Via:ty, $err:path, $param_metadata:expr_2021) => {
         impl GodotType for $T {
             type Ffi = $Via;
             type ToFfi<'f> = $Via;
@@ -186,16 +188,16 @@ macro_rules! impl_godot_scalar {
         }
 
         // For integer types, we can validate the conversion.
-        impl ArrayElement for $T {
+        impl Element for $T {
             fn debug_validate_elements(array: &Array<Self>) -> Result<(), ConvertError> {
-                array.debug_validate_elements()
+                array.debug_validate_int_elements()
             }
         }
 
         impl_godot_scalar!(@shared_traits; $T);
     };
 
-    ($T:ty as $Via:ty, $param_metadata:expr; lossy) => {
+    ($T:ty as $Via:ty, $param_metadata:expr_2021; lossy) => {
         impl GodotType for $T {
             type Ffi = $Via;
             type ToFfi<'f> = $Via;
@@ -216,30 +218,30 @@ macro_rules! impl_godot_scalar {
         }
 
         // For f32, conversion from f64 is lossy but will always succeed. Thus no debug validation needed.
-        impl ArrayElement for $T {}
+        impl Element for $T {}
 
         impl_godot_scalar!(@shared_traits; $T);
     };
 
-    (@shared_fns; $Via:ty, $param_metadata:expr) => {
-        fn param_metadata() -> sys::GDExtensionClassMethodArgumentMetadata {
+    (@shared_fns; $Via:ty, $param_metadata:expr_2021) => {
+        fn default_metadata() -> ParamMetadata {
             $param_metadata
-        }
-
-        fn godot_type_name() -> String {
-            <$Via as GodotType>::godot_type_name()
         }
     };
 
     (@shared_traits; $T:ty) => {
         impl GodotConvert for $T {
             type Via = $T;
+
+            fn godot_shape() -> GodotShape {
+                GodotShape::of_builtin::<$T>()
+            }
         }
 
         impl ToGodot for $T {
-            type ToVia<'v> = Self::Via;
+            type Pass = meta::ByValue;
 
-            fn to_godot(&self) -> Self::ToVia<'_> {
+            fn to_godot(&self) -> Self::Via {
                *self
             }
         }
@@ -249,53 +251,23 @@ macro_rules! impl_godot_scalar {
                 Ok(via)
             }
         }
-
-        $crate::impl_asarg_by_value!($T);
     };
 }
 
 // `GodotType` for these three is implemented in `godot-core/src/builtin/variant/impls.rs`.
-crate::meta::impl_godot_as_self!(bool);
-crate::meta::impl_godot_as_self!(i64);
-crate::meta::impl_godot_as_self!(f64);
-crate::meta::impl_godot_as_self!(());
+meta::impl_godot_as_self!(bool: ByValue);
+meta::impl_godot_as_self!(i64: ByValue);
+meta::impl_godot_as_self!(f64: ByValue);
+meta::impl_godot_as_self!((): ByValue);
 
-// Also implements ArrayElement.
-impl_godot_scalar!(
-    i8 as i64,
-    FromFfiError::I8,
-    sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_INT_IS_INT8
-);
-impl_godot_scalar!(
-    u8 as i64,
-    FromFfiError::U8,
-    sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_INT_IS_UINT8
-);
-impl_godot_scalar!(
-    i16 as i64,
-    FromFfiError::I16,
-    sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_INT_IS_INT16
-);
-impl_godot_scalar!(
-    u16 as i64,
-    FromFfiError::U16,
-    sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_INT_IS_UINT16
-);
-impl_godot_scalar!(
-    i32 as i64,
-    FromFfiError::I32,
-    sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_INT_IS_INT32
-);
-impl_godot_scalar!(
-    u32 as i64,
-    FromFfiError::U32,
-    sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_INT_IS_UINT32
-);
-impl_godot_scalar!(
-    f32 as f64,
-    sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_REAL_IS_FLOAT;
-    lossy
-);
+// Also implements Element.
+impl_godot_scalar!(i8 as i64, FromFfiError::I8, ParamMetadata::INT_IS_INT8);
+impl_godot_scalar!(u8 as i64, FromFfiError::U8, ParamMetadata::INT_IS_UINT8);
+impl_godot_scalar!(i16 as i64, FromFfiError::I16, ParamMetadata::INT_IS_INT16);
+impl_godot_scalar!(u16 as i64, FromFfiError::U16, ParamMetadata::INT_IS_UINT16);
+impl_godot_scalar!(i32 as i64, FromFfiError::I32, ParamMetadata::INT_IS_INT32);
+impl_godot_scalar!(u32 as i64, FromFfiError::U32, ParamMetadata::INT_IS_UINT32);
+impl_godot_scalar!(f32 as f64, ParamMetadata::REAL_IS_FLOAT; lossy);
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // u64: manually implemented, to ensure that type is not altered during conversion.
@@ -313,84 +285,85 @@ impl GodotType for u64 {
     }
 
     fn try_from_ffi(ffi: Self::Ffi) -> Result<Self, ConvertError> {
-        // Ok(ffi as u64)
-        Self::try_from(ffi).map_err(|_rust_err| FromFfiError::U64.into_error(ffi))
+        Ok(ffi as u64)
     }
 
-    impl_godot_scalar!(@shared_fns; i64, sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_INT_IS_UINT64);
+    impl_godot_scalar!(@shared_fns; i64, ParamMetadata::INT_IS_UINT64);
 }
 
 impl GodotConvert for u64 {
     type Via = u64;
+
+    fn godot_shape() -> GodotShape {
+        GodotShape::of_builtin::<u64>()
+    }
 }
 
-impl ToGodot for u64 {
-    type ToVia<'v> = u64;
+// u64 implements internal-only conversion traits for use in engine APIs and virtual methods.
+impl meta::EngineToGodot for u64 {
+    type Pass = meta::ByValue;
 
-    fn to_godot(&self) -> Self::ToVia<'_> {
+    fn engine_to_godot(&self) -> meta::ToArg<'_, Self::Via, Self::Pass> {
         *self
     }
 
-    fn to_variant(&self) -> Variant {
-        // TODO panic doesn't fit the trait's infallibility too well; maybe in the future try_to_godot/try_to_variant() methods are possible.
-        i64::try_from(*self)
-            .map(|v| v.to_variant())
-            .unwrap_or_else(|_| {
-                panic!("to_variant(): u64 value {self} is not representable inside Variant, which can only store i64 integers")
-            })
+    fn engine_to_variant(&self) -> Variant {
+        Variant::from(*self as i64) // Treat as i64.
     }
 }
 
-impl FromGodot for u64 {
-    fn try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
+impl meta::EngineFromGodot for u64 {
+    fn engine_try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
         Ok(via)
     }
 
-    fn try_from_variant(variant: &Variant) -> Result<Self, ConvertError> {
-        // Fail for values that are not representable as u64.
-        let value = variant.try_to::<i64>()?;
-
-        u64::try_from(value).map_err(|_rust_err| {
-            // TODO maybe use better error enumerator
-            FromVariantError::BadValue.into_error(value)
-        })
+    fn engine_try_from_variant(variant: &Variant) -> Result<Self, ConvertError> {
+        variant.try_to::<i64>().map(|i| i as u64)
     }
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Collections
 
-impl<T: ArrayElement> GodotConvert for Vec<T> {
+impl<T: Element> GodotConvert for Vec<T> {
     type Via = Array<T>;
+
+    fn godot_shape() -> GodotShape {
+        <Array<T> as GodotConvert>::godot_shape()
+    }
 }
 
-impl<T: ArrayElement> ToGodot for Vec<T> {
-    type ToVia<'v> = Array<T>;
+impl<T: Element> ToGodot for Vec<T> {
+    type Pass = meta::ByValue;
 
-    fn to_godot(&self) -> Self::ToVia<'_> {
+    fn to_godot(&self) -> Self::Via {
         Array::from(self.as_slice())
     }
 }
 
-impl<T: ArrayElement> FromGodot for Vec<T> {
+impl<T: Element> FromGodot for Vec<T> {
     fn try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
         Ok(via.iter_shared().collect())
     }
 }
 
-impl<T: ArrayElement, const LEN: usize> GodotConvert for [T; LEN] {
+impl<T: Element, const LEN: usize> GodotConvert for [T; LEN] {
     type Via = Array<T>;
+
+    fn godot_shape() -> GodotShape {
+        <Array<T> as GodotConvert>::godot_shape()
+    }
 }
 
-impl<T: ArrayElement, const LEN: usize> ToGodot for [T; LEN] {
-    type ToVia<'v> = Array<T>;
+impl<T: Element, const LEN: usize> ToGodot for [T; LEN] {
+    type Pass = meta::ByValue;
 
-    fn to_godot(&self) -> Self::ToVia<'_> {
+    fn to_godot(&self) -> Self::Via {
         Array::from(self)
     }
 }
 
-impl<T: ArrayElement, const LEN: usize> FromGodot for [T; LEN] {
+impl<T: Element, const LEN: usize> FromGodot for [T; LEN] {
     fn try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
         let via_len = via.len(); // Caching this avoids an FFI call
         if via_len != LEN {
@@ -418,17 +391,18 @@ impl<T: ArrayElement, const LEN: usize> FromGodot for [T; LEN] {
     }
 }
 
-impl<T: ArrayElement> GodotConvert for &[T] {
+impl<T: Element> GodotConvert for &[T] {
     type Via = Array<T>;
+
+    fn godot_shape() -> GodotShape {
+        <Array<T> as GodotConvert>::godot_shape()
+    }
 }
 
-impl<T: ArrayElement> ToGodot for &[T] {
-    type ToVia<'v>
-        = Array<T>
-    where
-        Self: 'v;
+impl<T: Element> ToGodot for &[T] {
+    type Pass = meta::ByValue;
 
-    fn to_godot(&self) -> Self::ToVia<'_> {
+    fn to_godot(&self) -> Self::Via {
         Array::from(*self)
     }
 }
@@ -436,40 +410,98 @@ impl<T: ArrayElement> ToGodot for &[T] {
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Raw pointers
 
-// const void* is used in some APIs like OpenXrApiExtension::transform_from_pose().
-// void* is used by ScriptExtension::instance_create().
-// Other impls for raw pointers are generated for native structures.
-
-macro_rules! impl_pointer_convert {
-    ($Ptr:ty) => {
-        impl GodotConvert for $Ptr {
-            type Via = i64;
-        }
-
-        impl ToGodot for $Ptr {
-            type ToVia<'v> = i64;
-
-            fn to_godot(&self) -> Self::ToVia<'_> {
-                *self as i64
-            }
-        }
-
-        impl FromGodot for $Ptr {
-            fn try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
-                Ok(via as Self)
-            }
-        }
-    };
-}
-
-impl_pointer_convert!(*const std::ffi::c_void);
-impl_pointer_convert!(*mut std::ffi::c_void);
-
+// Following types used to be manually implemented, but are now covered by RawPtr<P>.
+// - *mut *const u8
+// - *mut i32
+// - *mut f64
+// - *mut u8
+// - *const u8
+//
+// *const c_void: is used in some APIs like OpenXrApiExtension::transform_from_pose().
+// *mut c_void: is used by ScriptExtension::instance_create().
+//
+// Other impls for raw pointers are generated for native structures and sys pointers (e.g. GDExtensionManager::load_extension_from_function).
 // Some other pointer types are used by various other methods, see https://github.com/godot-rust/gdext/issues/677
-// TODO: Find better solution to this, this may easily break still if godot decides to add more pointer arguments.
 
-impl_pointer_convert!(*mut *const u8);
-impl_pointer_convert!(*mut i32);
-impl_pointer_convert!(*mut f64);
-impl_pointer_convert!(*mut u8);
-impl_pointer_convert!(*const u8);
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Tests for ToGodot/FromGodot missing impls
+//
+// Sanity check: comment-out ::godot::meta::ensure_func_bounds in func.rs, the 3 latter #[func] ones should fail.
+
+/// Test that `u64` cannot be converted to variant.
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// let variant = 100u64.to_variant();  // Error: u64 does not implement ToGodot
+/// ```
+fn __doctest_u64() {}
+
+/// Test that `*mut i32` cannot be converted to variant.
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// let ptr: *mut i32 = std::ptr::null_mut();
+/// let variant = ptr.to_variant();  // Error: *mut i32 does not implement ToGodot
+/// ```
+fn __doctest_i32_ptr_to_variant() {}
+
+/// Test that void-pointers cannot be converted from variant.
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// let variant = Variant::nil();
+/// let ptr: *const std::ffi::c_void = variant.to();
+/// ```
+fn __doctest_void_ptr_from_variant() {}
+
+/// Test that native struct pointers cannot be used as `#[func]` parameters.
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// # use godot::classes::native::AudioFrame;
+/// #[derive(GodotClass)]
+/// #[class(init)]
+/// struct MyClass {}
+///
+/// #[godot_api]
+/// impl MyClass {
+///     #[func]
+///     fn take_pointer(&self, ptr: *mut AudioFrame) {}
+/// }
+/// ```
+fn __doctest_native_struct_pointer_param() {}
+
+/// Test that native struct pointers cannot be used as `#[func]` return types.
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// # use godot::classes::native::AudioFrame;
+/// #[derive(GodotClass)]
+/// #[class(init)]
+/// struct MyClass {}
+///
+/// #[godot_api]
+/// impl MyClass {
+///     #[func]
+///     fn return_pointer(&self) -> *const AudioFrame {
+///         std::ptr::null()
+///     }
+/// }
+/// ```
+fn __doctest_native_struct_pointer_return() {}
+
+/// Test that `u64` cannot be returned from `#[func]`.
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init)]
+/// struct MyClass {}
+///
+/// #[godot_api]
+/// impl MyClass {
+///     #[func]
+///     fn return_pointer(&self) -> u64 { 123 }
+/// }
+/// ```
+fn __doctest_u64_return() {}

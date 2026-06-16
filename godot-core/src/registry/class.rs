@@ -5,20 +5,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use godot_ffi::join_with;
 use std::collections::HashMap;
 use std::{any, ptr};
 
+use sys::{Global, GlobalGuard, GlobalLockError, interface_fn, out};
+
 use crate::classes::ClassDb;
 use crate::init::InitLevel;
-use crate::meta::error::{ConvertError, FromGodotError};
-use crate::meta::ClassName;
-use crate::obj::{cap, DynGd, Gd, GodotClass};
+use crate::meta::ClassId;
+use crate::meta::error::FromGodotError;
+use crate::obj::{DynGd, Gd, GodotClass, Singleton, cap};
 use crate::private::{ClassPlugin, PluginItem};
 use crate::registry::callbacks;
 use crate::registry::plugin::{DynTraitImpl, ErasedRegisterFn, ITraitImpl, InherentImpl, Struct};
-use crate::{classes, godot_error, godot_warn, sys};
-use sys::{interface_fn, out, Global, GlobalGuard, GlobalLockError};
+use crate::{godot_error, godot_warn, sys};
 
 /// Returns a lock to a global map of loaded classes, by initialization level.
 ///
@@ -26,8 +26,8 @@ use sys::{interface_fn, out, Global, GlobalGuard, GlobalLockError};
 /// calls register/unregister in the main thread. Mutex is just casual way to ensure safety in this non-performance-critical path.
 /// Note that we panic on concurrent access instead of blocking (fail-fast approach). If that happens, most likely something changed on Godot
 /// side and analysis required to adopt these changes.
-fn global_loaded_classes_by_init_level(
-) -> GlobalGuard<'static, HashMap<InitLevel, Vec<LoadedClass>>> {
+fn global_loaded_classes_by_init_level()
+-> GlobalGuard<'static, HashMap<InitLevel, Vec<LoadedClass>>> {
     static LOADED_CLASSES_BY_INIT_LEVEL: Global<
         HashMap<InitLevel, Vec<LoadedClass>>, //.
     > = Global::default();
@@ -39,8 +39,8 @@ fn global_loaded_classes_by_init_level(
 ///
 /// Complementary mechanism to the on-registration hooks like `__register_methods()`. This is used for runtime queries about a class, for
 /// information which isn't stored in Godot. Example: list related `dyn Trait` implementations.
-fn global_loaded_classes_by_name() -> GlobalGuard<'static, HashMap<ClassName, ClassMetadata>> {
-    static LOADED_CLASSES_BY_NAME: Global<HashMap<ClassName, ClassMetadata>> = Global::default();
+fn global_loaded_classes_by_name() -> GlobalGuard<'static, HashMap<ClassId, ClassMetadata>> {
+    static LOADED_CLASSES_BY_NAME: Global<HashMap<ClassId, ClassMetadata>> = Global::default();
 
     lock_or_panic(&LOADED_CLASSES_BY_NAME, "loaded classes (by name)")
 }
@@ -58,8 +58,9 @@ fn global_dyn_traits_by_typeid() -> GlobalGuard<'static, HashMap<any::TypeId, Ve
 ///
 /// Besides the name, this type holds information relevant for the deregistration of the class.
 pub struct LoadedClass {
-    name: ClassName,
+    name: ClassId,
     is_editor_plugin: bool,
+    unregister_singleton_fn: Option<fn()>,
 }
 
 /// Represents a class which is currently loaded and retained in memory -- including metadata.
@@ -70,9 +71,7 @@ pub struct ClassMetadata {}
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
 // This works as long as fields are called the same. May still need individual #[cfg]s for newer fields.
-#[cfg(before_api = "4.2")]
-type GodotCreationInfo = sys::GDExtensionClassCreationInfo;
-#[cfg(all(since_api = "4.2", before_api = "4.3"))]
+#[cfg(before_api = "4.3")]
 type GodotCreationInfo = sys::GDExtensionClassCreationInfo2;
 #[cfg(all(since_api = "4.3", before_api = "4.4"))]
 type GodotCreationInfo = sys::GDExtensionClassCreationInfo3;
@@ -86,14 +85,16 @@ pub(crate) type GodotGetVirtual = <sys::GDExtensionClassGetVirtual2 as sys::Inne
 
 #[derive(Debug)]
 struct ClassRegistrationInfo {
-    class_name: ClassName,
-    parent_class_name: Option<ClassName>,
+    class_name: ClassId,
+    parent_class_name: Option<ClassId>,
     // Following functions are stored separately, since their order matters.
     register_methods_constants_fn: Option<ErasedRegisterFn>,
     register_properties_fn: Option<ErasedRegisterFn>,
     user_register_fn: Option<ErasedRegisterFn>,
     default_virtual_fn: Option<GodotGetVirtual>, // Optional (set if there is at least one OnReady field)
     user_virtual_fn: Option<GodotGetVirtual>, // Optional (set if there is a `#[godot_api] impl I*`)
+    register_singleton_fn: Option<fn()>,
+    unregister_singleton_fn: Option<fn()>,
 
     /// Godot low-level class creation parameters.
     godot_params: GodotCreationInfo,
@@ -136,7 +137,7 @@ impl ClassRegistrationInfo {
 }
 
 /// Registers a class with static type information.
-// Currently dead code, but will be needed for builder API. Don't remove.
+// Will be needed for builder API. Don't remove.
 pub fn register_class<
     T: cap::GodotDefault
         + cap::ImplementsGodotVirtual
@@ -147,7 +148,7 @@ pub fn register_class<
 >() {
     // TODO: provide overloads with only some trait impls
 
-    out!("Manually register class {}", std::any::type_name::<T>());
+    out!("Manually register class {}", any::type_name::<T>());
 
     let godot_params = GodotCreationInfo {
         to_string_func: Some(callbacks::to_string::<T>),
@@ -162,13 +163,13 @@ pub fn register_class<
     };
 
     assert!(
-        !T::class_name().is_none(),
+        !T::class_id().is_none(),
         "cannot register () or unnamed class"
     );
 
     register_class_raw(ClassRegistrationInfo {
-        class_name: T::class_name(),
-        parent_class_name: Some(T::Base::class_name()),
+        class_name: T::class_id(),
+        parent_class_name: Some(T::Base::class_id()),
         register_methods_constants_fn: None,
         register_properties_fn: None,
         user_register_fn: Some(ErasedRegisterFn {
@@ -181,6 +182,8 @@ pub fn register_class<
         is_editor_plugin: false,
         dynify_fns_by_trait: HashMap::new(),
         component_already_filled: Default::default(), // [false; N]
+        register_singleton_fn: None,
+        unregister_singleton_fn: None,
     });
 }
 
@@ -192,7 +195,7 @@ pub fn auto_register_classes(init_level: InitLevel) {
     // * missing #[derive(GodotClass)] or impl GodotClass for T
     // * duplicate impl GodotDefault for T
     //
-    let mut map = HashMap::<ClassName, ClassRegistrationInfo>::new();
+    let mut map = HashMap::<ClassId, ClassRegistrationInfo>::new();
 
     crate::private::iterate_plugins(|elem: &ClassPlugin| {
         // Filter per ClassPlugin and not PluginItem, because all components of all classes are mixed together in one huge list.
@@ -216,9 +219,17 @@ pub fn auto_register_classes(init_level: InitLevel) {
     // but it is much slower and doesn't guarantee that all the dependent classes will be already loaded in most cases.
     register_classes_and_dyn_traits(&mut map, init_level);
 
-    // Editor plugins should be added to the editor AFTER all the classes has been registered.
-    // Adding EditorPlugin to the Editor before registering all the classes it depends on might result in crash.
-    let mut editor_plugins: Vec<ClassName> = Vec::new();
+    // Before Godot 4.4.1, editor plugins were added to the editor immediately, triggering their lifecycle methods –- even before their
+    // dependencies (e.g. properties) have been registered.
+    // During hot-reload, Godot erases all GDExtension instance bindings (the "rust part"), effectively changing them to the base classes.
+    // These two behaviors combined were leading to crashes.
+    //
+    // Since Godot 4.4.1, adding new EditorPlugin to the editor is being postponed until the end of the frame (i.e. after library registration).
+    // See also: https://github.com/godot-rust/gdext/issues/1132.
+    let mut editor_plugins: Vec<ClassId> = Vec::new();
+
+    // Similarly to EnginePlugins – freshly instantiated engine singleton might depend on some not-yet-registered classes.
+    let mut singletons: Vec<fn()> = Vec::new();
 
     // Actually register all the classes.
     for info in map.into_values() {
@@ -229,15 +240,19 @@ pub fn auto_register_classes(init_level: InitLevel) {
             editor_plugins.push(info.class_name);
         }
 
+        if let Some(register_singleton_fn) = info.register_singleton_fn {
+            singletons.push(register_singleton_fn)
+        }
+
         register_class_raw(info);
 
         out!("Class {class_name} loaded.");
     }
 
-    // Will imminently add given class to the editor.
-    // It is expected and beneficial behaviour while we load library for the first time
-    // but (for now) might lead to some issues during hot reload.
-    // See also: (https://github.com/godot-rust/gdext/issues/1132)
+    for register_singleton_fn in singletons {
+        register_singleton_fn()
+    }
+
     for editor_plugin_class_name in editor_plugins {
         unsafe { interface_fn!(editor_add_plugin)(editor_plugin_class_name.string_sys()) };
     }
@@ -246,7 +261,7 @@ pub fn auto_register_classes(init_level: InitLevel) {
 }
 
 fn register_classes_and_dyn_traits(
-    map: &mut HashMap<ClassName, ClassRegistrationInfo>,
+    map: &mut HashMap<ClassId, ClassRegistrationInfo>,
     init_level: InitLevel,
 ) {
     let mut loaded_classes_by_level = global_loaded_classes_by_init_level();
@@ -260,6 +275,7 @@ fn register_classes_and_dyn_traits(
         let loaded_class = LoadedClass {
             name: class_name,
             is_editor_plugin: info.is_editor_plugin,
+            unregister_singleton_fn: info.unregister_singleton_fn,
         };
         let metadata = ClassMetadata {};
 
@@ -308,7 +324,7 @@ pub fn auto_register_rpcs<T: GodotClass>(object: &mut T) {
     if let Some(InherentImpl {
         register_rpcs_fn: Some(closure),
         ..
-    }) = crate::private::find_inherent_impl(T::class_name())
+    }) = crate::private::find_inherent_impl(T::class_id())
     {
         (closure.raw)(object);
     }
@@ -324,14 +340,14 @@ pub fn auto_register_rpcs<T: GodotClass>(object: &mut T) {
 /// lifted, but would need quite a bit of extra machinery to work.
 pub(crate) fn try_dynify_object<T: GodotClass, D: ?Sized + 'static>(
     mut object: Gd<T>,
-) -> Result<DynGd<T, D>, ConvertError> {
+) -> Result<DynGd<T, D>, (FromGodotError, Gd<T>)> {
     let typeid = any::TypeId::of::<D>();
     let trait_name = sys::short_type_name::<D>();
 
     // Iterate all classes that implement the trait.
     let dyn_traits_by_typeid = global_dyn_traits_by_typeid();
     let Some(relations) = dyn_traits_by_typeid.get(&typeid) else {
-        return Err(FromGodotError::UnregisteredDynTrait { trait_name }.into_error(object));
+        return Err((FromGodotError::UnregisteredDynTrait { trait_name }, object));
     };
 
     // TODO maybe use 2nd hashmap instead of linear search.
@@ -348,26 +364,20 @@ pub(crate) fn try_dynify_object<T: GodotClass, D: ?Sized + 'static>(
         class_name: object.dynamic_class_string().to_string(),
     };
 
-    Err(error.into_error(object))
+    Err((error, object))
 }
 
-/// Responsible for creating hint_string for [`DynGd<T, D>`][crate::obj::DynGd] properties which works with [`PropertyHint::NODE_TYPE`][crate::global::PropertyHint::NODE_TYPE] or [`PropertyHint::RESOURCE_TYPE`][crate::global::PropertyHint::RESOURCE_TYPE].
+/// Returns the `ClassId`s of all concrete implementors of trait `D` that inherit from `T`.
 ///
-/// Godot offers very limited capabilities when it comes to validating properties in the editor if given class isn't a tool.
-/// Proper hint string combined with `PropertyHint::RESOURCE_TYPE` allows to limit selection only to valid classes - those registered as implementors of given `DynGd<T, D>`'s `D` trait.
-/// Godot editor allows to export only one node type with `PropertyHint::NODE_TYPE` – therefore we are returning only the base class.
+/// Used by [`DynGd<T, D>`][crate::obj::DynGd] to populate [`ClassAncestor::DynResource`][crate::registry::property::ClassAncestor::DynResource]
+/// with the set of valid implementor classes from the `#[godot_dyn]` registry.
 ///
 /// See also [Godot docs for PropertyHint](https://docs.godotengine.org/en/stable/classes/class_@globalscope.html#enum-globalscope-propertyhint).
-pub(crate) fn get_dyn_property_hint_string<T, D>() -> String
+pub(crate) fn get_dyn_implementor_class_ids<T, D>() -> Vec<ClassId>
 where
     T: GodotClass,
     D: ?Sized + 'static,
 {
-    // Exporting multiple node types is not supported.
-    if T::inherits::<classes::Node>() {
-        return T::class_name().to_string();
-    }
-
     let typeid = any::TypeId::of::<D>();
     let dyn_traits_by_typeid = global_dyn_traits_by_typeid();
 
@@ -376,7 +386,7 @@ where
         godot_warn!(
             "godot-rust: No class has been linked to trait {trait_name} with #[godot_dyn]."
         );
-        return String::new();
+        return Vec::new();
     };
     assert!(
         !relations.is_empty(),
@@ -387,24 +397,23 @@ where
     );
 
     // Include only implementors inheriting given T.
-    // For example – don't include Nodes or Objects while creating hint_string for Resource.
-    let relations_iter = relations.iter().filter_map(|implementor| {
-        // TODO – check if caching it (using is_derived_base_cached) yields any benefits.
-        if implementor.parent_class_name? == T::class_name()
-            || ClassDb::singleton().is_parent_class(
-                &implementor.parent_class_name?.to_string_name(),
-                &T::class_name().to_string_name(),
-            )
-        {
-            Some(implementor)
-        } else {
-            None
-        }
-    });
-
-    join_with(relations_iter, ", ", |dyn_trait| {
-        dyn_trait.class_name().to_cow_str()
-    })
+    // For example — don't include Nodes or Objects while creating hint_string for Resource.
+    relations
+        .iter()
+        .filter_map(|implementor| {
+            // TODO — check if caching it (using is_derived_base_cached) yields any benefits.
+            if implementor.parent_class_name? == T::class_id()
+                || ClassDb::singleton().is_parent_class(
+                    &implementor.parent_class_name?.to_string_name(),
+                    &T::class_id().to_string_name(),
+                )
+            {
+                Some(*implementor.class_name())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Populate `c` with all the relevant data from `component` (depending on component type).
@@ -421,15 +430,21 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             register_properties_fn,
             free_fn,
             default_get_virtual_fn,
+            unregister_singleton_fn,
+            register_singleton_fn,
             is_tool,
             is_editor_plugin,
             is_internal,
             is_instantiable,
+            reference_fn,
+            unreference_fn,
         }) => {
             c.parent_class_name = Some(base_class_name);
             c.default_virtual_fn = default_get_virtual_fn;
             c.register_properties_fn = Some(register_properties_fn);
             c.is_editor_plugin = is_editor_plugin;
+            c.register_singleton_fn = register_singleton_fn;
+            c.unregister_singleton_fn = unregister_singleton_fn;
 
             // Classes marked #[class(no_init)] are translated to "abstract" in Godot. This disables their default constructor.
             // "Abstract" is a misnomer -- it's not an abstract base class, but rather a "utility/static class" (although it can have instance
@@ -441,6 +456,8 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             // See also: https://github.com/godotengine/godot/pull/58972
             c.godot_params.is_abstract = sys::conv::bool_to_sys(!is_instantiable);
             c.godot_params.free_instance_func = Some(free_fn);
+            c.godot_params.reference_func = reference_fn;
+            c.godot_params.unreference_func = unreference_fn;
 
             fill_into(
                 &mut c.godot_params.create_instance_func,
@@ -448,21 +465,13 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             )
             .expect("duplicate: create_instance_func (def)");
 
-            #[cfg(before_api = "4.2")]
-            let _ = is_internal; // mark used
-            #[cfg(since_api = "4.2")]
-            {
-                fill_into(
-                    &mut c.godot_params.recreate_instance_func,
-                    generated_recreate_fn,
-                )
-                .expect("duplicate: recreate_instance_func (def)");
+            fill_into(
+                &mut c.godot_params.recreate_instance_func,
+                generated_recreate_fn,
+            )
+            .expect("duplicate: recreate_instance_func (def)");
 
-                c.godot_params.is_exposed = sys::conv::bool_to_sys(!is_internal);
-            }
-
-            #[cfg(before_api = "4.2")]
-            assert!(generated_recreate_fn.is_none()); // not used
+            c.godot_params.is_exposed = sys::conv::bool_to_sys(!is_internal);
 
             #[cfg(before_api = "4.3")]
             let _ = is_tool; // mark used
@@ -493,7 +502,6 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             user_free_property_list_fn,
             user_property_can_revert_fn,
             user_property_get_revert_fn,
-            #[cfg(since_api = "4.2")]
             validate_property_fn,
         }) => {
             c.user_register_fn = user_register_fn;
@@ -504,12 +512,8 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             fill_into(&mut c.godot_params.create_instance_func, user_create_fn)
                 .expect("duplicate: create_instance_func (i)");
 
-            #[cfg(since_api = "4.2")]
             fill_into(&mut c.godot_params.recreate_instance_func, user_recreate_fn)
                 .expect("duplicate: recreate_instance_func (i)");
-
-            #[cfg(before_api = "4.2")]
-            assert!(user_recreate_fn.is_none()); // not used
 
             c.godot_params.to_string_func = user_to_string_fn;
             c.godot_params.notification_func = user_on_notification_fn;
@@ -520,7 +524,6 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             c.godot_params.property_can_revert_func = user_property_can_revert_fn;
             c.godot_params.property_get_revert_func = user_property_get_revert_fn;
             c.user_virtual_fn = get_virtual_fn;
-            #[cfg(since_api = "4.2")]
             {
                 c.godot_params.validate_property_func = validate_property_fn;
             }
@@ -574,10 +577,7 @@ fn register_class_raw(mut info: ClassRegistrationInfo) {
     let registration_failed = unsafe {
         // Try to register class...
 
-        #[cfg(before_api = "4.2")]
-        let register_fn = interface_fn!(classdb_register_extension_class);
-
-        #[cfg(all(since_api = "4.2", before_api = "4.3"))]
+        #[cfg(before_api = "4.3")]
         let register_fn = interface_fn!(classdb_register_extension_class2);
 
         #[cfg(all(since_api = "4.3", before_api = "4.4"))]
@@ -646,6 +646,12 @@ fn unregister_class_raw(class: LoadedClass) {
         out!("> Editor plugin removed");
     }
 
+    // Similarly to EditorPlugin – given instance is being freed and will not be recreated
+    // during hot reload (a new, independent one will be created instead).
+    if let Some(unregister_singleton_fn) = class.unregister_singleton_fn {
+        unregister_singleton_fn();
+    }
+
     #[allow(clippy::let_unit_value)]
     let _: () = unsafe {
         interface_fn!(classdb_unregister_extension_class)(
@@ -664,7 +670,9 @@ fn lock_or_panic<T>(global: &'static Global<T>, ctx: &str) -> GlobalGuard<'stati
             GlobalLockError::Poisoned { .. } => panic!(
                 "global lock for {ctx} poisoned; class registration or deregistration may have panicked"
             ),
-            GlobalLockError::WouldBlock => panic!("unexpected concurrent access to global lock for {ctx}"),
+            GlobalLockError::WouldBlock => {
+                panic!("unexpected concurrent access to global lock for {ctx}")
+            }
             GlobalLockError::InitFailed => unreachable!("global lock for {ctx} not initialized"),
         },
     }
@@ -675,7 +683,7 @@ fn lock_or_panic<T>(global: &'static Global<T>, ctx: &str) -> GlobalGuard<'stati
 
 // Yes, bindgen can implement Default, but only for _all_ types (with single exceptions).
 // For FFI types, it's better to have explicit initialization in the general case though.
-fn default_registration_info(class_name: ClassName) -> ClassRegistrationInfo {
+fn default_registration_info(class_name: ClassId) -> ClassRegistrationInfo {
     ClassRegistrationInfo {
         class_name,
         parent_class_name: None,
@@ -684,6 +692,8 @@ fn default_registration_info(class_name: ClassName) -> ClassRegistrationInfo {
         user_register_fn: None,
         default_virtual_fn: None,
         user_virtual_fn: None,
+        register_singleton_fn: None,
+        unregister_singleton_fn: None,
         godot_params: default_creation_info(),
         init_level: InitLevel::Scene,
         is_editor_plugin: false,
@@ -692,30 +702,7 @@ fn default_registration_info(class_name: ClassName) -> ClassRegistrationInfo {
     }
 }
 
-#[cfg(before_api = "4.2")]
-fn default_creation_info() -> sys::GDExtensionClassCreationInfo {
-    sys::GDExtensionClassCreationInfo {
-        is_virtual: false as u8,
-        is_abstract: false as u8,
-        set_func: None,
-        get_func: None,
-        get_property_list_func: None,
-        free_property_list_func: None,
-        property_can_revert_func: None,
-        property_get_revert_func: None,
-        notification_func: None,
-        to_string_func: None,
-        reference_func: None,
-        unreference_func: None,
-        create_instance_func: None,
-        free_instance_func: None,
-        get_virtual_func: None,
-        get_rid_func: None,
-        class_userdata: ptr::null_mut(),
-    }
-}
-
-#[cfg(all(since_api = "4.2", before_api = "4.3"))]
+#[cfg(before_api = "4.3")]
 fn default_creation_info() -> sys::GDExtensionClassCreationInfo2 {
     sys::GDExtensionClassCreationInfo2 {
         is_virtual: false as u8,

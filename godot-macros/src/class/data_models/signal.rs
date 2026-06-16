@@ -7,10 +7,11 @@
 
 // Some duplication with godot-codegen/signals.rs; see comments there.
 
-use crate::util::bail;
-use crate::{util, ParseResult};
 use proc_macro2::{Delimiter, Ident, TokenStream, TokenTree};
-use quote::{format_ident, quote, ToTokens};
+use quote::{ToTokens, format_ident, quote};
+
+use crate::util::bail;
+use crate::{ParseResult, util};
 
 /// Holds information known from a signal's definition
 pub struct SignalDefinition {
@@ -32,7 +33,7 @@ pub struct SignalDefinition {
 /// that a total order must exist. `in` paths cannot be semantically analyzed by proc-macros.
 ///
 /// Documented in <https://godot-rust.github.io/book/register/signals.html#signal-visibility>.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub enum SignalVisibility {
     Priv,
     PubSuper,
@@ -108,6 +109,8 @@ struct SignalDetails<'a> {
     signal_name_str: String,
     /// `#[cfg(..)] #[cfg(..)]`
     signal_cfg_attrs: Vec<&'a venial::Attribute>,
+    /// `///` `#[doc = ...]`
+    signal_doc_attrs: Vec<&'a venial::Attribute>,
     /// `MyClass_MySignal`
     individual_struct_name: Ident,
     /// Visibility, e.g. `pub(crate)`
@@ -145,9 +148,17 @@ impl<'a> SignalDetails<'a> {
             .into_iter()
             .collect();
 
+        // Preserve docs.
+        let signal_doc_attrs = util::extract_doc_attrs(external_attributes)
+            .into_iter()
+            .collect();
+
         let param_tuple = quote! { ( #( #param_types, )* ) };
         let signal_name = &fn_signature.name;
-        let individual_struct_name = format_ident!("__godot_Signal_{}_{}", class_name, signal_name);
+        let individual_struct_name = format_ident!(
+            "__godot_Signal_{class_name}_{signal_name}",
+            span = signal_name.span()
+        );
 
         let vis_marker = &fn_signature.vis_marker;
         let Some(_vis_classified) = SignalVisibility::try_parse(vis_marker.as_ref()) else {
@@ -168,6 +179,7 @@ impl<'a> SignalDetails<'a> {
             signal_name,
             signal_name_str: fn_signature.name.to_string(),
             signal_cfg_attrs,
+            signal_doc_attrs,
             individual_struct_name,
             vis_marker: vis_marker.clone(),
             // vis_classified,
@@ -186,9 +198,7 @@ pub fn make_signal_registrations(
 ) -> ParseResult<(Vec<TokenStream>, Option<TokenStream>)> {
     let mut signal_registrations = Vec::new();
 
-    #[cfg(since_api = "4.2")]
     let mut collection_api = SignalCollection::default();
-    // #[cfg(since_api = "4.2")]
     // let mut max_visibility = SignalVisibility::Priv;
 
     for signal in signals {
@@ -200,8 +210,7 @@ pub fn make_signal_registrations(
 
         let details = SignalDetails::extract(fn_signature, class_name, external_attributes)?;
 
-        // Callable custom functions are only supported in 4.2+, upon which custom signals rely.
-        #[cfg(since_api = "4.2")]
+        // Type-safe signal builder API, if available.
         if *has_builder {
             collection_api.extend_with(&details);
             // max_visibility = max_visibility.max(details.vis_classified);
@@ -212,12 +221,8 @@ pub fn make_signal_registrations(
     }
 
     // Rewrite the above using #[cfg].
-    #[cfg(since_api = "4.2")]
     let signal_symbols =
         (!no_typed_signals).then(|| make_signal_symbols(class_name, collection_api));
-
-    #[cfg(before_api = "4.2")]
-    let signal_symbols = None;
 
     Ok((signal_registrations, signal_symbols))
 }
@@ -241,7 +246,7 @@ fn make_signal_registration(details: &SignalDetails, class_name_obj: &TokenStrea
         [
             // Don't use raw sys pointers directly; it's very easy to have objects going out of scope.
             #(
-                <#param_list as ::godot::meta::ParamTuple>
+                <#param_list as ::godot::meta::conv::ParamTuple>
                     ::property_info(#indexes, #param_names_str).unwrap(),
             )*
         ]
@@ -249,11 +254,12 @@ fn make_signal_registration(details: &SignalDetails, class_name_obj: &TokenStrea
 
     let signal_parameters_count = param_names.len();
 
+    // Don't use quote_spanned! for the entire block -- the unsafe code should NOT be attributed to the user's signal definition.
     quote! {
         #(#signal_cfg_attrs)*
         unsafe {
             use ::godot::sys;
-            let parameters_info: [::godot::meta::PropertyInfo; #signal_parameters_count] = #param_property_infos;
+            let parameters_info: [::godot::register::info::PropertyInfo; #signal_parameters_count] = #param_property_infos;
 
             let mut parameters_info_sys: [sys::GDExtensionPropertyInfo; #signal_parameters_count] =
                 std::array::from_fn(|i| parameters_info[i].property_sys());
@@ -291,6 +297,7 @@ impl SignalCollection {
             signal_name,
             signal_name_str,
             signal_cfg_attrs,
+            signal_doc_attrs,
             individual_struct_name,
             vis_marker,
             ..
@@ -299,6 +306,7 @@ impl SignalCollection {
         self.provider_methods.push(quote! {
             // Deliberately not #[doc(hidden)] for IDE completion.
             #(#signal_cfg_attrs)*
+            #(#signal_doc_attrs)*
             // Note: this could be `pub` always and would still compile (maybe warning with the following message).
             //   associated function `SignalCollection::my_signal` is reachable at visibility `pub(crate)`
             //
@@ -306,7 +314,7 @@ impl SignalCollection {
             // visibility that exceeds the class visibility). So, we can as well declare the visibility here.
             #vis_marker fn #signal_name(&mut self) -> #individual_struct_name<'c, C> {
                 #individual_struct_name {
-                    __typed: ::godot::register::TypedSignal::<'c, C, _>::extract(&mut self.__internal_obj, #signal_name_str)
+                    __typed: ::godot::signal::TypedSignal::<'c, C, _>::extract(&mut self.__internal_obj, #signal_name_str)
                 }
             }
         });
@@ -353,7 +361,7 @@ fn make_signal_individual_struct(details: &SignalDetails) -> TokenStream {
         #[doc(hidden)] // Signal struct is hidden, but the method returning it is not (IDE completion).
         #vis_marker struct #individual_struct_name<'c, C: ::godot::obj::WithSignals> {
             #[doc(hidden)]
-            __typed: ::godot::register::TypedSignal<'c, C, #param_tuple>,
+            __typed: ::godot::signal::TypedSignal<'c, C, #param_tuple>,
         }
 
         // Concrete convenience API is macro-based; many parts are delegated to TypedSignal via Deref/DerefMut.
@@ -366,7 +374,7 @@ fn make_signal_individual_struct(details: &SignalDetails) -> TokenStream {
 
         #(#signal_cfg_attrs)*
         impl<'c, C: ::godot::obj::WithSignals> std::ops::Deref for #individual_struct_name<'c, C> {
-            type Target = ::godot::register::TypedSignal<'c, C, #param_tuple>;
+            type Target = ::godot::signal::TypedSignal<'c, C, #param_tuple>;
 
             fn deref(&self) -> &Self::Target {
                 &self.__typed
@@ -395,7 +403,7 @@ fn make_signal_symbols(
     // Earlier implementation generated a simplified code when no #[signal] was declared: only WithSignals/WithUserSignals impl, but no own
     // collection, instead the associated type pointing to the base class. This has however some problems:
     // * Part of the reason for user-defined collection is to store UserSignalObject instead of Gd, which can store &mut self.
-    //   This is necessary for self.signals().some_base_signal().emit(), if such a signal is connected to Self::method_mut;
+    //   This is necessary for self.signals().some_base_signal().emit(), if such a signal is connected to Self::connect*() taking &mut self;
     //   Gd would cause a borrow error.
     // * Once we add Rust-Rust inheritance, we'd need to differentiate case again, which can be tricky since #[godot_api] has no information
     //   about the base class.
@@ -404,7 +412,8 @@ fn make_signal_symbols(
     // We also provide opt-out via #[godot_api(no_typed_signals)].
 
     let declares_no_signals = collection_api.is_empty();
-    let collection_struct_name = format_ident!("__godot_Signals_{}", class_name);
+    let collection_struct_name =
+        format_ident!("__godot_Signals_{class_name}", span = class_name.span());
     let collection_struct_methods = &collection_api.provider_methods;
     let with_signals_impl = make_with_signals_impl(class_name, &collection_struct_name);
     let upcast_deref_impl = make_upcast_deref_impl(class_name, &collection_struct_name);
@@ -420,12 +429,10 @@ fn make_signal_symbols(
     // that collection type has *lower* visibility than the class, we *also* run into "leak private type" errors.
 
     // Unrelated, we could use the following for encapsulation:
-    //     #[cfg(since_api = "4.2")]
     //     mod #signal_mod_name {
     //         pub use super::*;
     //         ... // all the code below
     //     }
-    //     #[cfg(since_api = "4.2")]
     //     pub use #signal_mod_name::*;
     //
     // This now makes signal types/methods invisible to the surrounding scope, so we'd need to adjust visibility in some cases:
@@ -434,8 +441,8 @@ fn make_signal_symbols(
     //
     // Benefit of encapsulating would be:
     // * No need for `#[doc(hidden)]` on internal symbols like fields.
-    // * #[cfg(since_api = "4.2")] would not need to be repeated. This is less of a problem if the #[cfg] is used inside the macro
-    //   instead of generated code.
+    // * Any potential #[cfg]s (in the past for >= 4.2 API level) would not need to be repeated. This is less of a problem if the #[cfg]
+    //   is used inside the macro instead of generated code.
     // * Less scope pollution (even though names are mangled).
     //
     // Downside is slightly higher complexity and introducing signals in secondary blocks becomes harder (although we could use another
@@ -443,6 +450,10 @@ fn make_signal_symbols(
 
     let visibility_macro = util::format_class_visibility_macro(class_name);
 
+    // Span propagation: the visibility macro causes error messages for "method not found" on the signals collection to point to
+    // `#[derive(GodotClass)]` instead of `impl ClassName`. This is because `macro_rules!` hygiene overrides input token spans. Using
+    // `quote_spanned!` here doesn't help since spans are lost when passing through declarative macros (it works without surrounding macro).
+    // A proc-macro helper instead of `macro_rules!` could preserve spans, but adds complexity.
     let mut code = quote! {
         #visibility_macro! {
             #[allow(non_camel_case_types)]

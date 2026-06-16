@@ -5,17 +5,19 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::fmt;
+
+use proc_macro2::{Ident, TokenStream};
+use quote::{ToTokens, TokenStreamExt, format_ident, quote};
+
 use crate::context::Context;
 use crate::generator::lifecycle_builtins;
 use crate::models::domain::{
     BuiltinClass, BuiltinMethod, BuiltinVariant, Class, ClassCodegenLevel, ClassLike, ClassMethod,
     ExtensionApi, FnDirection, Function, TyName,
 };
-use crate::util::ident;
+use crate::util::{ident, make_load_safety_doc};
 use crate::{conv, generator, special_cases, util};
-use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote, ToTokens, TokenStreamExt};
-use std::fmt;
 
 pub fn make_builtin_lifecycle_table(api: &ExtensionApi) -> TokenStream {
     let builtins = &api.builtins;
@@ -274,6 +276,7 @@ fn make_named_method_table(info: NamedMethodTable) -> TokenStream {
 
     // Assumes that both decls and inits already have a trailing comma.
     // This is necessary because some generators emit multiple lines (statements) per element.
+    let safety_doc = make_load_safety_doc();
     quote! {
         #imports
 
@@ -286,9 +289,7 @@ fn make_named_method_table(info: NamedMethodTable) -> TokenStream {
             pub const CLASS_COUNT: usize = #class_count;
             pub const METHOD_COUNT: usize = #method_count;
 
-            // TODO: Figure out the right safety preconditions. This currently does not have any because incomplete safety docs
-            // can cause issues with people assuming they are sufficient.
-            #[allow(clippy::missing_safety_doc)]
+            #safety_doc
             pub unsafe fn load(
                 #ctor_parameters
             ) -> Self {
@@ -372,6 +373,7 @@ fn make_method_table(info: IndexedMethodTable) -> TokenStream {
 
     // Assumes that inits already have a trailing comma.
     // This is necessary because some generators emit multiple lines (statements) per element.
+    let safety_doc = make_load_safety_doc();
     quote! {
         #imports
 
@@ -385,9 +387,7 @@ fn make_method_table(info: IndexedMethodTable) -> TokenStream {
             pub const CLASS_COUNT: usize = #class_count;
             pub const METHOD_COUNT: usize = #method_count;
 
-            // TODO: Figure out the right safety preconditions. This currently does not have any because incomplete safety docs
-            // can cause issues with people assuming they are sufficient.
-            #[allow(clippy::missing_safety_doc)]
+            #safety_doc
             #unused_attr
             pub unsafe fn load(
                 #ctor_parameters
@@ -438,6 +438,7 @@ fn make_method_table(info: IndexedMethodTable) -> TokenStream {
 
     // Assumes that inits already have a trailing comma.
     // This is necessary because some generators emit multiple lines (statements) per element.
+    let safety_doc = make_load_safety_doc();
     quote! {
         #imports
         use crate::StringCache;
@@ -460,9 +461,7 @@ fn make_method_table(info: IndexedMethodTable) -> TokenStream {
             pub const CLASS_COUNT: usize = #class_count;
             pub const METHOD_COUNT: usize = #method_count;
 
-            // TODO: Figure out the right safety preconditions. This currently does not have any because incomplete safety docs
-            // can cause issues with people assuming they are sufficient.
-            #[allow(clippy::missing_safety_doc)]
+            #safety_doc
             #unused_attr
             pub unsafe fn load() -> Self {
                 // SAFETY: interface and lifecycle tables are initialized at this point, so we can get 'static references to them.
@@ -519,7 +518,7 @@ fn make_named_accessors(accessors: &[AccessorMethod], fptr: &TokenStream) -> Tok
             }
         };
 
-        result_api.append_all(code.into_iter());
+        result_api.append_all(code);
     }
 
     result_api

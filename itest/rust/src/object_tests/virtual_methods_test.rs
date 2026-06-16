@@ -5,24 +5,25 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::{itest, TestContext};
-
 use godot::builtin::{
-    real, varray, vslice, Color, GString, PackedByteArray, PackedColorArray, PackedFloat32Array,
+    AnyArray, Color, GString, PackedByteArray, PackedColorArray, PackedFloat32Array,
     PackedInt32Array, PackedVector2Array, PackedVector3Array, RealConv, StringName, Variant,
-    VariantArray, Vector2, Vector3,
+    Vector2, Vector3, real, varray, vslice,
 };
-use godot::classes::notify::NodeNotification;
 #[cfg(feature = "codegen-full")]
 use godot::classes::Material;
+use godot::classes::notify::NodeNotification;
 use godot::classes::{
     IEditorPlugin, INode, INode2D, IPrimitiveMesh, IRefCounted, InputEvent, InputEventAction, Node,
     Node2D, Object, PrimitiveMesh, RefCounted, Window,
 };
+use godot::global::godot_str;
 use godot::meta::ToGodot;
 use godot::obj::{Base, Gd, NewAlloc, NewGd};
 use godot::private::class_macros::assert_eq_approx;
-use godot::register::{godot_api, GodotClass};
+use godot::register::{GodotClass, godot_api};
+
+use crate::framework::{TestContext, itest};
 
 /// Simple class, that deliberately has no constructor accessible from GDScript
 #[derive(GodotClass, Debug)]
@@ -44,7 +45,7 @@ struct VirtualMethodTest {
 #[godot_api]
 impl IRefCounted for VirtualMethodTest {
     fn to_string(&self) -> GString {
-        format!("VirtualMethodTest[integer={}]", self.integer).into()
+        godot_str!("VirtualMethodTest[integer={}]", self.integer)
     }
 }
 
@@ -122,30 +123,30 @@ struct VirtualReturnTest {
 #[rustfmt::skip]
 #[godot_api]
 impl IPrimitiveMesh for VirtualReturnTest {
-    fn create_mesh_array(&self) -> VariantArray {
+    fn create_mesh_array(&self) -> AnyArray {
         varray![
-            PackedVector3Array::from_iter([Vector3::LEFT]),
-            PackedVector3Array::from_iter([Vector3::LEFT]),
-            PackedFloat32Array::from_iter([0.0, 0.0, 0.0, 1.0]),
-            PackedColorArray::from_iter([Color::from_rgb(1.0, 1.0, 1.0)]),
-            PackedVector2Array::from_iter([Vector2::LEFT]),
-            PackedVector2Array::from_iter([Vector2::LEFT]),
-            PackedByteArray::from_iter([0, 1, 2, 3]),
-            PackedByteArray::from_iter([0, 1, 2, 3]),
-            PackedByteArray::from_iter([0, 1, 2, 3]),
-            PackedByteArray::from_iter([0, 1, 2, 3]),
-            PackedInt32Array::from_iter([0, 1, 2, 3]),
-            PackedFloat32Array::from_iter([0.0, 1.0, 2.0, 3.0]),
-            PackedInt32Array::from_iter([0]),
-        ]
+            &PackedVector3Array::from_iter([Vector3::LEFT]),
+            &PackedVector3Array::from_iter([Vector3::LEFT]),
+            &PackedFloat32Array::from_iter([0.0, 0.0, 0.0, 1.0]),
+            &PackedColorArray::from_iter([Color::from_rgb(1.0, 1.0, 1.0)]),
+            &PackedVector2Array::from_iter([Vector2::LEFT]),
+            &PackedVector2Array::from_iter([Vector2::LEFT]),
+            &PackedByteArray::from_iter([0, 1, 2, 3]),
+            &PackedByteArray::from_iter([0, 1, 2, 3]),
+            &PackedByteArray::from_iter([0, 1, 2, 3]),
+            &PackedByteArray::from_iter([0, 1, 2, 3]),
+            &PackedInt32Array::from_iter([0, 1, 2, 3]),
+            &PackedFloat32Array::from_iter([0.0, 1.0, 2.0, 3.0]),
+            &PackedInt32Array::from_iter([0]),
+        ].upcast_any_array()
     }
 
     fn get_surface_count(&self) -> i32 { unreachable!() }
     fn surface_get_array_len(&self, _index: i32) -> i32 { unreachable!() }
     fn surface_get_array_index_len(&self, _index: i32) -> i32 { unreachable!() }
-    fn surface_get_arrays(&self, _index: i32) -> VariantArray { unreachable!() }
-    fn surface_get_blend_shape_arrays(&self, _index: i32) -> godot::prelude::Array<VariantArray> { unreachable!() }
-    fn surface_get_lods(&self, _index: i32) -> godot::prelude::Dictionary { unreachable!() }
+    fn surface_get_arrays(&self, _index: i32) -> AnyArray { unreachable!() }
+    fn surface_get_blend_shape_arrays(&self, _index: i32) -> godot::prelude::Array<AnyArray> { unreachable!() }
+    fn surface_get_lods(&self, _index: i32) -> godot::builtin::AnyDictionary { unreachable!() }
     fn surface_get_format(&self, _index: i32) -> u32 { unreachable!() }
     fn surface_get_primitive_type(&self, _index: i32) -> u32 { unreachable!() }
     #[cfg(feature = "codegen-full")]
@@ -218,7 +219,7 @@ struct GetTest {
 
 #[godot_api]
 impl IRefCounted for GetTest {
-    fn get_property(&self, property: StringName) -> Option<Variant> {
+    fn on_get(&self, property: StringName) -> Option<Variant> {
         self.get_called.set(true);
 
         match String::from(property).as_str() {
@@ -244,7 +245,7 @@ struct SetTest {
 
 #[godot_api]
 impl IRefCounted for SetTest {
-    fn set_property(&mut self, property: StringName, value: Variant) -> bool {
+    fn on_set(&mut self, property: StringName, value: Variant) -> bool {
         self.set_called = true;
 
         match String::from(property).as_str() {
@@ -269,7 +270,7 @@ struct RevertTest {}
 
 #[godot_api]
 impl IRefCounted for RevertTest {
-    fn property_get_revert(&self, property: StringName) -> Option<Variant> {
+    fn on_property_get_revert(&self, property: StringName) -> Option<Variant> {
         use std::sync::atomic::AtomicUsize;
 
         static INC: AtomicUsize = AtomicUsize::new(0);
@@ -291,6 +292,43 @@ impl IRefCounted for RevertTest {
             }
             _ => None,
         }
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+#[derive(GodotClass)]
+#[class(init)]
+struct VirtualGdSelfTest {
+    #[init(val = 4)]
+    some_val: i64,
+}
+
+#[godot_api]
+impl IRefCounted for VirtualGdSelfTest {
+    #[func(gd_self)]
+    fn to_string(_this: Gd<Self>) -> GString {
+        GString::from("Gd<Self>")
+    }
+
+    #[func(gd_self)]
+    fn on_get(this: Gd<Self>, _property: StringName) -> Option<Variant> {
+        // Delegates call to Display which calls `VirtualGdSelfTest::to_string` later in the chain.
+        Some(this.to_string().to_variant())
+    }
+
+    #[func(gd_self)]
+    fn on_set(mut this: Gd<Self>, _property: StringName, value: Variant) -> bool {
+        // Check bind_mut and bind.
+        this.bind_mut().some_val = value.to();
+        this.bind().some_val != 4
+    }
+
+    #[func(gd_self)]
+    fn on_property_get_revert(this: Gd<Self>, property: StringName) -> Option<Variant> {
+        // Access other virtual method directly.
+        let property = Self::on_get(this, property)?;
+        Some(property)
     }
 }
 
@@ -520,6 +558,8 @@ fn test_notifications() {
     assert_eq!(
         obj.bind().sequence,
         vec![
+            #[cfg(since_api = "4.4")]
+            ReceivedEvent::Notification(NodeNotification::POSTINITIALIZE),
             ReceivedEvent::Notification(NodeNotification::UNPAUSED),
             ReceivedEvent::Notification(NodeNotification::EDITOR_POST_SAVE),
             ReceivedEvent::Ready,
@@ -605,6 +645,25 @@ fn test_revert() {
     assert_eq!(revert.property_get_revert(&changes), true.to_variant());
 }
 
+#[itest]
+fn test_gd_self_virtual_methods() {
+    let mut obj = VirtualGdSelfTest::new_gd();
+    let expected = GString::from("Gd<Self>");
+
+    // Test various calling conventions:
+    let ret: GString = obj.call("to_string", &[]).to::<GString>();
+    assert_eq!(ret, expected);
+
+    let ret: GString = obj.call("get", vslice![""]).to();
+    assert_eq!(ret, expected);
+
+    obj.set("a", &4.to_variant());
+    assert_eq!(obj.bind().some_val, 4);
+
+    let ret: GString = obj.property_get_revert("a").to();
+    assert_eq!(ret, expected);
+}
+
 #[derive(GodotClass)]
 #[class(init)]
 pub struct GetSetTest {
@@ -619,7 +678,7 @@ pub struct GetSetTest {
 
 #[godot_api]
 impl IRefCounted for GetSetTest {
-    fn get_property(&self, property: StringName) -> Option<Variant> {
+    fn on_get(&self, property: StringName) -> Option<Variant> {
         self.get_called.set(true);
 
         match String::from(property).as_str() {
@@ -629,7 +688,7 @@ impl IRefCounted for GetSetTest {
         }
     }
 
-    fn set_property(&mut self, property: StringName, value: Variant) -> bool {
+    fn on_set(&mut self, property: StringName, value: Variant) -> bool {
         self.set_called = true;
 
         match String::from(property).as_str() {
@@ -676,10 +735,9 @@ impl GetSetTest {
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
-// There isn't a good way to test editor plugins, but we can at least declare one to ensure that the macro
-// compiles.
+// There isn't a good way to test editor plugins, but we can at least declare one to ensure that the macro compiles.
 #[derive(GodotClass)]
-#[class(no_init, base = EditorPlugin, tool)]
+#[class(init, base = EditorPlugin, tool)]
 struct CustomEditorPlugin;
 
 // Just override EditorPlugin::edit() to verify method is declared with Option<T>.
@@ -693,5 +751,59 @@ impl IEditorPlugin for CustomEditorPlugin {
     // This parameter is non-null.
     fn handles(&self, _object: Gd<Object>) -> bool {
         true
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+/// Test that virtual methods with u64 parameters work correctly.
+///
+/// `u64` doesn't have ToGodot/FromGodot implementations (not natively supported in GDScript),
+/// but engine virtual methods may use it via EngineToGodot/EngineFromGodot.
+#[cfg(feature = "codegen-full")]
+#[derive(GodotClass)]
+#[class(init, tool, base=OpenXrExtensionWrapper)]
+struct VirtualU64Test {
+    base: Base<godot::classes::OpenXrExtensionWrapper>,
+}
+
+#[cfg(feature = "codegen-full")]
+#[godot_api]
+impl godot::classes::IOpenXrExtensionWrapper for VirtualU64Test {
+    fn on_instance_created(&mut self, _instance: u64) {
+        // No need to do anything, this must just compile with u64.
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// During v0.5: deprecated names for virtual methods.
+
+#[itest]
+fn test_deprecated_get() {
+    let obj = compat::DeprecatedObjectVirtuals::new_gd();
+    assert_eq!(obj.get("test_value"), 123.to_variant());
+    assert_eq!(obj.get("inexistent"), Variant::nil());
+}
+
+// use of deprecated function `godot::__deprecated::virtual_method_get_property`:
+// Virtual method `get_property` has been renamed to `on_get`.
+#[expect(deprecated)]
+mod compat {
+    use super::*;
+
+    #[derive(GodotClass)]
+    #[class(init)]
+    pub struct DeprecatedObjectVirtuals {}
+
+    #[godot_api]
+    impl IRefCounted for DeprecatedObjectVirtuals {
+        // Using old name `get_property` -- emits a deprecation warning but still works.
+        fn get_property(&self, property: StringName) -> Option<Variant> {
+            if property == "test_value" {
+                Some(123.to_variant())
+            } else {
+                None
+            }
+        }
     }
 }

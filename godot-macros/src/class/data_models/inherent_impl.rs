@@ -5,21 +5,21 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream};
+use quote::spanned::Spanned;
+use quote::{ToTokens, format_ident, quote};
+
+use crate::class::data_models::func;
 use crate::class::{
-    into_signature_info, make_constant_registration, make_method_registration,
-    make_signal_registrations, ConstDefinition, FuncDefinition, RpcAttr, RpcMode, SignalDefinition,
-    SignatureInfo, TransferMode,
+    ConstDefinition, FuncDefinition, RpcAttr, RpcMode, SignalDefinition, SignatureInfo,
+    TransferMode, into_signature_info, make_constant_registration, make_method_registration,
+    make_signal_registrations,
 };
 use crate::util::{
-    bail, c_str, format_funcs_collection_struct, ident, make_funcs_collection_constants,
-    replace_class_in_path, require_api_version, KvParser,
+    KvParser, bail, c_str, format_funcs_collection_struct, ident, make_funcs_collection_constants,
+    replace_class_in_path, require_api_version,
 };
-use crate::{handle_mutually_exclusive_keys, util, ParseResult};
-
-use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
-use quote::spanned::Spanned;
-use quote::{format_ident, quote, ToTokens};
-use venial::FnParam;
+use crate::{ParseResult, handle_mutually_exclusive_keys, util};
 
 /// Attribute for user-declared function.
 enum ItemAttrType {
@@ -92,17 +92,39 @@ pub fn transform_inherent_impl(
     let consts = process_godot_constants(&mut impl_block)?;
 
     let inherent_impl_docs =
-        crate::docs::make_inherent_docs_registration(&funcs, &consts, &signals, &class_name, &prv);
+        crate::docs::make_trait_docs_registration(&funcs, &consts, &signals, &class_name, &prv);
 
-    // Container struct holding names of all registered #[func]s.
-    // The struct is declared by #[derive(GodotClass)].
-    let funcs_collection = {
-        let struct_name = format_funcs_collection_struct(&class_name);
-        replace_class_in_path(self_path, struct_name)
+    // Generate constants for the funcs collection struct (only primary impl).
+    //
+    // Today, secondary impl blocks don't add to the funcs collection (access from #[var(get = ...)] etc. not supported).
+    // Could potentially be added. What was tried:
+    //     trait WithFuncs { type FuncCollection; }
+    // instead of the collection being a struct with a "conventional" name. However, it's not possible to
+    //     impl <MyClass as WithFuncs>::FuncCollection { ... }
+    // because Rust requires a nominal type for `impl` blocks. Even type aliases to associated types don't qualify. Compile error:
+    //     error[E0118]: no nominal type found for inherent implementation
+    //
+    // One alternative would be to add func name constants directly on the class itself as `impl Class { const __func_... }`, however
+    // this would slightly pollute the user-facing namespace. Another option is to pass the MyStruct path explicitly as an attribute argument,
+    // e.g. `#[godot_api(secondary_from = crate::my_mod)]`).
+    let funcs_collection_impl = if meta.secondary {
+        TokenStream::new()
+    } else {
+        let func_consts = make_funcs_collection_constants(&funcs, &class_name);
+        if func_consts.is_empty() {
+            TokenStream::new()
+        } else {
+            let struct_name = format_funcs_collection_struct(&class_name);
+            let funcs_path = replace_class_in_path(self_path, struct_name);
+
+            quote! {
+                impl #funcs_path {
+                    #(#func_consts)*
+                }
+            }
+        }
     };
 
-    // For each #[func] in this impl block, create one constant.
-    let func_name_constants = make_funcs_collection_constants(&funcs, &class_name);
     let (signal_registrations, signal_symbol_types) = make_signal_registrations(
         &signals,
         &class_name,
@@ -122,21 +144,19 @@ pub fn transform_inherent_impl(
 
     let constant_registration = make_constant_registration(consts, &class_name, &class_name_obj)?;
 
-    let method_storage_name = format_ident!("__registration_methods_{class_name}");
-    let constants_storage_name = format_ident!("__registration_constants_{class_name}");
-
     let fill_storage = {
         quote! {
             ::godot::sys::plugin_execute_pre_main!({
-                #method_storage_name.lock().unwrap().push(|| {
+                let mut guard = #class_name::__registration_storage().lock().unwrap();
+
+                guard.0.push(|| {
                     #( #method_registrations )*
                     #( #signal_registrations )*
                 });
 
-                #constants_storage_name.lock().unwrap().push(|| {
+                guard.1.push(|| {
                     #constant_registration
                 });
-
             });
         }
     };
@@ -144,28 +164,32 @@ pub fn transform_inherent_impl(
     if !meta.secondary {
         // We are the primary `impl` block.
 
+        // Storage for registration functions from all `#[godot_api]` impl blocks (primary + secondary).
+        // Accessed through the class type so secondary blocks in other modules can find it.
+        // Tuple: (method+signal registrations, constant registrations).
         let storage = quote! {
-            #[allow(non_upper_case_globals)]
-            #[doc(hidden)]
-            pub(crate) static #method_storage_name: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
-
-            #[allow(non_upper_case_globals)]
-            #[doc(hidden)]
-            pub(crate) static #constants_storage_name: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
+            impl #class_name {
+                #[doc(hidden)]
+                pub fn __registration_storage() -> &'static std::sync::Mutex<(Vec<fn()>, Vec<fn()>)> {
+                    static STORAGE: std::sync::Mutex<(Vec<fn()>, Vec<fn()>)>
+                        = std::sync::Mutex::new((Vec::new(), Vec::new()));
+                    &STORAGE
+                }
+            }
         };
 
         let trait_impl = quote! {
             impl ::godot::obj::cap::ImplementsGodotApi for #class_name {
                 fn __register_methods() {
-                    let guard = #method_storage_name.lock().unwrap();
-                    for f in guard.iter() {
+                    let guard = #class_name::__registration_storage().lock().unwrap();
+                    for f in guard.0.iter() {
                         f();
                     }
                 }
 
                 fn __register_constants() {
-                    let guard = #constants_storage_name.lock().unwrap();
-                    for f in guard.iter() {
+                    let guard = #class_name::__registration_storage().lock().unwrap();
+                    for f in guard.1.iter() {
                         f();
                     }
                 }
@@ -182,13 +206,11 @@ pub fn transform_inherent_impl(
 
         let result = quote! {
             #impl_block
+            #funcs_collection_impl
             #storage
             #trait_impl
             #fill_storage
             #class_registration
-            impl #funcs_collection {
-                #( #func_name_constants )*
-            }
             #signal_symbol_types
             #inherent_impl_docs
         };
@@ -200,10 +222,8 @@ pub fn transform_inherent_impl(
 
         let result = quote! {
             #impl_block
+            #funcs_collection_impl
             #fill_storage
-            impl #funcs_collection {
-                #( #func_name_constants )*
-            }
             #inherent_impl_docs
         };
 
@@ -227,30 +247,6 @@ fn extract_hint_attribute(impl_block: &mut venial:: Impl) -> ParseResult<GodotAp
     Ok(GodotApiHints { has_base_field })
 }
 */
-
-fn extract_gd_self(signature: &mut venial::Function, attr_name: &Ident) -> ParseResult<Ident> {
-    if signature.params.is_empty() {
-        return bail_attr(
-            attr_name,
-            "with attribute key `gd_self`, the method must have a first parameter of type Gd<Self>",
-            &signature.name,
-        );
-    }
-
-    // Remove Gd<Self> receiver from signature for further processing.
-    let param = signature.params.inner.remove(0);
-
-    let venial::FnParam::Typed(param) = param.0 else {
-        return bail_attr(
-            attr_name,
-            "with attribute key `gd_self`, the first parameter must be Gd<Self> (not a `self` receiver)",
-             &signature.name
-        );
-    };
-
-    // Note: parameter is explicitly NOT renamed (maybe_rename_parameter).
-    Ok(param.name)
-}
 
 fn process_godot_fns(
     class_name: &Ident,
@@ -293,43 +289,33 @@ fn process_godot_fns(
 
         match attr.ty {
             ItemAttrType::Func(func, rpc_info) => {
+                if rpc_info.is_some() && is_secondary_impl {
+                    return bail!(
+                        &function,
+                        "#[rpc] is currently not supported in secondary impl blocks",
+                    )?;
+                }
+
                 let external_attributes = function.attributes.clone();
 
                 // Transforms the following.
                 //   from function:     #[attr] pub fn foo(&self, a: i32) -> i32 { ... }
                 //   into signature:    fn foo(&self, a: i32) -> i32
                 let mut signature = util::reduce_to_signature(function);
-                let gd_self_parameter = if func.has_gd_self {
-                    // Removes Gd<Self> receiver from signature for further processing.
-                    let param_name = extract_gd_self(&mut signature, &attr.attr_name)?;
-                    Some(param_name)
-                } else {
-                    None
-                };
+                let gd_self_parameter = func::validate_receiver_extract_gdself(
+                    &mut signature,
+                    func.has_gd_self,
+                    &attr.attr_name,
+                )?;
 
                 // Clone might not strictly be necessary, but the 2 other callers of into_signature_info() are better off with pass-by-value.
-                let signature_info =
+                let mut signature_info =
                     into_signature_info(signature.clone(), class_name, gd_self_parameter.is_some());
 
-                for (param, _) in function
-                    .params
-                    .iter_mut()
-                    .rev()
-                    .take(signature_info.default_params.len())
-                {
-                    let attrs = match param {
-                        FnParam::Receiver(recv) => &mut recv.attributes,
-                        FnParam::Typed(typed) => &mut typed.attributes,
-                    };
-
-                    attrs.retain_mut(|attr| {
-                        if let Some(TokenTree::Ident(ident)) = attr.path.first() {
-                            ident != "default"
-                        } else {
-                            true
-                        }
-                    });
-                }
+                // Default value expressions from `#[opt(default = EXPR)]`; None for required parameters.
+                let all_param_maybe_defaults = parse_default_expressions(&mut function.params)?;
+                signature_info.optional_param_default_exprs =
+                    validate_default_exprs(all_param_maybe_defaults, &signature_info.param_idents)?;
 
                 // For virtual methods, rename/mangle existing user method and create a new method with the original name,
                 // which performs a dynamic dispatch.
@@ -354,6 +340,7 @@ fn process_godot_fns(
                     registered_name,
                     is_script_virtual: func.is_virtual,
                     rpc_info,
+                    is_generated_accessor: false,
                 });
             }
 
@@ -395,7 +382,7 @@ fn process_godot_fns(
                 return bail!(
                     function,
                     "#[constant] can only be used on associated constant",
-                )
+                );
             }
         }
     }
@@ -426,10 +413,10 @@ fn process_godot_constants(decl: &mut venial::Impl) -> ParseResult<Vec<ConstDefi
         if let Some(attr) = parse_attributes(constant)? {
             match attr.ty {
                 ItemAttrType::Func(_, _) => {
-                    return bail!(constant, "#[func] and #[rpc] can only be used on functions")
+                    return bail!(constant, "#[func] and #[rpc] can only be used on functions");
                 }
                 ItemAttrType::Signal(_, _) => {
-                    return bail!(constant, "#[signal] can only be used on functions")
+                    return bail!(constant, "#[signal] can only be used on functions");
                 }
                 ItemAttrType::Const(_) => {
                     if constant.initializer.is_none() {
@@ -462,12 +449,15 @@ fn add_virtual_script_call(
     rename: &Option<String>,
     gd_self_parameter: Option<Ident>,
 ) -> String {
-    assert!(cfg!(since_api = "4.3"));
+    #[allow(clippy::assertions_on_constants)]
+    {
+        // Without braces, clippy removes the #[allow] for some reason...
+        assert!(cfg!(since_api = "4.3"));
+    }
 
     // Update parameter names, so they can be forwarded (e.g. a "_" declared by the user cannot).
     let is_params = function.params.iter_mut().skip(1); // skip receiver.
-    let should_param_names = signature_info.param_idents();
-
+    let should_param_names = signature_info.param_idents.iter();
     is_params
         .zip(should_param_names)
         .for_each(|(param, should_param_name)| {
@@ -477,7 +467,11 @@ fn add_virtual_script_call(
         });
 
     let class_name_str = class_name.to_string();
-    let early_bound_name = format_ident!("__earlybound_{}", &function.name);
+    let early_bound_name = format_ident!(
+        "__earlybound_{}",
+        function.name,
+        span = function.name.span()
+    );
 
     let method_name_str = match rename {
         Some(rename) => rename.clone(),
@@ -485,9 +479,9 @@ fn add_virtual_script_call(
     };
     let method_name_cstr = c_str(&method_name_str);
 
-    let call_params = signature_info.param_types_tuple();
+    let call_params = signature_info.params_type();
     let call_ret = &signature_info.return_type;
-    let arg_names = signature_info.param_idents().collect::<Vec<_>>();
+    let arg_names = &signature_info.param_idents;
 
     let (object_ptr, receiver);
     if let Some(gd_self_parameter) = gd_self_parameter {
@@ -500,7 +494,7 @@ fn add_virtual_script_call(
 
     let code = quote! {
         let object_ptr = #object_ptr;
-        let method_sname = ::godot::builtin::StringName::from(#method_name_cstr);
+        let method_sname = ::godot::builtin::StringName::__cstr(#method_name_cstr);
         let method_sname_ptr = method_sname.string_sys();
         let has_virtual_override = unsafe { ::godot::private::has_virtual_script_method(object_ptr, method_sname_ptr) };
 
@@ -593,7 +587,10 @@ fn parse_attributes_inner(
 
             // We found two incompatible attributes.
             (Some((found_name, _)), _) => {
-                return bail!(full_item_span, "attributes `{found_name}` and `{attr_name}` cannot be used in the same declaration");
+                return bail!(
+                    full_item_span,
+                    "attributes `{found_name}` and `{attr_name}` cannot be used in the same declaration"
+                );
             }
         };
 
@@ -661,15 +658,20 @@ fn parse_rpc_attr(attributes: &[venial::Attribute]) -> ParseResult<AttrParseResu
     let item_span = parser.span();
     parser.finish()?;
 
-    let rpc_attr = match (config_expr, (&rpc_mode, &transfer_mode, &call_local, &channel)) {
+    let rpc_attr = match (
+        config_expr,
+        (&rpc_mode, &transfer_mode, &call_local, &channel),
+    ) {
         // Ok: Only `config = [expr]` is present.
         (Some(expr), (None, None, None, None)) => RpcAttr::Expression(expr),
 
         // Err: `config = [expr]` is present along other parameters, which is not allowed.
-        (Some(_), _) => return bail!(
-            item_span,
-            "`#[rpc(config = ...)]` is mutually exclusive with any other parameters(`any_peer`, `reliable`, `call_local`, `channel = 0`)"
-        ),
+        (Some(_), _) => {
+            return bail!(
+                item_span,
+                "`#[rpc(config = ...)]` is mutually exclusive with any other parameters(`any_peer`, `reliable`, `call_local`, `channel = 0`)"
+            );
+        }
 
         // Ok: `config` is not present, any combination of the other parameters is allowed.
         _ => RpcAttr::SeparatedArgs {
@@ -677,7 +679,7 @@ fn parse_rpc_attr(attributes: &[venial::Attribute]) -> ParseResult<AttrParseResu
             transfer_mode,
             call_local,
             channel,
-        }
+        },
     };
 
     Ok(AttrParseResult::Rpc(rpc_attr))
@@ -713,8 +715,68 @@ fn parse_constant_attr(
     Ok(AttrParseResult::Constant(attr.value.clone()))
 }
 
-fn bail_attr<R>(attr_name: &Ident, msg: &str, method_name: &Ident) -> ParseResult<R> {
-    bail!(method_name, "#[{attr_name}]: {msg}")
+/// Parses `#[opt(default = ...)]` parameter attributes and validates that optional parameters only appear at the end.
+///
+/// Returns a vector of optional default values, one per parameter (skipping receiver).
+fn parse_default_expressions(
+    params: &mut venial::Punctuated<venial::FnParam>,
+) -> ParseResult<Vec<Option<TokenStream>>> {
+    let mut res = vec![];
+
+    for param in params.iter_mut() {
+        let typed_param = match &mut param.0 {
+            venial::FnParam::Receiver(_) => continue,
+            venial::FnParam::Typed(fn_typed_param) => fn_typed_param,
+        };
+
+        let optional_value = match KvParser::parse_remove(&mut typed_param.attributes, "opt")? {
+            None => None,
+            Some(mut parser) => Some(parser.handle_expr_required("default")?),
+        };
+
+        res.push(optional_value);
+    }
+
+    Ok(res)
+}
+
+/// Validates that default parameters only appear at the end of the parameter list.
+/// Consumes the input and returns only the non-None default expressions.
+fn validate_default_exprs(
+    all_param_maybe_defaults: Vec<Option<TokenStream>>,
+    param_idents: &[Ident],
+) -> ParseResult<Vec<TokenStream>> {
+    let mut must_be_default = false;
+    let mut result = Vec::new();
+
+    for (i, param) in all_param_maybe_defaults.into_iter().enumerate() {
+        match (param, must_be_default) {
+            // First optional parameter encountered.
+            (Some(default_expr), false) => {
+                must_be_default = true;
+                result.push(default_expr);
+            }
+
+            // Subsequent optional parameters.
+            (Some(default_expr), true) => {
+                result.push(default_expr);
+            }
+
+            // Required parameter before any optional ones.
+            (None, false) => {}
+
+            // Required parameter after optional ones.
+            (None, true) => {
+                let name = &param_idents[i];
+                return bail!(
+                    name,
+                    "parameter `{name}` must have a default value, because previous parameters are already optional",
+                );
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------

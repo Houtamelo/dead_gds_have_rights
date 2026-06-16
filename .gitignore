@@ -2,6 +2,7 @@
 .vscode
 .idea
 .run
+.zed
 
 # Rust
 target
@@ -23,6 +24,7 @@ gen
 *.bat
 config.toml
 exp.rs
+/extension_api.json
 
 # Mac specific
 .DS_Store
@@ -30,4 +32,5 @@ exp.rs
 # Windows specific
 desktop.ini
 
-.qodo
+# Test outputs
+/itest/rust/src/register_tests/res/actual_registered_docs.xml

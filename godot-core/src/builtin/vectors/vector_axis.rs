@@ -5,8 +5,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::builtin::{real, Vector2, Vector2i, Vector3, Vector3i, Vector4, Vector4i};
+use crate::builtin::{Vector2, Vector2i, Vector3, Vector3i, Vector4, Vector4i, real};
 use crate::meta::error::{ConvertError, FromGodotError};
+use crate::meta::shape::GodotShape;
 use crate::meta::{FromGodot, GodotConvert, ToGodot};
 use crate::obj::EngineEnum;
 
@@ -16,7 +17,7 @@ macro_rules! impl_vector_axis_enum {
         ///
         #[doc = concat!("`", stringify!($Vector), "` implements `Index<", stringify!($AxisEnum), ">` and `IndexMut<", stringify!($AxisEnum), ">`")]
         #[doc = ", so you can use this type to access a vector component as `vec[axis]`."]
-        #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
+        #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
         #[repr(i32)]
         pub enum $AxisEnum {
             $(
@@ -47,14 +48,6 @@ macro_rules! impl_vector_axis_enum {
                 }
             }
 
-            fn godot_name(&self) -> &'static str {
-                match *self {
-                    $(
-                        Self::$axis => concat!("AXIS_", stringify!($axis)),
-                    )+
-                }
-            }
-
             fn values() -> &'static [Self] {
                 // For vector axis enums, all values are distinct, so both are the same
                 &[
@@ -78,12 +71,16 @@ macro_rules! impl_vector_axis_enum {
 
         impl GodotConvert for $AxisEnum {
             type Via = i32;
+
+            fn godot_shape() -> GodotShape {
+                i32::godot_shape()
+            }
         }
 
         impl ToGodot for $AxisEnum {
-            type ToVia<'v> = i32;
+            type Pass = crate::meta::ByValue;
 
-            fn to_godot(&self) -> Self::ToVia<'_> {
+            fn to_godot(&self) -> Self::Via {
                 self.ord()
             }
         }

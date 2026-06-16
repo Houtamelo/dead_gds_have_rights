@@ -5,43 +5,36 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::cell::OnceCell;
 use std::marker::PhantomData;
 use std::{cmp, fmt};
 
+use godot_ffi as sys;
+use sys::{GodotFfi, ffi_methods, interface_fn};
+
+use crate::builtin::iter::ArrayFunctionalOps;
 use crate::builtin::*;
 use crate::meta;
-use crate::meta::error::{ConvertError, FromGodotError, FromVariantError};
+use crate::meta::error::{ArrayMismatch, ConvertError, FromGodotError, FromVariantError};
+use crate::meta::inspect::ElementType;
+use crate::meta::shape::{GodotElementShape, GodotShape};
+use crate::meta::signed_range::SignedRange;
 use crate::meta::{
-    element_godot_type_name, element_variant_type, ArrayElement, ArrayTypeInfo, AsArg, ByRef,
-    ClassName, ExtVariantType, FromGodot, GodotConvert, GodotFfiVariant, GodotType, ParamType,
-    PropertyHintInfo, RefArg, ToGodot,
+    AsArg, ClassId, Element, ExtVariantType, FromGodot, GodotConvert, GodotFfiVariant, GodotType,
+    RefArg, ToGodot, element_variant_type,
 };
-use crate::obj::{bounds, Bounds, DynGd, Gd, GodotClass};
+use crate::obj::{Bounds, DynGd, Gd, GodotClass, bounds};
+use crate::registry::info::{ParamMetadata, PropertyHintInfo};
 use crate::registry::property::{BuiltinExport, Export, Var};
-use godot_ffi as sys;
-use sys::{ffi_methods, interface_fn, GodotFfi};
 
 /// Godot's `Array` type.
 ///
-/// Unlike GDScript, all indices and sizes are unsigned, so negative indices are not supported.
+/// Versatile, linear storage container for all types that can be represented inside a `Variant`.  \
+/// For space-efficient storage, consider using [`PackedArray<T>`][crate::builtin::PackedArray] or `Vec<T>`.
 ///
-/// # Typed arrays
-///
-/// Godot's `Array` can be either typed or untyped.
-///
-/// An untyped array can contain any kind of [`Variant`], even different types in the same array.
-/// We represent this in Rust as `VariantArray`, which is just a type alias for `Array<Variant>`.
-///
-/// Godot also supports typed arrays, which are also just `Variant` arrays under the hood, but with
-/// runtime checks, so that no values of the wrong type are inserted into the array. We represent this as
-/// `Array<T>`, where the type `T` must implement `ArrayElement`. Some types like `Array<T>` cannot
-/// be stored inside arrays, as Godot prevents nesting.
-///
-/// If you plan to use any integer or float types apart from `i64` and `f64`, read
-/// [this documentation](../meta/trait.ArrayElement.html#integer-and-float-types).
+/// Check out the [book](https://godot-rust.github.io/book/godot-api/builtins.html#arrays-and-dictionaries) for a tutorial on arrays.
 ///
 /// # Reference semantics
-///
 /// Like in GDScript, `Array` acts as a reference type: multiple `Array` instances may
 /// refer to the same underlying array, and changes to one are visible in the other.
 ///
@@ -49,18 +42,52 @@ use sys::{ffi_methods, interface_fn, GodotFfi};
 /// If you want to create a copy of the data, use [`duplicate_shallow()`][Self::duplicate_shallow]
 /// or [`duplicate_deep()`][Self::duplicate_deep].
 ///
-/// # Typed array example
+/// # Element type
+/// Godot's `Array` builtin can be either typed or untyped. In Rust, this maps to three representations:
 ///
+/// - Untyped array: `VariantArray`, a type alias for `Array<Variant>`.  \
+///   An untyped array can contain any kind of [`Variant`], even different types in the same array.
+///
+/// - Typed: `Array<T>`, with any non-`Variant` type `T` such as `i64`, `GString`, `Gd<T>` etc.  \
+///   Typing is enforced at compile-time in Rust, and at runtime by Godot.
+///
+/// - Either typed or untyped: [`AnyArray`].  \
+///   Represents either typed or untyped arrays. This is different from `Array<Variant>`, because the latter allows you to insert
+///   `Variant` objects. However, for an array that has dynamic type `i64`, it is not allowed to insert any variants that are not `i64`.
+///
+/// If you plan to use any integer or float types apart from `i64` and `f64`, read
+/// [this documentation](../meta/trait.Element.html#integer-and-float-types).
+///
+/// ## Conversions between arrays
+/// The following table gives an overview of useful conversions.
+///
+/// | From               | To               | Conversion method                                        |
+/// |--------------------|------------------|----------------------------------------------------------|
+/// | `AnyArray`         | `Array<T>`       | [`AnyArray::try_cast_array::<T>`]                        |
+/// | `AnyArray`         | `Array<Variant>` | [`AnyArray::try_cast_var_array`]                         |
+/// | `&Array<T>`        | `&AnyArray`      | Implicit via [deref coercion]; often used in class APIs. |
+/// | `Array<T>`         | `AnyArray`       | [`Array<T>::upcast_any_array`]                           |
+/// | `Array<T>`         | `PackedArray<T>` | [`Array<T>::to_packed_array`]                            |
+/// | `PackedArray<T>`   | `Array<T>`       | [`PackedArray<T>::to_typed_array`]                       |
+/// | `PackedArray<T>`   | `Array<Variant>` | [`PackedArray<T>::to_var_array`]                         |
+///
+/// Note that it's **not** possible to upcast `Array<Gd<Derived>>` to `Array<Gd<Base>>`. `Array<T>` is not covariant over the `T` parameter,
+/// otherwise it would be possible to insert `Base` pointers that aren't actually `Derived`.
+// Note: the above could theoretically be implemented by making AnyArray<T> generic and covariant over T.
+///
+/// [deref coercion]: struct.Array.html#deref-methods-AnyArray
+///
+/// ## Typed array example
 /// ```no_run
 /// # use godot::prelude::*;
 /// // Create typed Array<i64> and add values.
-/// let mut array = Array::new();
+/// let mut array = Array::<i64>::new();
 /// array.push(10);
 /// array.push(20);
 /// array.push(30);
 ///
 /// // Or create the same array in a single expression.
-/// let array = array![10, 20, 30];
+/// let array = iarray![10, 20, 30];
 ///
 /// // Access elements.
 /// let value: i64 = array.at(0); // 10
@@ -82,12 +109,11 @@ use sys::{ffi_methods, interface_fn, GodotFfi};
 /// assert_eq!(array.front(), Some(50));
 /// ```
 ///
-/// # Untyped array example
-///
+/// ## Untyped array example
 /// ```no_run
 /// # use godot::prelude::*;
-/// // VariantArray allows dynamic element types.
-/// let mut array = VariantArray::new();
+/// // VarArray allows dynamic element types.
+/// let mut array = VarArray::new();
 /// array.push(&10.to_variant());
 /// array.push(&"Hello".to_variant());
 ///
@@ -103,15 +129,41 @@ use sys::{ffi_methods, interface_fn, GodotFfi};
 /// // ...and so on.
 /// ```
 ///
-/// # Thread safety
+/// # Working with signed ranges and steps
+/// For negative indices, use [`wrapped()`](crate::meta::wrapped).
 ///
+/// ```no_run
+/// # use godot::builtin::{array, iarray};
+/// # use godot::meta::wrapped;
+/// let arr = iarray![0, 1, 2, 3, 4, 5];
+///
+/// // The values of `begin` (inclusive) and `end` (exclusive) will be clamped to the array size.
+/// let clamped_array = arr.subarray_deep(999..99999, None);
+/// assert_eq!(clamped_array, array![]);
+///
+/// // If either `begin` or `end` is negative, its value is relative to the end of the array.
+/// let sub = arr.subarray_shallow(wrapped(-1..-5), None);
+/// assert_eq!(sub, array![5, 3]);
+///
+/// // If `end` is not specified, the range spans through whole array.
+/// let sub = arr.subarray_deep(1.., None);
+/// assert_eq!(sub, array![1, 2, 3, 4, 5]);
+/// let other_clamped_array = arr.subarray_shallow(5.., Some(2));
+/// assert_eq!(other_clamped_array, array![5]);
+///
+/// // If specified, `step` is the relative index between source elements. It can be negative,
+/// // in which case `begin` must be higher than `end`.
+/// let sub = arr.subarray_shallow(wrapped(-1..-5), Some(-2));
+/// assert_eq!(sub, array![5, 3]);
+/// ```
+///
+/// # Thread safety
 /// Usage is safe if the `Array` is used on a single thread only. Concurrent reads on
 /// different threads are also safe, but any writes must be externally synchronized. The Rust
 /// compiler will enforce this as long as you use only Rust threads, but it cannot protect against
 /// concurrent modification on other threads (e.g. created through GDScript).
 ///
 /// # Element type safety
-///
 /// We provide a richer set of element types than Godot, for convenience and stronger invariants in your _Rust_ code.
 /// This, however, means that the Godot representation of such arrays is not capable of incorporating the additional "Rust-side" information.
 /// This can lead to situations where GDScript code or the editor UI can insert values that do not fulfill the Rust-side invariants.
@@ -126,17 +178,22 @@ use sys::{ffi_methods, interface_fn, GodotFfi};
 /// - Objects with dyn-trait association: [`DynGd<T, D>`][crate::obj::DynGd].
 ///   Godot doesn't know Rust traits and will only see the `T` part.
 ///
-/// # Godot docs
+/// # Differences from GDScript
+/// Unlike GDScript, all indices and sizes are unsigned, so negative indices are not supported.
 ///
+/// # Godot docs
 /// [`Array[T]` (stable)](https://docs.godotengine.org/en/stable/classes/class_array.html)
-pub struct Array<T: ArrayElement> {
+pub struct Array<T: Element> {
     // Safety Invariant: The type of all values in `opaque` matches the type `T`.
     opaque: sys::types::OpaqueArray,
     _phantom: PhantomData<T>,
+
+    /// Lazily computed and cached element type information.
+    pub(super) cached_element_type: OnceCell<ElementType>,
 }
 
 /// Guard that can only call immutable methods on the array.
-struct ImmutableInnerArray<'a> {
+pub(super) struct ImmutableInnerArray<'a> {
     inner: inner::InnerArray<'a>,
 }
 
@@ -148,33 +205,47 @@ impl<'a> std::ops::Deref for ImmutableInnerArray<'a> {
     }
 }
 
-/// A Godot `Array` without an assigned type.
-pub type VariantArray = Array<Variant>;
+impl<T: Element> std::ops::Deref for Array<T> {
+    type Target = AnyArray;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_any_ref()
+    }
+}
+
+impl<T: Element> std::ops::DerefMut for Array<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_any_mut()
+    }
+}
+
+// Compile-time validation of layout compatibility.
+sys::static_assert_eq_size_align!(Array<i64>, VarArray);
+sys::static_assert_eq_size_align!(Array<GString>, VarArray);
+sys::static_assert_eq_size_align!(VarArray, AnyArray);
+
+/// Untyped Godot `Array`.
+pub type VarArray = Array<Variant>;
 
 // TODO check if these return a typed array
-impl_builtin_froms!(VariantArray;
-    PackedByteArray => array_from_packed_byte_array,
-    PackedColorArray => array_from_packed_color_array,
-    PackedFloat32Array => array_from_packed_float32_array,
-    PackedFloat64Array => array_from_packed_float64_array,
-    PackedInt32Array => array_from_packed_int32_array,
-    PackedInt64Array => array_from_packed_int64_array,
-    PackedStringArray => array_from_packed_string_array,
-    PackedVector2Array => array_from_packed_vector2_array,
-    PackedVector3Array => array_from_packed_vector3_array,
-);
 
-#[cfg(since_api = "4.3")]
-impl_builtin_froms!(VariantArray;
-    PackedVector4Array => array_from_packed_vector4_array,
-);
-
-impl<T: ArrayElement> Array<T> {
-    fn from_opaque(opaque: sys::types::OpaqueArray) -> Self {
+// Methods that don't provide type-specific ergonomics are available through `Deref`/`DerefMut` to [`AnyArray`].
+// This includes:
+// - Read-only: `len()`, `is_empty()`, `hash_u32()`, `element_type()`
+// - Mutable: `clear()`, `reverse()`, `shuffle()`, `shrink()`, `sort_unstable()`, `sort_unstable_custom()`
+//
+// Only methods that benefit from the type parameter `T` are implemented directly on `Array<T>`:
+// - Methods returning `T` instead of `Variant`: `at()`, `get()`, `front()`, `back()`, `min()`, `max()`, `pick_random()`, `pop()`, `pop_front()`, `remove()`
+// - Methods accepting `impl AsArg<T>`: `set()`, `push()`, `insert()`, `contains()`, `find()`, `erase()`, etc.
+// - Methods with typed closures: `sort_unstable_by()`, `bsearch_by()`
+// - Methods returning `Array<T>`: `duplicate_shallow()`, `duplicate_deep()`, `subarray_shallow()`, `subarray_deep()`
+impl<T: Element> Array<T> {
+    pub(super) fn from_opaque(opaque: sys::types::OpaqueArray) -> Self {
         // Note: type is not yet checked at this point, because array has not yet been initialized!
         Self {
             opaque,
             _phantom: PhantomData,
+            cached_element_type: OnceCell::new(),
         }
     }
 
@@ -185,11 +256,10 @@ impl<T: ArrayElement> Array<T> {
 
     /// ⚠️ Returns the value at the specified index.
     ///
-    /// This replaces the `Index` trait, which cannot be implemented for `Array` as references are not guaranteed to remain valid.
+    /// This replaces the `Index` trait, which cannot be implemented for `Array`, as it stores variants and not references.
     ///
     /// # Panics
-    ///
-    /// If `index` is out of bounds. If you want to handle out-of-bounds access, use [`get()`](Self::get) instead.
+    /// If `index` is out of bounds. To handle out-of-bounds access fallibly, use [`get()`](Self::get) instead.
     pub fn at(&self, index: usize) -> T {
         // Panics on out-of-bounds.
         let ptr = self.ptr(index);
@@ -225,34 +295,6 @@ impl<T: ArrayElement> Array<T> {
         to_usize(self.as_inner().count(&value.to_variant()))
     }
 
-    /// Returns the number of elements in the array. Equivalent of `size()` in Godot.
-    ///
-    /// Retrieving the size incurs an FFI call. If you know the size hasn't changed, you may consider storing
-    /// it in a variable. For loops, prefer iterators.
-    #[doc(alias = "size")]
-    pub fn len(&self) -> usize {
-        to_usize(self.as_inner().size())
-    }
-
-    /// Returns `true` if the array is empty.
-    ///
-    /// Checking for emptiness incurs an FFI call. If you know the size hasn't changed, you may consider storing
-    /// it in a variable. For loops, prefer iterators.
-    pub fn is_empty(&self) -> bool {
-        self.as_inner().is_empty()
-    }
-
-    /// Returns a 32-bit integer hash value representing the array and its contents.
-    ///
-    /// Note: Arrays with equal content will always produce identical hash values. However, the
-    /// reverse is not true. Returning identical hash values does not imply the arrays are equal,
-    /// because different arrays can have identical hash values due to hash collisions.
-    pub fn hash(&self) -> u32 {
-        // The GDExtension interface only deals in `i64`, but the engine's own `hash()` function
-        // actually returns `uint32_t`.
-        self.as_inner().hash().try_into().unwrap()
-    }
-
     /// Returns the first element in the array, or `None` if the array is empty.
     #[doc(alias = "first")]
     pub fn front(&self) -> Option<T> {
@@ -271,21 +313,13 @@ impl<T: ArrayElement> Array<T> {
         })
     }
 
-    /// Clears the array, removing all elements.
-    pub fn clear(&mut self) {
-        self.debug_ensure_mutable();
-
-        // SAFETY: No new values are written to the array, we only remove values from the array.
-        unsafe { self.as_inner_mut() }.clear();
-    }
-
-    /// Sets the value at the specified index.
+    ///  ⚠️ Sets the value at the specified index.
     ///
     /// # Panics
     ///
     /// If `index` is out of bounds.
     pub fn set(&mut self, index: usize, value: impl AsArg<T>) {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         let ptr_mut = self.ptr_mut(index);
 
@@ -302,7 +336,7 @@ impl<T: ArrayElement> Array<T> {
     #[doc(alias = "append")]
     #[doc(alias = "push_back")]
     pub fn push(&mut self, value: impl AsArg<T>) {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         meta::arg_into_ref!(value: T);
 
@@ -311,12 +345,18 @@ impl<T: ArrayElement> Array<T> {
         inner.push_back(&value.to_variant());
     }
 
+    /// Internal helper for the `array!` macro; uses [`AsDirectElement`][meta::AsDirectElement] for unambiguous type inference.
+    #[doc(hidden)]
+    pub fn __macro_push_direct<E: meta::AsDirectElement<T>>(&mut self, value: E) {
+        self.push(value)
+    }
+
     /// Adds an element at the beginning of the array, in O(n).
     ///
     /// On large arrays, this method is much slower than [`push()`][Self::push], as it will move all the array's elements.
     /// The larger the array, the slower `push_front()` will be.
     pub fn push_front(&mut self, value: impl AsArg<T>) {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         meta::arg_into_ref!(value: T);
 
@@ -330,7 +370,7 @@ impl<T: ArrayElement> Array<T> {
     /// _Godot equivalent: `pop_back`_
     #[doc(alias = "pop_back")]
     pub fn pop(&mut self) -> Option<T> {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         (!self.is_empty()).then(|| {
             // SAFETY: We do not write any values to the array, we just remove one.
@@ -344,7 +384,7 @@ impl<T: ArrayElement> Array<T> {
     /// Note: On large arrays, this method is much slower than `pop()` as it will move all the
     /// array's elements. The larger the array, the slower `pop_front()` will be.
     pub fn pop_front(&mut self) -> Option<T> {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         (!self.is_empty()).then(|| {
             // SAFETY: We do not write any values to the array, we just remove one.
@@ -361,7 +401,7 @@ impl<T: ArrayElement> Array<T> {
     /// # Panics
     /// If `index > len()`.
     pub fn insert(&mut self, index: usize, value: impl AsArg<T>) {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         let len = self.len();
         assert!(
@@ -385,8 +425,7 @@ impl<T: ArrayElement> Array<T> {
     /// If `index` is out of bounds.
     #[doc(alias = "pop_at")]
     pub fn remove(&mut self, index: usize) -> T {
-        self.debug_ensure_mutable();
-
+        self.balanced_ensure_mutable();
         self.check_bounds(index);
 
         // SAFETY: We do not write any values to the array, we just remove one.
@@ -401,7 +440,7 @@ impl<T: ArrayElement> Array<T> {
     /// On large arrays, this method is much slower than [`pop()`][Self::pop], as it will move all the array's
     /// elements after the removed element.
     pub fn erase(&mut self, value: impl AsArg<T>) {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         meta::arg_into_ref!(value: T);
 
@@ -412,7 +451,7 @@ impl<T: ArrayElement> Array<T> {
     /// Assigns the given value to all elements in the array. This can be used together with
     /// `resize` to create an array with a given size and initialized elements.
     pub fn fill(&mut self, value: impl AsArg<T>) {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         meta::arg_into_ref!(value: T);
 
@@ -425,9 +464,9 @@ impl<T: ArrayElement> Array<T> {
     /// If the new size is smaller than the current size, then it removes elements from the end. If the new size is bigger than the current one
     /// then the new elements are set to `value`.
     ///
-    /// If you know that the new size is smaller, then consider using [`shrink`](Array::shrink) instead.
+    /// If you know that the new size is smaller, then consider using [`shrink`][AnyArray::shrink] instead.
     pub fn resize(&mut self, new_size: usize, value: impl AsArg<T>) {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         let original_size = self.len();
 
@@ -452,31 +491,9 @@ impl<T: ArrayElement> Array<T> {
         }
     }
 
-    /// Shrinks the array down to `new_size`.
-    ///
-    /// This will only change the size of the array if `new_size` is smaller than the current size. Returns `true` if the array was shrunk.
-    ///
-    /// If you want to increase the size of the array, use [`resize`](Array::resize) instead.
-    #[doc(alias = "resize")]
-    pub fn shrink(&mut self, new_size: usize) -> bool {
-        self.debug_ensure_mutable();
-
-        if new_size >= self.len() {
-            return false;
-        }
-
-        // SAFETY: Since `new_size` is less than the current size, we'll only be removing elements from the array.
-        unsafe { self.as_inner_mut() }.resize(to_i64(new_size));
-
-        true
-    }
-
     /// Appends another array at the end of this array. Equivalent of `append_array` in GDScript.
     pub fn extend_array(&mut self, other: &Array<T>) {
-        self.debug_ensure_mutable();
-
-        // SAFETY: `append_array` will only read values from `other`, and all types can be converted to `Variant`.
-        let other: &VariantArray = unsafe { other.assume_type_ref::<Variant>() };
+        self.balanced_ensure_mutable();
 
         // SAFETY: `append_array` will only write values gotten from `other` into `self`, and all values in `other` are guaranteed
         // to be of type `T`.
@@ -484,40 +501,27 @@ impl<T: ArrayElement> Array<T> {
         inner_self.append_array(other);
     }
 
-    /// Returns a shallow copy of the array. All array elements are copied, but any reference types
-    /// (such as `Array`, `Dictionary` and `Object`) will still refer to the same value.
+    /// Returns a shallow copy, sharing reference types (`Array`, `Dictionary`, `Object`...) with the original array.
+    ///
+    /// This operation retains the dynamic [element type][Self::element_type]: copying `Array<T>` will yield another `Array<T>`.
     ///
     /// To create a deep copy, use [`duplicate_deep()`][Self::duplicate_deep] instead.
     /// To create a new reference to the same array data, use [`clone()`][Clone::clone].
     pub fn duplicate_shallow(&self) -> Self {
-        // SAFETY: We never write to the duplicated array, and all values read are read as `Variant`.
-        let duplicate: VariantArray = unsafe { self.as_inner().duplicate(false) };
-
-        // SAFETY: duplicate() returns a typed array with the same type as Self, and all values are taken from `self` so have the right type.
-        unsafe { duplicate.assume_type() }
+        // duplicate() returns a typed array with the same type as Self, and all values are taken from `self` so have the right type.
+        self.as_inner().duplicate(false).cast_array::<T>()
     }
 
-    /// Returns a deep copy of the array. All nested arrays and dictionaries are duplicated and
-    /// will not be shared with the original array. Note that any `Object`-derived elements will
-    /// still be shallow copied.
+    /// Returns a deep copy, duplicating nested `Array`/`Dictionary` elements but keeping `Object` elements shared.
     ///
     /// To create a shallow copy, use [`duplicate_shallow()`][Self::duplicate_shallow] instead.
     /// To create a new reference to the same array data, use [`clone()`][Clone::clone].
     pub fn duplicate_deep(&self) -> Self {
-        // SAFETY: We never write to the duplicated array, and all values read are read as `Variant`.
-        let duplicate: VariantArray = unsafe { self.as_inner().duplicate(true) };
-
-        // SAFETY: duplicate() returns a typed array with the same type as Self, and all values are taken from `self` so have the right type.
-        unsafe { duplicate.assume_type() }
+        // duplicate() returns a typed array with the same type as Self, and all values are taken from `self` so have the right type.
+        self.as_inner().duplicate(true).cast_array::<T>()
     }
 
-    /// Returns a sub-range `begin..end`, as a new array.
-    ///
-    /// The values of `begin` (inclusive) and `end` (exclusive) will be clamped to the array size.
-    ///
-    /// If specified, `step` is the relative index between source elements. It can be negative,
-    /// in which case `begin` must be higher than `end`. For example,
-    /// `Array::from(&[0, 1, 2, 3, 4, 5]).slice(5, 1, -2)` returns `[5, 3]`.
+    /// Returns a sub-range `begin..end` as a new `Array`.
     ///
     /// Array elements are copied to the slice, but any reference types (such as `Array`,
     /// `Dictionary` and `Object`) will still refer to the same value. To create a deep copy, use
@@ -525,18 +529,11 @@ impl<T: ArrayElement> Array<T> {
     ///
     /// _Godot equivalent: `slice`_
     #[doc(alias = "slice")]
-    // TODO(v0.3): change to i32 like NodePath::slice/subpath() and support+test negative indices.
-    pub fn subarray_shallow(&self, begin: usize, end: usize, step: Option<isize>) -> Self {
-        self.subarray_impl(begin, end, step, false)
+    pub fn subarray_shallow(&self, range: impl SignedRange, step: Option<i32>) -> Self {
+        self.subarray_impl(range, step, false)
     }
 
-    /// Returns a sub-range `begin..end`, as a new `Array`.
-    ///
-    /// The values of `begin` (inclusive) and `end` (exclusive) will be clamped to the array size.
-    ///
-    /// If specified, `step` is the relative index between source elements. It can be negative,
-    /// in which case `begin` must be higher than `end`. For example,
-    /// `Array::from(&[0, 1, 2, 3, 4, 5]).slice(5, 1, -2)` returns `[5, 3]`.
+    /// Returns a sub-range `begin..end` as a new `Array`.
     ///
     /// All nested arrays and dictionaries are duplicated and will not be shared with the original
     /// array. Note that any `Object`-derived elements will still be shallow copied. To create a
@@ -544,38 +541,31 @@ impl<T: ArrayElement> Array<T> {
     ///
     /// _Godot equivalent: `slice`_
     #[doc(alias = "slice")]
-    // TODO(v0.3): change to i32 like NodePath::slice/subpath() and support+test negative indices.
-    pub fn subarray_deep(&self, begin: usize, end: usize, step: Option<isize>) -> Self {
-        self.subarray_impl(begin, end, step, true)
+    pub fn subarray_deep(&self, range: impl SignedRange, step: Option<i32>) -> Self {
+        self.subarray_impl(range, step, true)
     }
 
-    fn subarray_impl(&self, begin: usize, end: usize, step: Option<isize>, deep: bool) -> Self {
+    // Note: Godot will clamp values by itself.
+    fn subarray_impl(&self, range: impl SignedRange, step: Option<i32>, deep: bool) -> Self {
         assert_ne!(step, Some(0), "subarray: step cannot be zero");
 
-        let len = self.len();
-        let begin = begin.min(len);
-        let end = end.min(len);
         let step = step.unwrap_or(1);
+        let (begin, end) = range.signed();
+        let end = end.unwrap_or(i32::MAX as i64);
 
-        // SAFETY: The type of the array is `T` and we convert the returned array to an `Array<T>` immediately.
-        let subarray: VariantArray = unsafe {
-            self.as_inner()
-                .slice(to_i64(begin), to_i64(end), step.try_into().unwrap(), deep)
-        };
-
-        // SAFETY: slice() returns a typed array with the same type as Self
-        unsafe { subarray.assume_type() }
+        self.as_inner()
+            .slice(begin, end, step as i64, deep)
+            .cast_array::<T>()
     }
 
-    /// Returns an iterator over the elements of the `Array`. Note that this takes the array
-    /// by reference but returns its elements by value, since they are internally converted from
-    /// `Variant`.
+    /// Returns an non-exclusive iterator over the elements of the `Array`.
     ///
-    /// Notice that it's possible to modify the `Array` through another reference while
-    /// iterating over it. This will not result in unsoundness or crashes, but will cause the
-    /// iterator to behave in an unspecified way.
-    pub fn iter_shared(&self) -> Iter<'_, T> {
-        Iter {
+    /// Takes the array by reference but returns its elements by value, since they are internally converted from `Variant`.
+    ///
+    /// Notice that it's possible to modify the `Array` through another reference while iterating over it. This will not result
+    /// in unsoundness or crashes, but will cause the iterator to behave in an unspecified way.
+    pub fn iter_shared(&self) -> ArrayIter<'_, T> {
+        ArrayIter {
             array: self,
             next_idx: 0,
         }
@@ -645,6 +635,8 @@ impl<T: ArrayElement> Array<T> {
     ///
     /// Calling `bsearch` on an unsorted array results in unspecified behavior. Consider using `sort()` to ensure the sorting
     /// order is compatible with your callable's ordering.
+    ///
+    /// See also: [`bsearch_by()`][Self::bsearch_by], [`functional_ops().bsearch_custom()`][ArrayFunctionalOps::bsearch_custom].
     pub fn bsearch(&self, value: impl AsArg<T>) -> usize {
         meta::arg_into_ref!(value: T);
 
@@ -655,14 +647,15 @@ impl<T: ArrayElement> Array<T> {
     ///
     /// The comparator function should return an ordering that indicates whether its argument is `Less`, `Equal` or `Greater` the desired value.
     /// For example, for an ascending-ordered array, a simple predicate searching for a constant value would be `|elem| elem.cmp(&4)`.
-    /// See also [`slice::binary_search_by()`].
+    /// This follows the design of [`slice::binary_search_by()`].
     ///
     /// If the value is found, returns `Ok(index)` with its index. Otherwise, returns `Err(index)`, where `index` is the insertion index
     /// that would maintain sorting order.
     ///
-    /// Calling `bsearch_by` on an unsorted array results in unspecified behavior. Consider using [`sort_by()`] to ensure
-    /// the sorting order is compatible with your callable's ordering.
-    #[cfg(since_api = "4.2")]
+    /// Calling `bsearch_by` on an unsorted array results in unspecified behavior. Consider using [`sort_unstable_by()`][Self::sort_unstable_by]
+    /// to ensure the sorting order is compatible with your callable's ordering.
+    ///
+    /// See also: [`bsearch()`][Self::bsearch], [`functional_ops().bsearch_custom()`][ArrayFunctionalOps::bsearch_custom].
     pub fn bsearch_by<F>(&self, mut func: F) -> Result<usize, usize>
     where
         F: FnMut(&T) -> cmp::Ordering + 'static,
@@ -675,68 +668,27 @@ impl<T: ArrayElement> Array<T> {
         // We need one dummy element of type T, because Godot's bsearch_custom() checks types (so Variant::nil() can't be passed).
         // Optimization: roundtrip Variant -> T -> Variant could be avoided, but anyone needing speed would use Rust binary search...
         let ignored_value = self.at(0);
-        let ignored_value = meta::val_into_arg(ignored_value); //AsArg::into_arg(&ignored_value);
+        let ignored_value = meta::owned_into_arg(ignored_value);
 
         let godot_comparator = |args: &[&Variant]| {
             let value = T::from_variant(args[0]);
             let is_less = matches!(func(&value), cmp::Ordering::Less);
 
-            Ok(is_less.to_variant())
+            is_less.to_variant()
         };
 
         let debug_name = std::any::type_name::<F>();
         let index = Callable::with_scoped_fn(debug_name, godot_comparator, |pred| {
-            self.bsearch_custom(ignored_value, pred)
+            self.functional_ops().bsearch_custom(ignored_value, pred)
         });
 
-        if let Some(value_at_index) = self.get(index) {
-            if func(&value_at_index) == cmp::Ordering::Equal {
-                return Ok(index);
-            }
+        if let Some(value_at_index) = self.get(index)
+            && func(&value_at_index) == cmp::Ordering::Equal
+        {
+            return Ok(index);
         }
 
         Err(index)
-    }
-
-    /// Finds the index of a value in a sorted array using binary search, with `Callable` custom predicate.
-    ///
-    /// The callable `pred` takes two elements `(a, b)` and should return if `a < b` (strictly less).
-    /// For a type-safe version, check out [`bsearch_by()`][Self::bsearch_by].
-    ///
-    /// If the value is not present in the array, returns the insertion index that would maintain sorting order.
-    ///
-    /// Calling `bsearch_custom` on an unsorted array results in unspecified behavior. Consider using `sort_custom()` to ensure
-    /// the sorting order is compatible with your callable's ordering.
-    pub fn bsearch_custom(&self, value: impl AsArg<T>, pred: &Callable) -> usize {
-        meta::arg_into_ref!(value: T);
-
-        to_usize(
-            self.as_inner()
-                .bsearch_custom(&value.to_variant(), pred, true),
-        )
-    }
-
-    /// Reverses the order of the elements in the array.
-    pub fn reverse(&mut self) {
-        self.debug_ensure_mutable();
-
-        // SAFETY: We do not write any values that don't already exist in the array, so all values have the correct type.
-        unsafe { self.as_inner_mut() }.reverse();
-    }
-
-    /// Sorts the array.
-    ///
-    /// The sorting algorithm used is not [stable](https://en.wikipedia.org/wiki/Sorting_algorithm#Stability).
-    /// This means that values considered equal may have their order changed when using `sort_unstable`. For most variant types,
-    /// this distinction should not matter though.
-    ///
-    /// _Godot equivalent: `Array.sort()`_
-    #[doc(alias = "sort")]
-    pub fn sort_unstable(&mut self) {
-        self.debug_ensure_mutable();
-
-        // SAFETY: We do not write any values that don't already exist in the array, so all values have the correct type.
-        unsafe { self.as_inner_mut() }.sort();
     }
 
     /// Sorts the array, using a type-safe comparator.
@@ -745,21 +697,22 @@ impl<T: ArrayElement> Array<T> {
     /// elements themselves would be achieved with `|a, b| a.cmp(b)`.
     ///
     /// The sorting algorithm used is not [stable](https://en.wikipedia.org/wiki/Sorting_algorithm#Stability).
-    /// This means that values considered equal may have their order changed when using `sort_unstable_by`. For most variant types,
+    /// This means that values considered equal may have their order changed when using `sort_unstable_by()`. For most variant types,
     /// this distinction should not matter though.
-    #[cfg(since_api = "4.2")]
+    ///
+    /// See also: [`sort_unstable()`][Self::sort_unstable], [`sort_unstable_custom()`][Self::sort_unstable_custom].
     pub fn sort_unstable_by<F>(&mut self, mut func: F)
     where
         F: FnMut(&T, &T) -> cmp::Ordering,
     {
-        self.debug_ensure_mutable();
+        self.balanced_ensure_mutable();
 
         let godot_comparator = |args: &[&Variant]| {
             let lhs = T::from_variant(args[0]);
             let rhs = T::from_variant(args[1]);
             let is_less = matches!(func(&lhs, &rhs), cmp::Ordering::Less);
 
-            Ok(is_less.to_variant())
+            is_less.to_variant()
         };
 
         let debug_name = std::any::type_name::<F>();
@@ -768,33 +721,11 @@ impl<T: ArrayElement> Array<T> {
         });
     }
 
-    /// Sorts the array, using type-unsafe `Callable` comparator.
+    /// Access to Godot's functional-programming APIs based on callables.
     ///
-    /// For a type-safe variant of this method, use [`sort_unstable_by()`][Self::sort_unstable_by].
-    ///
-    /// The callable expects two parameters `(lhs, rhs)` and should return a bool `lhs < rhs`.
-    ///
-    /// The sorting algorithm used is not [stable](https://en.wikipedia.org/wiki/Sorting_algorithm#Stability).
-    /// This means that values considered equal may have their order changed when using `sort_unstable_custom`.For most variant types,
-    /// this distinction should not matter though.
-    ///
-    /// _Godot equivalent: `Array.sort_custom()`_
-    #[doc(alias = "sort_custom")]
-    pub fn sort_unstable_custom(&mut self, func: &Callable) {
-        self.debug_ensure_mutable();
-
-        // SAFETY: We do not write any values that don't already exist in the array, so all values have the correct type.
-        unsafe { self.as_inner_mut() }.sort_custom(func);
-    }
-
-    /// Shuffles the array such that the items will have a random order. This method uses the
-    /// global random number generator common to methods such as `randi`. Call `randomize` to
-    /// ensure that a new seed will be used each time if you want non-reproducible shuffling.
-    pub fn shuffle(&mut self) {
-        self.debug_ensure_mutable();
-
-        // SAFETY: We do not write any values that don't already exist in the array, so all values have the correct type.
-        unsafe { self.as_inner_mut() }.shuffle();
+    /// Exposes Godot array methods such as `filter()`, `map()`, `reduce()` and many more. See return type docs.
+    pub fn functional_ops(&self) -> ArrayFunctionalOps<'_, T> {
+        ArrayFunctionalOps::new(self)
     }
 
     /// Turns the array into a shallow-immutable array.
@@ -821,6 +752,22 @@ impl<T: ArrayElement> Array<T> {
         self
     }
 
+    /// Downgrades this typed/untyped `Array<T>` into an owned `AnyArray`.
+    ///
+    /// Typically, you can use deref coercion to convert `&Array<T>` to `&AnyArray`. This method is useful if you need `AnyArray` by value.
+    /// It consumes `self` to avoid incrementing the reference count; use `clone()` if you use the original array further.
+    pub fn upcast_any_array(self) -> AnyArray {
+        AnyArray::from_typed_or_untyped(self)
+    }
+
+    /// Converts this typed `Array<T>` into a `PackedArray<T>`.
+    pub fn to_packed_array(&self) -> PackedArray<T>
+    where
+        T: meta::PackedElement,
+    {
+        PackedArray::<T>::from_typed_array(self)
+    }
+
     /// Returns true if the array is read-only.
     ///
     /// See [`into_read_only()`][Self::into_read_only].
@@ -831,10 +778,10 @@ impl<T: ArrayElement> Array<T> {
 
     /// Best-effort mutability check.
     ///
-    /// # Panics
-    /// In Debug mode, if the array is marked as read-only.
-    fn debug_ensure_mutable(&self) {
-        debug_assert!(
+    /// # Panics (safeguards-balanced)
+    /// If the array is marked as read-only.
+    fn balanced_ensure_mutable(&self) {
+        sys::balanced_assert!(
             !self.is_read_only(),
             "mutating operation on read-only array"
         );
@@ -845,6 +792,7 @@ impl<T: ArrayElement> Array<T> {
     /// # Panics
     /// If `index` is out of bounds.
     fn check_bounds(&self, index: usize) {
+        // Safety-relevant; explicitly *don't* use safeguards-dependent validation.
         let len = self.len();
         assert!(
             index < len,
@@ -868,11 +816,10 @@ impl<T: ArrayElement> Array<T> {
 
     /// Returns a pointer to the element at the given index, or null if out of bounds.
     fn ptr_or_null(&self, index: usize) -> sys::GDExtensionConstVariantPtr {
+        let index = to_i64(index);
+
         // SAFETY: array_operator_index_const returns null for invalid indexes.
-        let variant_ptr = unsafe {
-            let index = to_i64(index);
-            interface_fn!(array_operator_index_const)(self.sys(), index)
-        };
+        let variant_ptr = unsafe { interface_fn!(array_operator_index_const)(self.sys(), index) };
 
         // Signature is wrong in GDExtension, semantically this is a const ptr
         sys::SysPtr::as_const(variant_ptr)
@@ -895,15 +842,13 @@ impl<T: ArrayElement> Array<T> {
 
     /// Returns a pointer to the element at the given index, or null if out of bounds.
     fn ptr_mut_or_null(&mut self, index: usize) -> sys::GDExtensionVariantPtr {
+        let index = to_i64(index);
+
         // SAFETY: array_operator_index returns null for invalid indexes.
-        unsafe {
-            let index = to_i64(index);
-            interface_fn!(array_operator_index)(self.sys_mut(), index)
-        }
+        unsafe { interface_fn!(array_operator_index)(self.sys_mut(), index) }
     }
 
     /// # Safety
-    ///
     /// This has the same safety issues as doing `self.assume_type::<Variant>()` and so the relevant safety invariants from
     /// [`assume_type`](Self::assume_type) must be upheld.
     ///
@@ -915,19 +860,17 @@ impl<T: ArrayElement> Array<T> {
         inner::InnerArray::from_outer_typed(self)
     }
 
-    fn as_inner(&self) -> ImmutableInnerArray<'_> {
+    pub(super) fn as_inner(&self) -> ImmutableInnerArray<'_> {
         ImmutableInnerArray {
             // SAFETY: We can only read from the array.
             inner: unsafe { self.as_inner_mut() },
         }
     }
 
-    /// Changes the generic type on this array, without changing its contents. Needed for API
-    /// functions that return a variant array even though we know its type, and for API functions
+    /// Changes the generic type on this array, without changing its contents. Needed for API functions
     /// that take a variant array even though we want to pass a typed one.
     ///
     /// # Safety
-    ///
     /// - Any values written to the array must match the runtime type of the array.
     /// - Any values read from the array must be convertible to the type `U`.
     ///
@@ -938,20 +881,55 @@ impl<T: ArrayElement> Array<T> {
     /// Note also that any `GodotType` can be written to a `Variant` array.
     ///
     /// In the current implementation, both cases will produce a panic rather than undefined behavior, but this should not be relied upon.
-    unsafe fn assume_type<U: ArrayElement>(self) -> Array<U> {
-        // The memory layout of `Array<T>` does not depend on `T`.
-        std::mem::transmute::<Array<T>, Array<U>>(self)
+    #[cfg(safeguards_strict)]
+    unsafe fn assume_type_ref<U: Element>(&self) -> &Array<U> {
+        // SAFETY: per function precondition.
+        unsafe { std::mem::transmute::<&Array<T>, &Array<U>>(self) }
     }
 
+    fn as_any_ref(&self) -> &AnyArray {
+        // SAFETY:
+        // - Array<T> and Array<Variant> have identical memory layout.
+        // - AnyArray is #[repr(transparent)] around VariantArray and provides no "in" operations (moving data in) that could violate covariance.
+        unsafe { std::mem::transmute::<&Array<T>, &AnyArray>(self) }
+    }
+
+    fn as_any_mut(&mut self) -> &mut AnyArray {
+        // SAFETY:
+        // - Array<T> and Array<Variant> have identical memory layout (validated by static_assert_eq_size_align!).
+        // - AnyArray is #[repr(transparent)] around VariantArray.
+        // - Mutable operations on AnyArray work with Variant values, maintaining type safety through balanced_ensure_mutable() checks.
+        unsafe { std::mem::transmute::<&mut Array<T>, &mut AnyArray>(self) }
+    }
+
+    /// Changes the type parameter without runtime checks, consuming the array.
+    ///
     /// # Safety
-    /// See [`assume_type`](Self::assume_type).
-    unsafe fn assume_type_ref<U: ArrayElement>(&self) -> &Array<U> {
-        // The memory layout of `Array<T>` does not depend on `T`.
-        std::mem::transmute::<&Array<T>, &Array<U>>(self)
+    /// Same safety requirements as [`assume_type_ref`](Self::assume_type_ref):
+    /// - Values written to array must match runtime type.
+    /// - Values read must be convertible to type `U`.
+    /// - If runtime type matches `U`, both conditions hold automatically.
+    // TODO(v0.6): fragile manual field move + mem::forget; if a field is added, it must be moved here too.
+    // Consider transmute (requires #[repr(C)]) or ManuallyDrop + ptr::read. Same issue in Dictionary::assume_type.
+    pub(super) unsafe fn assume_type<U: Element>(self) -> Array<U> {
+        let result = Array::<U> {
+            opaque: self.opaque,
+            _phantom: PhantomData,
+            cached_element_type: OnceCell::new(),
+        };
+
+        // Transfer cached type to avoid redundant FFI calls.
+        ElementType::transfer_cache(&self.cached_element_type, &result.cached_element_type);
+
+        // Prevent drop of self since we moved opaque.
+        std::mem::forget(self);
+
+        result
     }
 
-    #[cfg(debug_assertions)]
-    pub(crate) fn debug_validate_elements(&self) -> Result<(), ConvertError> {
+    /// Validates that all elements in this array can be converted to integers of type `T`.
+    #[cfg(safeguards_strict)]
+    pub(crate) fn debug_validate_int_elements(&self) -> Result<(), ConvertError> {
         // SAFETY: every element is internally represented as Variant.
         let canonical_array = unsafe { self.assume_type_ref::<Variant>() };
 
@@ -959,12 +937,12 @@ impl<T: ArrayElement> Array<T> {
         for elem in canonical_array.iter_shared() {
             elem.try_to::<T>().map_err(|_err| {
                 FromGodotError::BadArrayTypeInt {
-                    expected: self.type_info(),
+                    expected_int_type: std::any::type_name::<T>(),
                     value: elem
                         .try_to::<i64>()
                         .expect("origin must be i64 compatible; this is a bug"),
                 }
-                .into_error(self.clone())
+                .into_error(self.clone()) // Context info about array, not element.
             })?;
         }
 
@@ -972,74 +950,59 @@ impl<T: ArrayElement> Array<T> {
     }
 
     // No-op in Release. Avoids O(n) conversion checks, but still panics on access.
-    #[cfg(not(debug_assertions))]
-    pub(crate) fn debug_validate_elements(&self) -> Result<(), ConvertError> {
+    #[cfg(not(safeguards_strict))]
+    pub(crate) fn debug_validate_int_elements(&self) -> Result<(), ConvertError> {
         Ok(())
-    }
-
-    /// Returns the runtime type info of this array.
-    fn type_info(&self) -> ArrayTypeInfo {
-        let variant_type = VariantType::from_sys(
-            self.as_inner().get_typed_builtin() as sys::GDExtensionVariantType
-        );
-
-        let class_name = if variant_type == VariantType::OBJECT {
-            Some(self.as_inner().get_typed_class_name())
-        } else {
-            None
-        };
-
-        ArrayTypeInfo {
-            variant_type,
-            class_name,
-        }
     }
 
     /// Checks that the inner array has the correct type set on it for storing elements of type `T`.
     fn with_checked_type(self) -> Result<Self, ConvertError> {
-        let self_ty = self.type_info();
-        let target_ty = ArrayTypeInfo::of::<T>();
+        let actual = self.element_type();
+        let expected = ElementType::of::<T>();
 
-        if self_ty == target_ty {
+        if actual.is_compatible_with(&expected) {
             Ok(self)
         } else {
-            Err(FromGodotError::BadArrayType {
-                expected: target_ty,
-                actual: self_ty,
-            }
-            .into_error(self))
+            let mismatch = ArrayMismatch { expected, actual };
+            Err(FromGodotError::BadArrayType(mismatch).into_error(self))
         }
     }
 
     /// Sets the type of the inner array.
     ///
     /// # Safety
-    ///
     /// Must only be called once, directly after creation.
     unsafe fn init_inner_type(&mut self) {
-        debug_assert!(self.is_empty());
-        debug_assert!(!self.type_info().is_typed());
+        sys::strict_assert!(self.is_empty());
+        sys::strict_assert!(
+            self.cached_element_type.get().is_none(),
+            "init_inner_type() called twice"
+        );
 
-        let type_info = ArrayTypeInfo::of::<T>();
-        if type_info.is_typed() {
+        // Immediately set cache to static type.
+        let elem_ty = ElementType::of::<T>();
+        let _ = self.cached_element_type.set(elem_ty);
+
+        if elem_ty.is_typed() {
             let script = Variant::nil();
 
             // A bit contrived because empty StringName is lazy-initialized but must also remain valid.
             #[allow(unused_assignments)]
             let mut empty_string_name = None;
-            let class_name = if let Some(class_name) = &type_info.class_name {
-                class_name.string_sys()
+            let class_name = if let Some(class_id) = elem_ty.class_id() {
+                class_id.string_sys()
             } else {
                 empty_string_name = Some(StringName::default());
                 // as_ref() crucial here -- otherwise the StringName is dropped.
                 empty_string_name.as_ref().unwrap().string_sys()
             };
 
-            // SAFETY: The array is a newly created empty untyped array.
+            // SAFETY: Valid pointers are passed in.
+            // Relevant for correctness, not safety: the array is a newly created, empty, untyped array.
             unsafe {
                 interface_fn!(array_set_typed)(
                     self.sys_mut(),
-                    type_info.variant_type.sys(),
+                    elem_ty.variant_type().sys(),
                     class_name, // must be empty if variant_type != OBJECT.
                     script.var_sys(),
                 );
@@ -1047,17 +1010,57 @@ impl<T: ArrayElement> Array<T> {
         }
     }
 
+    /// Creates a new array for [`GodotFfi::new_with_init()`], without setting a type yet.
+    pub(super) fn new_uncached_type(init_fn: impl FnOnce(sys::GDExtensionTypePtr)) -> Self {
+        let mut result = unsafe {
+            Self::new_with_uninit(|self_ptr| {
+                let ctor = sys::builtin_fn!(array_construct_default);
+                ctor(self_ptr, std::ptr::null_mut());
+            })
+        };
+        init_fn(result.sys_mut());
+        result
+    }
+
+    /// # Safety
+    /// Does not validate the array element type; `with_checked_type()` should be called afterward.
+    // Visibility: shared with AnyArray.
+    pub(super) unsafe fn unchecked_from_variant(variant: &Variant) -> Result<Self, ConvertError> {
+        let dest_type = Self::VARIANT_TYPE.variant_as_nil();
+
+        if variant.get_type() != dest_type {
+            return Err(FromVariantError::BadType {
+                expected: dest_type,
+                actual: variant.get_type(),
+            }
+            .into_error(variant.clone()));
+        }
+
+        let array = unsafe {
+            Self::new_with_uninit(|self_ptr| {
+                let array_from_variant = sys::builtin_fn!(array_from_variant);
+                array_from_variant(self_ptr, sys::SysPtr::force_mut(variant.var_sys()));
+            })
+        };
+
+        Ok(array)
+    }
+
     /// Returns a clone of the array without checking the resulting type.
     ///
     /// # Safety
     /// Should be used only in scenarios where the caller can guarantee that the resulting array will have the correct type,
     /// or when an incorrect Rust type is acceptable (passing raw arrays to Godot FFI).
-    unsafe fn clone_unchecked(&self) -> Self {
-        Self::new_with_uninit(|self_ptr| {
-            let ctor = sys::builtin_fn!(array_construct_copy);
-            let args = [self.sys()];
-            ctor(self_ptr, args.as_ptr());
-        })
+    pub(super) unsafe fn clone_unchecked(&self) -> Self {
+        let result = unsafe {
+            Self::new_with_uninit(|self_ptr| {
+                let ctor = sys::builtin_fn!(array_construct_copy);
+                let args = [self.sys()];
+                ctor(self_ptr, args.as_ptr());
+            })
+        };
+
+        result.with_cache(self)
     }
 
     /// Whether this array is untyped and holds `Variant` elements (compile-time check).
@@ -1067,24 +1070,29 @@ impl<T: ArrayElement> Array<T> {
     fn has_variant_t() -> bool {
         element_variant_type::<T>() == VariantType::NIL
     }
+
+    /// Execute a function that creates a new Array, transferring cached element type if available.
+    ///
+    /// This is a convenience helper for methods that create new Array instances and want to preserve
+    /// cached type information to avoid redundant FFI calls.
+    fn with_cache(self, source: &Self) -> Self {
+        ElementType::transfer_cache(&source.cached_element_type, &self.cached_element_type);
+        self
+    }
 }
 
-#[test]
-fn correct_variant_t() {
-    assert!(Array::<Variant>::has_variant_t());
-    assert!(!Array::<i64>::has_variant_t());
-}
-
-impl VariantArray {
+impl VarArray {
     /// # Safety
     /// - Variant must have type `VariantType::ARRAY`.
     /// - Subsequent operations on this array must not rely on the type of the array.
     pub(crate) unsafe fn from_variant_unchecked(variant: &Variant) -> Self {
-        // See also ffi_from_variant().
-        Self::new_with_uninit(|self_ptr| {
-            let array_from_variant = sys::builtin_fn!(array_from_variant);
-            array_from_variant(self_ptr, sys::SysPtr::force_mut(variant.var_sys()));
-        })
+        unsafe {
+            // See also ffi_from_variant().
+            Self::new_with_uninit(|self_ptr| {
+                let array_from_variant = sys::builtin_fn!(array_from_variant);
+                array_from_variant(self_ptr, sys::SysPtr::force_mut(variant.var_sys()));
+            })
+        }
     }
 }
 
@@ -1109,48 +1117,73 @@ impl VariantArray {
 // - `from_arg_ptr`
 //   Arrays are properly initialized through a `from_sys` call, but the ref-count should be incremented
 //   as that is the callee's responsibility. Which we do by calling `std::mem::forget(array.clone())`.
-unsafe impl<T: ArrayElement> GodotFfi for Array<T> {
+unsafe impl<T: Element> GodotFfi for Array<T> {
     const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(VariantType::ARRAY);
 
-    ffi_methods! { type sys::GDExtensionTypePtr = *mut Opaque; .. }
+    ffi_methods! { type sys::GDExtensionTypePtr = *mut Opaque;
+        fn new_from_sys;
+        fn new_with_uninit;
+        fn sys;
+        fn sys_mut;
+        fn from_arg_ptr;
+        fn move_return_ptr;
+    }
+
+    /// Constructs a valid Godot array as ptrcall destination, without caching the element type.
+    ///
+    /// Ptrcall may replace the underlying data with an array of a different type (e.g. `duplicate()` on a typed
+    /// array returns `VarArray` in codegen, but the actual data is typed). The cache is lazily populated on first
+    /// access from the actual Godot data.
+    unsafe fn new_with_init(init_fn: impl FnOnce(sys::GDExtensionTypePtr)) -> Self {
+        Self::new_uncached_type(init_fn)
+    }
 }
 
 // Only implement for untyped arrays; typed arrays cannot be nested in Godot.
-impl ArrayElement for VariantArray {}
+impl Element for VarArray {}
 
-impl<T: ArrayElement> ParamType for Array<T> {
-    type ArgPassing = ByRef;
-}
-
-impl<T: ArrayElement> GodotConvert for Array<T> {
+impl<T: Element> GodotConvert for Array<T> {
     type Via = Self;
+
+    fn godot_shape() -> GodotShape {
+        if Self::has_variant_t() {
+            return GodotShape::Builtin {
+                variant_type: VariantType::ARRAY,
+                metadata: ParamMetadata::NONE,
+            };
+        }
+
+        GodotShape::TypedArray {
+            element: GodotElementShape::new(T::godot_shape()),
+        }
+    }
 }
 
-impl<T: ArrayElement> ToGodot for Array<T> {
-    type ToVia<'v> = Self::Via;
+impl<T: Element> ToGodot for Array<T> {
+    type Pass = meta::ByRef;
 
-    fn to_godot(&self) -> Self::ToVia<'_> {
-        // SAFETY: only safe when passing to FFI in a context where Rust-side type doesn't matter.
-        // TODO: avoid unsafety with either of the following:
-        // * OutArray -- https://github.com/godot-rust/gdext/pull/806.
-        // * Instead of cloning, use ArgRef<Array<T>>.
+    fn to_godot(&self) -> &Self::Via {
+        self
+    }
+
+    fn to_godot_owned(&self) -> Self::Via
+    where
+        Self::Via: Clone,
+    {
+        // Overridden, because default clone() validates that before/after element types are equal, which doesn't matter when we pass to FFI.
+        // This may however be an issue if to_godot_owned() is used by the user directly.
         unsafe { self.clone_unchecked() }
-        //self.clone()
-    }
-
-    fn to_variant(&self) -> Variant {
-        self.ffi_to_variant()
     }
 }
 
-impl<T: ArrayElement> FromGodot for Array<T> {
+impl<T: Element> FromGodot for Array<T> {
     fn try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
         T::debug_validate_elements(&via)?;
         Ok(via)
     }
 }
 
-impl<T: ArrayElement> fmt::Debug for Array<T> {
+impl<T: Element> fmt::Debug for Array<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Going through `Variant` because there doesn't seem to be a direct way.
         // Reuse Display.
@@ -1158,13 +1191,13 @@ impl<T: ArrayElement> fmt::Debug for Array<T> {
     }
 }
 
-impl<T: ArrayElement + fmt::Display> fmt::Display for Array<T> {
+impl<T: Element + fmt::Display> fmt::Display for Array<T> {
     /// Formats `Array` to match Godot's string representation.
     ///
     /// # Example
     /// ```no_run
     /// # use godot::prelude::*;
-    /// let a = array![1,2,3,4];
+    /// let a = iarray![1,2,3,4];
     /// assert_eq!(format!("{a}"), "[1, 2, 3, 4]");
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1184,14 +1217,14 @@ impl<T: ArrayElement + fmt::Display> fmt::Display for Array<T> {
 ///
 /// To create a (mostly) independent copy instead, see [`Array::duplicate_shallow()`] and
 /// [`Array::duplicate_deep()`].
-impl<T: ArrayElement> Clone for Array<T> {
+impl<T: Element> Clone for Array<T> {
     fn clone(&self) -> Self {
         // SAFETY: `self` is a valid array, since we have a reference that keeps it alive.
         // Type-check follows below.
         let copy = unsafe { self.clone_unchecked() };
 
         // Double-check copy's runtime type in Debug mode.
-        if cfg!(debug_assertions) {
+        if cfg!(safeguards_strict) {
             copy.with_checked_type()
                 .expect("copied array should have same type as original array")
         } else {
@@ -1200,54 +1233,37 @@ impl<T: ArrayElement> Clone for Array<T> {
     }
 }
 
-impl<T: ArrayElement> Var for Array<T> {
-    fn get_property(&self) -> Self::Via {
-        self.to_godot()
+// No Var bound on T.
+impl<T: Element> Var for Array<T> {
+    type PubType = Self;
+
+    fn var_get(field: &Self) -> Self::Via {
+        field.to_godot_owned()
     }
 
-    fn set_property(&mut self, value: Self::Via) {
-        *self = FromGodot::from_godot(value)
+    fn var_set(field: &mut Self, value: Self::Via) {
+        *field = FromGodot::from_godot(value);
     }
 
-    fn var_hint() -> PropertyHintInfo {
-        // For array #[var], the hint string is "PackedInt32Array", "Node" etc. for typed arrays, and "" for untyped arrays.
-        if Self::has_variant_t() {
-            PropertyHintInfo::none()
-        } else if sys::GdextBuild::since_api("4.2") {
-            PropertyHintInfo::var_array_element::<T>()
-        } else {
-            // Godot 4.1 was not using PropertyHint::ARRAY_TYPE, but the empty hint instead.
-            PropertyHintInfo::none()
-        }
+    fn var_pub_get(field: &Self) -> Self::PubType {
+        field.clone()
     }
-}
 
-impl<T> Export for Array<T>
-where
-    T: ArrayElement + Export,
-{
-    fn export_hint() -> PropertyHintInfo {
-        // If T == Variant, then we return "Array" builtin type hint.
-        if Self::has_variant_t() {
-            PropertyHintInfo::type_name::<VariantArray>()
-        } else {
-            PropertyHintInfo::export_array_element::<T>()
-        }
+    fn var_pub_set(field: &mut Self, value: Self::PubType) {
+        *field = value;
     }
 }
 
-impl<T: ArrayElement> BuiltinExport for Array<T> {}
+impl<T> Export for Array<T> where T: Element + Export {}
+
+impl<T: Element> BuiltinExport for Array<T> {}
 
 impl<T> Export for Array<Gd<T>>
 where
     T: GodotClass + Bounds<Exportable = bounds::Yes>,
 {
-    fn export_hint() -> PropertyHintInfo {
-        PropertyHintInfo::export_array_element::<Gd<T>>()
-    }
-
     #[doc(hidden)]
-    fn as_node_class() -> Option<ClassName> {
+    fn as_node_class() -> Option<ClassId> {
         PropertyHintInfo::object_as_node_class::<T>()
     }
 }
@@ -1260,17 +1276,13 @@ where
     T: GodotClass + Bounds<Exportable = bounds::Yes>,
     D: ?Sized + 'static,
 {
-    fn export_hint() -> PropertyHintInfo {
-        PropertyHintInfo::export_array_element::<DynGd<T, D>>()
-    }
-
     #[doc(hidden)]
-    fn as_node_class() -> Option<ClassName> {
+    fn as_node_class() -> Option<ClassId> {
         PropertyHintInfo::object_as_node_class::<T>()
     }
 }
 
-impl<T: ArrayElement> Default for Array<T> {
+impl<T: Element> Default for Array<T> {
     #[inline]
     fn default() -> Self {
         let mut array = unsafe {
@@ -1286,10 +1298,10 @@ impl<T: ArrayElement> Default for Array<T> {
     }
 }
 
-// T must be GodotType (or subtrait ArrayElement), because drop() requires sys_mut(), which is on the GodotFfi trait.
+// T must be GodotType (or subtrait Element), because drop() requires sys_mut(), which is on the GodotFfi trait.
 // Its sister method GodotFfi::from_sys_init() requires Default, which is only implemented for T: GodotType.
 // This could be addressed by splitting up GodotFfi if desired.
-impl<T: ArrayElement> Drop for Array<T> {
+impl<T: Element> Drop for Array<T> {
     #[inline]
     fn drop(&mut self) {
         unsafe {
@@ -1299,7 +1311,7 @@ impl<T: ArrayElement> Drop for Array<T> {
     }
 }
 
-impl<T: ArrayElement> GodotType for Array<T> {
+impl<T: Element> GodotType for Array<T> {
     type Ffi = Self;
 
     type ToFfi<'f>
@@ -1318,27 +1330,9 @@ impl<T: ArrayElement> GodotType for Array<T> {
     fn try_from_ffi(ffi: Self::Ffi) -> Result<Self, ConvertError> {
         Ok(ffi)
     }
-
-    fn godot_type_name() -> String {
-        "Array".to_string()
-    }
-
-    #[cfg(since_api = "4.2")]
-    fn property_hint_info() -> PropertyHintInfo {
-        // Array<Variant>, aka untyped array, has no hints.
-        if Self::has_variant_t() {
-            return PropertyHintInfo::none();
-        }
-
-        // Typed arrays use type hint.
-        PropertyHintInfo {
-            hint: crate::global::PropertyHint::ARRAY_TYPE,
-            hint_string: GString::from(element_godot_type_name::<T>()),
-        }
-    }
 }
 
-impl<T: ArrayElement> GodotFfiVariant for Array<T> {
+impl<T: Element> GodotFfiVariant for Array<T> {
     fn ffi_to_variant(&self) -> Variant {
         unsafe {
             Variant::new_with_var_uninit(|variant_ptr| {
@@ -1349,21 +1343,8 @@ impl<T: ArrayElement> GodotFfiVariant for Array<T> {
     }
 
     fn ffi_from_variant(variant: &Variant) -> Result<Self, ConvertError> {
-        // First check if the variant is an array. The array conversion shouldn't be called otherwise.
-        if variant.get_type() != Self::VARIANT_TYPE.variant_as_nil() {
-            return Err(FromVariantError::BadType {
-                expected: Self::VARIANT_TYPE.variant_as_nil(),
-                actual: variant.get_type(),
-            }
-            .into_error(variant.clone()));
-        }
-
-        let array = unsafe {
-            Self::new_with_uninit(|self_ptr| {
-                let array_from_variant = sys::builtin_fn!(array_from_variant);
-                array_from_variant(self_ptr, sys::SysPtr::force_mut(variant.var_sys()));
-            })
-        };
+        // SAFETY: if conversion succeeds, we call with_checked_type() afterwards.
+        let array = unsafe { Self::unchecked_from_variant(variant) }?;
 
         // Then, check the runtime type of the array.
         array.with_checked_type()
@@ -1373,15 +1354,18 @@ impl<T: ArrayElement> GodotFfiVariant for Array<T> {
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Conversion traits
 
+// From impls converting values (like [T; N] or Vec<T>) are explicitly not supported, because there's no perf benefit in submitting ownership.
+// This is different for PackedArray, which can move values. See also related: https://github.com/godot-rust/gdext/pull/1286.
+
 /// Creates a `Array` from the given Rust array.
-impl<T: ArrayElement + ToGodot, const N: usize> From<&[T; N]> for Array<T> {
+impl<T: Element + ToGodot, const N: usize> From<&[T; N]> for Array<T> {
     fn from(arr: &[T; N]) -> Self {
         Self::from(&arr[..])
     }
 }
 
 /// Creates a `Array` from the given slice.
-impl<T: ArrayElement + ToGodot> From<&[T]> for Array<T> {
+impl<T: Element + ToGodot> From<&[T]> for Array<T> {
     fn from(slice: &[T]) -> Self {
         let mut array = Self::new();
         let len = slice.len();
@@ -1406,7 +1390,7 @@ impl<T: ArrayElement + ToGodot> From<&[T]> for Array<T> {
 }
 
 /// Creates a `Array` from an iterator.
-impl<T: ArrayElement + ToGodot> FromIterator<T> for Array<T> {
+impl<T: Element + ToGodot> FromIterator<T> for Array<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut array = Self::new();
         array.extend(iter);
@@ -1415,7 +1399,7 @@ impl<T: ArrayElement + ToGodot> FromIterator<T> for Array<T> {
 }
 
 /// Extends a `Array` with the contents of an iterator.
-impl<T: ArrayElement> Extend<T> for Array<T> {
+impl<T: Element> Extend<T> for Array<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         // Unfortunately the GDExtension API does not offer the equivalent of `Vec::reserve`.
         // Otherwise, we could use it to pre-allocate based on `iter.size_hint()`.
@@ -1424,13 +1408,13 @@ impl<T: ArrayElement> Extend<T> for Array<T> {
         // Note that this could technically also use iter(), since no moves need to happen (however Extend requires IntoIterator).
         for item in iter.into_iter() {
             // self.push(AsArg::into_arg(&item));
-            self.push(meta::val_into_arg(item));
+            self.push(meta::owned_into_arg(item));
         }
     }
 }
 
 /// Converts this array to a strongly typed Rust vector.
-impl<T: ArrayElement + FromGodot> From<&Array<T>> for Vec<T> {
+impl<T: Element + FromGodot> From<&Array<T>> for Vec<T> {
     fn from(array: &Array<T>) -> Vec<T> {
         let len = array.len();
         let mut vec = Vec::with_capacity(len);
@@ -1446,14 +1430,18 @@ impl<T: ArrayElement + FromGodot> From<&Array<T>> for Vec<T> {
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
+// Iterators
 
 /// An iterator over typed elements of an [`Array`].
-pub struct Iter<'a, T: ArrayElement> {
+///
+/// Unlike dictionary iterators, this does not provide a `typed()` method to re-type an untyped `VarArray` iterator.
+// Currently doesn't have a `typed()` method like dictionary iterators. Less useful here, as arrays are more often properly typed.
+pub struct ArrayIter<'a, T: Element> {
     array: &'a Array<T>,
     next_idx: usize,
 }
 
-impl<T: ArrayElement + FromGodot> Iterator for Iter<'_, T> {
+impl<T: Element + FromGodot> Iterator for ArrayIter<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1480,7 +1468,7 @@ impl<T: ArrayElement + FromGodot> Iterator for Iter<'_, T> {
 }
 
 // TODO There's a macro for this, but it doesn't support generics yet; add support and use it
-impl<T: ArrayElement> PartialEq for Array<T> {
+impl<T: Element> PartialEq for Array<T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         unsafe {
@@ -1493,7 +1481,7 @@ impl<T: ArrayElement> PartialEq for Array<T> {
     }
 }
 
-impl<T: ArrayElement> PartialOrd for Array<T> {
+impl<T: Element> PartialOrd for Array<T> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let op_less = |lhs, rhs| unsafe {
@@ -1517,62 +1505,86 @@ impl<T: ArrayElement> PartialOrd for Array<T> {
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
+// Expression macros
+// Intra-doc-links use HTML to stay in same module (not switch to prelude when looking at godot::builtin).
 
-/// Constructs [`Array`] literals, similar to Rust's standard `vec!` macro.
+/// **Array**: constructs `Array` literals for all possible element types.
 ///
-/// The type of the array is inferred from the arguments.
+/// # Type inference
+/// There are three related macros, all of which create [`Array<T>`] expressions, but they differ in how the type `T` is inferred:
 ///
-/// # Example
+/// - `array!` uses [`AsArg`][crate::meta::AsArg] to push elements. This works when the array's element type `T` is already
+///   determined from context -- a type annotation, function parameter, etc. This supports all element types including `Gd<T>` and `Variant`.
+/// - [`iarray!`](macro.iarray.html) uses [`AsDirectElement`][crate::meta::AsDirectElement] for (opinionated) type inference from literals.
+///   This macro needs no type annotations, however is limited to common types, like `i32`, `&str` (inferred as `GString`), etc.
+/// - [`varray!`](macro.varray.html) uses `AsArg<Variant>`, meaning it's like `array!` but inferred as [`VarArray`].
+///
+/// # Examples
 /// ```no_run
 /// # use godot::prelude::*;
-/// let arr = array![3, 1, 4];  // Array<i32>
+/// // array! requires type context (e.g. annotation, return type, etc.).
+/// // The same expression can be used to initialize different array types:
+///
+/// let ints: Array<i8>      = array![3, 1, 4];
+/// let ints: Array<i64>     = array![3, 1, 4];
+/// let ints: Array<Variant> = array![3, 1, 4];
+///
+/// let strs: Array<GString>    = array!["a", "b"];
+/// let strs: Array<StringName> = array!["a", "b"];
+/// let strs: Array<Variant>    = array!["a", "b"];
+///
+/// // More strict inference with iarray! and varray! macros:
+///
+/// let ints = iarray![3, 1, 4];  // Array<i32>.
+/// let strs = iarray!["a", "b"]; // Array<GString>.
+///
+/// let strs = varray!["a", "b"]; // VarArray.
 /// ```
 ///
 /// # See also
-/// To create an `Array` of variants, see the [`varray!`] macro.
+/// For dictionaries, a similar macro [`dict!`](macro.dict.html) exists.
 ///
-/// For dictionaries, a similar macro [`vdict!`] exists.
+/// To construct slices of variants, use [`vslice!`](macro.vslice.html).
 #[macro_export]
 macro_rules! array {
-    ($($elements:expr),* $(,)?) => {
+    ($($elements:expr_2021),* $(,)?) => {
         {
             let mut array = $crate::builtin::Array::default();
-            $(
-                array.push($elements);
-            )*
+            $(array.push($elements);)*
             array
         }
     };
 }
 
-/// Constructs [`VariantArray`] literals, similar to Rust's standard `vec!` macro.
+/// **I**nferred **array**: constructs `Array` literals without ambiguity.
 ///
-/// The type of the array elements is always [`Variant`].
-///
-/// # Example
-/// ```no_run
-/// # use godot::prelude::*;
-/// let arr: VariantArray = varray![42_i64, "hello", true];
-/// ```
-///
-/// # See also
-/// To create a typed `Array` with a single element type, see the [`array!`] macro.
-///
-/// For dictionaries, a similar macro [`vdict!`] exists.
-///
-/// To construct slices of variants, use [`vslice!`].
+/// See [`array!`](macro.array.html) for docs and examples.
 #[macro_export]
-macro_rules! varray {
-    // Note: use to_variant() and not Variant::from(), as that works with both references and values
-    ($($elements:expr),* $(,)?) => {
+macro_rules! iarray {
+    ($($elements:expr_2021),* $(,)?) => {
         {
-            use $crate::meta::ToGodot as _;
-            let mut array = $crate::builtin::VariantArray::default();
-            $(
-                array.push(&$elements.to_variant());
-            )*
+            let mut array = $crate::builtin::Array::default();
+            $(array.__macro_push_direct($elements);)*
             array
         }
+    };
+}
+
+/// **V**ariant **array**: constructs [`VarArray`] literals.
+///
+/// See [`array!`](macro.array.html) for docs and examples.
+#[macro_export]
+macro_rules! varray {
+    // Uses `AsArg` semantics, consistent with `array!`.
+    ($($elements:expr_2021),* $(,)?) => {
+        {
+            let mut array = $crate::builtin::VarArray::default();
+            $(
+                array.push($elements);
+            )*
+            array
+        } as $crate::builtin::VarArray
+        // The `as` cast is necessary for Deref coercion to AnyArray; type inference doesn't seem to pick it up otherwise.
     };
 }
 
@@ -1584,54 +1596,55 @@ macro_rules! varray {
 /// This macro creates a [slice](https://doc.rust-lang.org/std/primitive.slice.html) of `Variant` values.
 ///
 /// # Examples
-/// Variable number of arguments:
+/// ## Variable number of arguments
 /// ```no_run
 /// # use godot::prelude::*;
 /// let slice: &[Variant] = vslice![42, "hello", true];
-///
 /// let concat: GString = godot::global::str(slice);
 /// ```
-/// _(In practice, you might want to use [`godot_str!`][crate::global::godot_str] instead of `str()`.)_
+/// _In practice, you might want to use [`godot_str!`][crate::global::godot_str] instead of `str()`._
 ///
-/// Dynamic function call via reflection. NIL can still be passed inside `vslice!`, just use `Variant::nil()`.
+/// ## Dynamic function call via reflection
+/// NIL can still be passed inside `vslice!`, just use `Variant::nil()`.
 /// ```no_run
 /// # use godot::prelude::*;
 /// # fn some_object() -> Gd<Object> { unimplemented!() }
 /// let mut obj: Gd<Object> = some_object();
-/// obj.call("some_method", vslice![Vector2i::new(1, 2), Variant::nil()]);
+///
+/// obj.call("some_method", vslice![
+///     Vector2i::new(1, 2),
+///     Variant::nil(),
+/// ]);
 /// ```
 ///
 /// # See also
-/// To create typed and untyped `Array`s, use the [`array!`] and [`varray!`] macros respectively.
+/// To create typed and untyped `Array`s, use the [`array!`] macro and its variants.
 ///
 /// For dictionaries, a similar macro [`vdict!`] exists.
 #[macro_export]
 macro_rules! vslice {
-    // Note: use to_variant() and not Variant::from(), as that works with both references and values
-    ($($elements:expr),* $(,)?) => {
-        {
-            use $crate::meta::ToGodot as _;
-            let mut array = $crate::builtin::VariantArray::default();
-            &[
-                $( $elements.to_variant(), )*
-            ]
-        }
+    // Note: use to_variant() and not Variant::from(), as that works with both references and values.
+    ($($elements:expr_2021),* $(,)?) => {
+        &[$( $crate::meta::ToGodot::to_variant(&$elements), )*]
     };
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
+// Serde support
 
 #[cfg(feature = "serde")]
 mod serialize {
-    use super::*;
+    use std::marker::PhantomData;
+
     use serde::de::{SeqAccess, Visitor};
     use serde::ser::SerializeSeq;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::marker::PhantomData;
+
+    use super::*;
 
     impl<T> Serialize for Array<T>
     where
-        T: ArrayElement + Serialize,
+        T: Element + Serialize,
     {
         #[inline]
         fn serialize<S>(
@@ -1651,7 +1664,7 @@ mod serialize {
 
     impl<'de, T> Deserialize<'de> for Array<T>
     where
-        T: ArrayElement + Deserialize<'de>,
+        T: Element + Deserialize<'de>,
     {
         #[inline]
         fn deserialize<D>(deserializer: D) -> Result<Self, <D as Deserializer<'de>>::Error>
@@ -1661,7 +1674,7 @@ mod serialize {
             struct ArrayVisitor<T>(PhantomData<T>);
             impl<'de, T> Visitor<'de> for ArrayVisitor<T>
             where
-                T: ArrayElement + Deserialize<'de>,
+                T: Element + Deserialize<'de>,
             {
                 type Value = Array<T>;
 
@@ -1687,4 +1700,37 @@ mod serialize {
             deserializer.deserialize_seq(ArrayVisitor::<T>(PhantomData))
         }
     }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Tests
+
+/// Verifies that `AnyArray::try_cast*()` cannot be called on concrete arrays.
+///
+/// > error[E0507]: cannot move out of dereference of `godot::prelude::Array<i64>`
+///
+/// ```compile_fail
+/// use godot::prelude::*;
+/// let a: Array<i64> = array![1, 2, 3];
+/// a.try_cast_var_array();
+/// ```
+///
+/// ```compile_fail
+/// use godot::prelude::*;
+/// let a: VarArray = varray![1, 2, 3];
+/// a.try_cast_array::<i64>();
+/// ```
+///
+/// This works:
+/// ```no_run
+/// use godot::prelude::*;
+/// let a: VarArray = varray![1, 2, 3];
+/// a.upcast_any_array().try_cast_array::<i64>();
+/// ```
+fn __cannot_downcast_from_concrete() {}
+
+#[test]
+fn correct_variant_t() {
+    assert!(Array::<Variant>::has_variant_t());
+    assert!(!Array::<i64>::has_variant_t());
 }

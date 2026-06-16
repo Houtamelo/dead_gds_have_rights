@@ -27,15 +27,13 @@ pub mod init;
 pub mod meta;
 pub mod obj;
 pub mod registry;
-#[cfg(since_api = "4.2")]
 pub mod task;
-#[cfg(before_api = "4.2")]
-pub mod task {}
 pub mod tools;
 
 mod storage;
-pub use crate::private::{get_gdext_panic_context, set_gdext_hook};
 pub use godot_ffi as sys;
+
+pub use crate::private::{fetch_last_panic_context, set_gdext_hook};
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Validations (see also godot/lib.rs)
@@ -55,7 +53,8 @@ compile_error!("Generating editor docs for Rust symbols requires at least Godot 
 #[allow(clippy::upper_case_acronyms)] // TODO remove this line once we transform names
 #[allow(clippy::needless_lifetimes)]  // the following explicit lifetimes could be elided: 'a
 #[allow(unreachable_code, clippy::unimplemented)] // TODO remove once #153 is implemented
-mod gen {
+#[allow(unsafe_op_in_unsafe_fn)] // FFI delegation, safety delegated to Godot C API contract
+mod r#gen {
     include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 }
 
@@ -74,3 +73,33 @@ pub mod private;
 /// Re-export logging macro.
 #[doc(hidden)]
 pub use godot_ffi::out;
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+/// Tests for code that must not compile.
+///
+/// To add a new one, simply add a new `__*` named function with a `compile_fail` doc attribute.
+mod no_compile_tests {
+    /// With Godot 4.6+, functions with required parameters accept `Gd<T>` instead of `Option<Gd<T>>`.
+    ///
+    /// ```compile_fail
+    /// use godot::prelude::*;
+    /// let mut node: Gd<Node> = unimplemented!();
+    /// let option = Some(node.clone());
+    /// let option: Option<&Gd<Node>> = option.as_ref();
+    ///
+    /// // Following must not compile since `add_child` accepts only required (non-null) arguments.
+    /// node.add_child(option);
+    /// ```
+    ///
+    /// Sanity check that without the last line, it _does_ compile. This catches any regressions in the previous statements that would not
+    /// be caught by the above `compile_fail` test.
+    /// ```no_run
+    /// use godot::prelude::*;
+    /// let mut node: Gd<Node> = unimplemented!();
+    /// let option = Some(node.clone());
+    /// let option: Option<&Gd<Node>> = option.as_ref();
+    /// ```
+    #[cfg(since_api = "4.6")]
+    fn __required_param_must_not_take_option() {}
+}

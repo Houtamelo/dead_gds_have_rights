@@ -4,6 +4,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+
+use std::path::Path;
+
+use proc_macro2::{Ident, TokenStream};
+use quote::{format_ident, quote};
+
 use crate::context::{Context, NotificationEnum};
 use crate::generator::functions_common::{FnCode, FnDefinition, FnDefinitions};
 use crate::generator::method_tables::MethodTableKey;
@@ -15,10 +21,7 @@ use crate::models::domain::{
     ModName, TyName,
 };
 use crate::util::{ident, make_string_name};
-use crate::{util, SubmitFn};
-use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote};
-use std::path::Path;
+use crate::{SubmitFn, util};
 
 pub fn generate_class_files(
     api: &ExtensionApi,
@@ -77,10 +80,10 @@ struct GeneratedClassModule {
 }
 
 struct Construction {
-    constructor: TokenStream,
     construct_doc: &'static str,
     final_doc: Option<&'static str>,
     godot_default_impl: TokenStream,
+    singleton_impl: TokenStream,
 }
 
 fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClass {
@@ -88,7 +91,6 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
 
     // Strings
     let godot_class_str = &class_name.godot_ty;
-    let class_name_cstr = util::c_str(godot_class_str);
 
     // Idents and tokens
     let (base_ty, base_ident_opt) = match class.base_class.as_ref() {
@@ -99,10 +101,10 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
     };
 
     let Construction {
-        constructor,
         construct_doc,
         final_doc,
         godot_default_impl,
+        singleton_impl,
     } = make_constructor_and_default(class, ctx);
 
     let mut extended_class_doc = construct_doc.replace("Self", &class_name.rust_ty.to_string());
@@ -190,11 +192,14 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
     let (assoc_memory, assoc_dyn_memory, is_exportable) = make_bounds(class, ctx);
 
     let internal_methods = quote! {
-        fn __checked_id(&self) -> Option<crate::obj::InstanceId> {
-            // SAFETY: only Option due to layout-compatibility with RawGd<T>; it is always Some because stored in Gd<T> which is non-null.
-            let rtti = unsafe { self.rtti.as_ref().unwrap_unchecked() };
-            let instance_id = rtti.check_type::<Self>();
-            Some(instance_id)
+        /// Creates a validated object for FFI boundary crossing.
+        ///
+        /// Low-level internal method. Validation (liveness/type checks) depend on safeguard level.
+        fn __validated_obj(&self) -> crate::obj::ValidatedObject {
+            // SAFETY: Self has the same layout as RawGd<Self> (object_ptr + rtti fields in same order).
+            let raw_gd = unsafe { std::mem::transmute::<&Self, &crate::obj::RawGd<Self>>(self) };
+
+            raw_gd.validated_object()
         }
 
         #[doc(hidden)]
@@ -231,7 +236,7 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
             #interface_trait
             #notification_enum
             impl #class_name {
-                #constructor
+                // Constructors all through traits: NewGd, NewAlloc, Singleton.
                 #methods
                 #notify_methods
                 #internal_methods
@@ -241,11 +246,11 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
                 type Base = #base_ty;
 
                 // Code duplicated in godot-macros.
-                fn class_name() -> ClassName {
+                fn class_id() -> ClassId {
                     // Optimization note: instead of lazy init, could use separate static which is manually initialized during registration.
-                    static CLASS_NAME: std::sync::OnceLock<ClassName> = std::sync::OnceLock::new();
+                    static CLASS_ID: std::sync::OnceLock<ClassId> = std::sync::OnceLock::new();
 
-                    let name: &'static ClassName = CLASS_NAME.get_or_init(|| ClassName::alloc_next_ascii(#class_name_cstr));
+                    let name: &'static ClassId = CLASS_ID.get_or_init(|| ClassId::__alloc_next_unicode(#godot_class_str));
                     *name
                 }
 
@@ -264,6 +269,7 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
             )*
 
             #godot_default_impl
+            #singleton_impl
             #deref_impl
             #inherits_macro_code
         }
@@ -418,37 +424,21 @@ fn make_constructor_and_default(class: &Class, ctx: &Context) -> Construction {
     let class_name = class.name();
 
     let godot_class_stringname = make_string_name(&class_name.godot_ty);
-    // Note: this could use class_name() but is not yet done due to potential future lazy-load refactoring.
-    //let class_name_obj = quote! { <Self as crate::obj::GodotClass>::class_name() };
+    // Note: this could use class_id() but is not yet done due to potential future lazy-load refactoring.
+    //let class_name_obj = quote! { <Self as crate::obj::GodotClass>::class_id() };
 
-    let (constructor, construct_doc, has_godot_default_impl);
+    let (construct_doc, has_godot_default_impl);
     if ctx.is_singleton(class_name) {
-        // Note: we cannot return &'static mut Self, as this would be very easy to mutably alias.
-        // &'static Self would be possible, but we would lose the whole mutability information (even if that is best-effort and
-        // not strict Rust mutability, it makes the API much more usable).
-        // As long as the user has multiple Gd smart pointers to the same singletons, only the internal raw pointers are aliased.
-        // See also Deref/DerefMut impl for Gd.
-        constructor = quote! {
-            pub fn singleton() -> Gd<Self> {
-                unsafe {
-                    let __class_name = #godot_class_stringname;
-                    let __object_ptr = sys::interface_fn!(global_get_singleton)(__class_name.string_sys());
-                    Gd::from_obj_sys(__object_ptr)
-                }
-            }
-        };
         construct_doc = "# Singleton\n\n\
-            This class is a singleton. You can get the one instance using [`Self::singleton()`][Self::singleton].";
+            This class is a singleton. You can get the one instance using [`Singleton::singleton()`][crate::obj::Singleton::singleton].";
         has_godot_default_impl = false;
     } else if !class.is_instantiable {
         // Abstract base classes or non-singleton classes without constructor.
-        constructor = TokenStream::new();
         construct_doc = "# Not instantiable\n\nThis class cannot be constructed. Obtain `Gd<Self>` instances via Godot APIs.";
         has_godot_default_impl = false;
     } else {
         // Manually managed classes (Object, Node, ...) as well as ref-counted ones (RefCounted, Resource, ...).
         // The constructors are provided as associated methods in NewGd::new_gd() and NewAlloc::new_alloc().
-        constructor = TokenStream::new();
 
         if class.is_refcounted {
             construct_doc = "# Construction\n\n\
@@ -485,11 +475,25 @@ fn make_constructor_and_default(class: &Class, ctx: &Context) -> Construction {
         TokenStream::new()
     };
 
+    let singleton_impl = if ctx.is_singleton(class_name) {
+        let class_name = &class.name().rust_ty;
+        quote! {
+            impl crate::obj::Singleton for #class_name {
+                fn singleton() -> crate::obj::Gd<Self> {
+                    // SAFETY: Class name matches type T, per code generator.
+                    unsafe { crate::classes::singleton_unchecked(&#godot_class_stringname) }
+                }
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
     Construction {
-        constructor,
         construct_doc,
         final_doc,
         godot_default_impl,
+        singleton_impl,
     }
 }
 
@@ -582,10 +586,10 @@ fn make_class_method_definition(
 
     let table_index = ctx.get_table_index(&MethodTableKey::from_class(class, method));
 
-    let maybe_instance_id = if method.qualifier() == FnQualifier::Static {
+    let validated_obj = if method.qualifier() == FnQualifier::Static {
         quote! { None }
     } else {
-        quote! { self.__checked_id() }
+        quote! { Some(self.__validated_obj()) }
     };
 
     let fptr_access = if cfg!(feature = "codegen-lazy-fptrs") {
@@ -601,7 +605,6 @@ fn make_class_method_definition(
         quote! { fptr_by_index(#table_index) }
     };
 
-    let object_ptr = &receiver.ffi_arg;
     let ptrcall_invocation = quote! {
         let method_bind = sys::#get_method_table().#fptr_access;
 
@@ -609,8 +612,7 @@ fn make_class_method_definition(
             method_bind,
             #rust_class_name,
             #rust_method_name,
-            #object_ptr,
-            #maybe_instance_id,
+            #validated_obj,
             args,
         )
     };
@@ -622,8 +624,7 @@ fn make_class_method_definition(
             method_bind,
             #rust_class_name,
             #rust_method_name,
-            #object_ptr,
-            #maybe_instance_id,
+            #validated_obj,
             args,
             varargs
         )
@@ -638,7 +639,6 @@ fn make_class_method_definition(
             is_virtual_required: false,
             is_varcall_fallible: true,
         },
-        None,
         cfg_attributes,
     )
 }

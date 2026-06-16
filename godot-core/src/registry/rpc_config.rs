@@ -5,10 +5,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::builtin::{Dictionary, StringName};
+use crate::builtin::{StringName, VarDictionary};
+use crate::classes::Node;
 use crate::classes::multiplayer_api::RpcMode;
 use crate::classes::multiplayer_peer::TransferMode;
-use crate::classes::Node;
 use crate::meta::{AsArg, ToGodot};
 use crate::{arg_into_ref, vdict};
 
@@ -43,13 +43,13 @@ impl RpcConfig {
         node.rpc_config(method_name, &self.to_dictionary().to_variant());
     }
 
-    /// Returns a [`Dictionary`] populated with the values required for a call to [`Node::rpc_config()`].
-    pub fn to_dictionary(&self) -> Dictionary {
+    /// Returns an untyped `Dictionary` populated with the values required for a call to [`Node::rpc_config()`].
+    pub fn to_dictionary(&self) -> VarDictionary {
         vdict! {
-            "rpc_mode": self.rpc_mode,
-            "transfer_mode": self.transfer_mode,
-            "call_local": self.call_local,
-            "channel": self.channel,
+            "rpc_mode" => self.rpc_mode,
+            "transfer_mode" => self.transfer_mode,
+            "call_local" => self.call_local,
+            "channel" => self.channel,
         }
     }
 }

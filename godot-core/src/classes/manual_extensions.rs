@@ -4,9 +4,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+
+//! Adds new convenience APIs to existing classes.
+//!
+//! This should not add new functionality, but provide existing one in a slightly nicer way to use. Generally, we should be conservative
+//! about adding methods here, as it's a potentially endless quest, and many are better suited in high-level APIs or third-party crates.
+//!
+//! See also sister module [super::type_safe_replacements].
+
 use crate::builtin::NodePath;
 use crate::classes::{Node, PackedScene};
-use crate::meta::{arg_into_ref, AsArg};
+use crate::meta::{AsArg, arg_into_ref};
 use crate::obj::{Gd, Inherits};
 
 /// Manual extensions for the `Node` class.
@@ -24,7 +32,7 @@ impl Node {
         self.try_get_node_as(path).unwrap_or_else(|| {
             panic!(
                 "There is no node of type {ty} at path `{path}`",
-                ty = T::class_name()
+                ty = T::class_id()
             )
         })
     }
@@ -58,7 +66,7 @@ impl PackedScene {
         T: Inherits<Node>,
     {
         self.try_instantiate_as::<T>()
-            .unwrap_or_else(|| panic!("Failed to instantiate {to}", to = T::class_name()))
+            .unwrap_or_else(|| panic!("Failed to instantiate {to}", to = T::class_id()))
     }
 
     /// Instantiates the scene as type `T` (fallible).

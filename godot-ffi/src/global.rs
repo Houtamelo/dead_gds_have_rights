@@ -103,8 +103,9 @@ impl<T> Global<T> {
 
 // Encapsulate private fields.
 mod global_guard {
-    use super::*;
     use std::ops::{Deref, DerefMut};
+
+    use super::*;
 
     /// Guard that temporarily gives access to a `Global<T>`'s inner value.
     pub struct GlobalGuard<'a, T> {
@@ -126,11 +127,12 @@ mod global_guard {
         ///
         /// The value must be initialized.
         pub(super) unsafe fn new_unchecked(mutex_guard: MutexGuard<'a, OnceCell<T>>) -> Self {
-            debug_assert!(
+            crate::strict_assert!(
                 mutex_guard.get().is_some(),
                 "safety precondition violated: cell not initialized"
             );
-            Self::new(mutex_guard).unwrap_unchecked()
+
+            unsafe { Self::new(mutex_guard).unwrap_unchecked() }
         }
     }
 
@@ -169,8 +171,9 @@ pub enum GlobalLockError<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     static MAP: Global<HashMap<i32, &'static str>> = Global::default();
     static VEC: Global<Vec<i32>> = Global::new(|| vec![1, 2, 3]);
@@ -208,7 +211,12 @@ mod tests {
         assert_eq!(*vec, &[1, 2, 3, 4]);
     }
 
+    // TODO(v0.6): Figure out if this can be made to work, or if this is expected behavior in Wasm.
     #[test]
+    #[cfg_attr(
+        all(target_family = "wasm", not(target_feature = "atomics")),
+        ignore = "Single-threaded Wasm semantics differ"
+    )]
     fn test_global_would_block() {
         let vec = VEC.lock();
 

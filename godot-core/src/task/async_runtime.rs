@@ -34,8 +34,8 @@ use crate::private::handle_panic;
 ///
 /// [`Signal::to_future()`]: crate::builtin::Signal::to_future
 /// [`Signal::to_fallible_future()`]: crate::builtin::Signal::to_fallible_future
-/// [`TypedSignal::to_future()`]: crate::registry::signal::TypedSignal::to_future
-/// [`TypedSignal::to_fallible_future()`]: crate::registry::signal::TypedSignal::to_fallible_future
+/// [`TypedSignal::to_future()`]: crate::obj::signal::TypedSignal::to_future
+/// [`TypedSignal::to_fallible_future()`]: crate::obj::signal::TypedSignal::to_fallible_future
 ///
 /// # Panics
 /// If called from any other thread than the main thread.
@@ -411,11 +411,9 @@ fn poll_future(godot_waker: Arc<GodotWaker>) {
     let current_thread = thread::current().id();
 
     assert_eq!(
-        godot_waker.thread_id,
-        current_thread,
+        godot_waker.thread_id, current_thread,
         "trying to poll future on a different thread!\n  Current thread: {:?}\n  Future thread: {:?}",
-        current_thread,
-        godot_waker.thread_id,
+        current_thread, godot_waker.thread_id,
     );
 
     let waker = Waker::from(godot_waker.clone());
@@ -443,7 +441,7 @@ fn poll_future(godot_waker: Arc<GodotWaker>) {
         return;
     };
 
-    let error_context = || "Godot async task failed".to_string();
+    let error_context = || format!("async task #{}", godot_waker.task_id);
 
     // If Future::poll() panics, the future is immediately dropped and cannot be accessed again,
     // thus any state that may not have been unwind-safe cannot be observed later.
@@ -500,13 +498,13 @@ impl Wake for GodotWaker {
         /// This appears to be a common issue: https://github.com/rust-lang/rust/issues/89976
         fn callback_type_hint<F>(f: F) -> F
         where
-            F: for<'a> FnMut(&'a [&Variant]) -> Result<Variant, ()>,
+            F: for<'a> FnMut(&'a [&Variant]) -> Variant,
         {
             f
         }
 
         #[cfg(not(feature = "experimental-threads"))]
-        let create_callable = Callable::from_local_fn;
+        let create_callable = Callable::from_fn;
 
         #[cfg(feature = "experimental-threads")]
         let create_callable = Callable::from_sync_fn;
@@ -515,7 +513,7 @@ impl Wake for GodotWaker {
             "GodotWaker::wake",
             callback_type_hint(move |_args| {
                 poll_future(waker.take().expect("Callable will never be called again"));
-                Ok(Variant::nil())
+                Variant::nil()
             }),
         );
 

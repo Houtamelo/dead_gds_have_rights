@@ -5,15 +5,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-#![cfg(since_api = "4.2")]
+use godot::builtin::{Callable, Signal};
+use godot::classes::Object;
+use godot::obj::{Base, Gd, NewAlloc};
+use godot::register::{GodotClass, godot_api};
+use godot::signal::ConnectHandle;
 
-use crate::framework::{expect_debug_panic_or_release_ok, expect_panic, itest};
-use godot::{
-    builtin::{Callable, Signal},
-    classes::Object,
-    obj::{Base, Gd, NewAlloc},
-    register::{godot_api, ConnectHandle, GodotClass},
-};
+use crate::framework::{expect_panic, expect_panic_or_nothing, itest};
 
 #[derive(GodotClass)]
 #[class(init, base=Object)]
@@ -226,7 +224,7 @@ fn test_handle_recognizes_non_valid_state(disconnect_function: impl FnOnce(&mut 
     let is_valid = handle.is_connected();
     assert!(!is_valid);
 
-    expect_debug_panic_or_release_ok("disconnect invalid handle", || {
+    expect_panic_or_nothing("disconnect invalid handle", || {
         handle.disconnect();
     });
 

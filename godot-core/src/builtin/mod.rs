@@ -13,46 +13,63 @@
 //! API design behind the builtin types (and some wider parts of the library) is elaborated in the
 //! [extended documentation page](../__docs/index.html#builtin-api-design).
 
-// Re-export macros.
-#[allow(deprecated)] // dict
-pub use crate::{array, dict, real, reals, varray, vdict};
-
 // Re-export generated enums.
-pub use crate::gen::central::global_reexported_enums::{Corner, EulerOrder, Side, VariantOperator};
 // Not yet public.
-pub(crate) use crate::gen::central::VariantDispatch;
+pub(crate) use crate::r#gen::central::VariantDispatch;
+pub use crate::r#gen::central::global_reexported_enums::{
+    Corner, EulerOrder, Side, VariantOperator,
+};
 pub use crate::sys::VariantType;
+// Re-export macros.
+pub use crate::{array, dict, iarray, idict, real, reals, varray, vdict};
+
+/// Abbreviation for occasionally used _owned or borrowed string_.
+#[doc(hidden)]
+pub type CowStr = std::borrow::Cow<'static, str>;
 
 #[doc(hidden)]
 pub mod __prelude_reexport {
+    #[rustfmt::skip] // Do not reorder.
     use super::*;
 
-    pub use super::math::XformInv;
     pub use aabb::*;
-    pub use basis::*;
     pub use callable::*;
     pub use collections::containers::*;
     pub use color::*;
     pub use color_hsv::*;
+    pub use matrices::*;
     pub use plane::*;
-    pub use projection::*;
     pub use quaternion::*;
     pub use real_inner::*;
     pub use rect2::*;
     pub use rect2i::*;
     pub use rid::*;
     pub use signal::*;
-    pub use string::{Encoding, GString, NodePath, StringName};
-    pub use transform2d::*;
-    pub use transform3d::*;
+    pub use strings::{Encoding, GString, NodePath, StringName};
     pub use variant::*;
     pub use vectors::*;
 
-    pub use super::{EulerOrder, Side, VariantOperator, VariantType};
-    pub use crate::{array, real, reals, varray, vdict, vslice};
+    pub use super::math::XformInv;
+    pub use super::{EulerOrder, VariantOperator, VariantType};
+    #[cfg(feature = "trace")] // Test only.
+    pub use crate::static_sname;
+    pub use crate::{array, dict, iarray, idict, real, reals, varray, vdict, vslice};
+}
 
-    #[allow(deprecated)]
-    pub use crate::dict;
+pub use crate::r#gen::builtin_classes::*;
+
+/// Manual symbols and default extenders for builtin type [`GString`].
+pub mod gstring {
+    pub use crate::builtin::strings::{GStringExFind as ExFind, GStringExSplit as ExSplit};
+    pub use crate::r#gen::builtin_classes::gstring::*;
+}
+
+/// Manual symbols and default extenders for builtin type [`StringName`].
+pub mod string_name {
+    pub use crate::builtin::strings::{
+        StringNameExFind as ExFind, StringNameExSplit as ExSplit, TransientStringNameOrd,
+    };
+    pub use crate::r#gen::builtin_classes::string_name::*;
 }
 
 pub use __prelude_reexport::*;
@@ -61,15 +78,13 @@ pub use __prelude_reexport::*;
 pub mod math;
 
 /// Iterator types for arrays and dictionaries.
+// Might rename this to `collections` or so.
 pub mod iter {
     pub use super::collections::iterators::*;
 }
 
-/// Specialized types related to Godot's various string implementations.
-pub mod strings {
-    pub use super::string::{
-        ExGStringFind, ExGStringSplit, ExStringNameFind, ExStringNameSplit, TransientStringNameOrd,
-    };
+pub(crate) mod meta_reexport {
+    pub use super::collections::PackedElement;
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -80,22 +95,19 @@ mod macros;
 
 // Other modules
 mod aabb;
-mod basis;
 mod callable;
 mod collections;
 mod color;
 mod color_constants; // After color, so that constants are listed after methods in docs (alphabetic ensures that).
 mod color_hsv;
+mod matrices;
 mod plane;
-mod projection;
 mod quaternion;
 mod rect2;
 mod rect2i;
 mod rid;
 mod signal;
-mod string;
-mod transform2d;
-mod transform3d;
+mod strings;
 mod variant;
 mod vectors;
 
@@ -105,18 +117,27 @@ mod real_inner;
 
 #[doc(hidden)]
 pub mod inner {
-    pub use crate::gen::builtin_classes::*;
+    pub use crate::r#gen::builtin_classes::*;
 }
+
+#[macro_export]
+macro_rules! declare_hash_u32_method {
+    ( $( $docs:tt )+ ) => {
+        $( $docs )+
+        pub fn hash_u32(&self) -> u32 {
+            self.as_inner().hash().try_into().expect("Godot hashes are uint32_t")
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Conversion functions
 
 pub(crate) fn to_i64(i: usize) -> i64 {
     i.try_into().unwrap()
 }
 
 pub(crate) fn to_usize(i: i64) -> usize {
-    i.try_into().unwrap()
-}
-
-pub(crate) fn to_isize(i: usize) -> isize {
     i.try_into().unwrap()
 }
 

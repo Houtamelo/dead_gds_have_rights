@@ -7,41 +7,12 @@
 
 //! Functions and macros that are not very specific to gdext, but come in handy.
 
-use crate as sys;
 use std::fmt::{Display, Write};
+
+use crate as sys;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Macros
-
-/// Verifies a condition at compile time.
-// https://blog.rust-lang.org/2021/12/02/Rust-1.57.0.html#panic-in-const-contexts
-#[macro_export]
-macro_rules! static_assert {
-    ($cond:expr) => {
-        const _: () = assert!($cond);
-    };
-    ($cond:expr, $msg:literal) => {
-        const _: () = assert!($cond, $msg);
-    };
-}
-
-/// Verifies at compile time that two types `T` and `U` have the same size and alignment.
-#[macro_export]
-macro_rules! static_assert_eq_size_align {
-    ($T:ty, $U:ty) => {
-        godot_ffi::static_assert!(
-            std::mem::size_of::<$T>() == std::mem::size_of::<$U>()
-                && std::mem::align_of::<$T>() == std::mem::align_of::<$U>()
-        );
-    };
-    ($T:ty, $U:ty, $msg:literal) => {
-        godot_ffi::static_assert!(
-            std::mem::size_of::<$T>() == std::mem::size_of::<$U>()
-                && std::mem::align_of::<$T>() == std::mem::align_of::<$U>(),
-            $msg
-        );
-    };
-}
 
 /// Trace output.
 #[cfg(feature = "debug-log")]
@@ -70,7 +41,7 @@ macro_rules! out {
 ///
 /// ```ignore
 ///  let get_godot_version = get_proc_address(sys::c_str(b"get_godot_version\0"));
-///  let get_godot_version = sys::cast_fn_ptr!(get_godot_version as sys::GDExtensionInterfaceGetGodotVersion);
+///  let get_godot_version = sys::unsafe_cast_fn_ptr!(get_godot_version as sys::GDExtensionInterfaceGetGodotVersion);
 /// ```
 ///
 /// # Safety
@@ -128,7 +99,7 @@ where
 #[inline]
 pub fn c_str(s: &[u8]) -> *const std::ffi::c_char {
     // Ensure null-terminated
-    debug_assert!(!s.is_empty() && s[s.len() - 1] == 0);
+    crate::strict_assert!(!s.is_empty() && s[s.len() - 1] == 0);
 
     s.as_ptr() as *const std::ffi::c_char
 }
@@ -191,6 +162,20 @@ pub fn i64_to_ordering(value: i64) -> std::cmp::Ordering {
         0 => std::cmp::Ordering::Equal,
         1 => std::cmp::Ordering::Greater,
         _ => panic!("cannot convert value {value} to cmp::Ordering"),
+    }
+}
+
+/// Converts a Godot "found" index `Option<usize>`, where -1 is mapped to `None`.
+pub fn found_to_option(index: i64) -> Option<usize> {
+    if index == -1 {
+        None
+    } else {
+        // If this fails, then likely because we overlooked a negative value.
+        let index_usize = index
+            .try_into()
+            .unwrap_or_else(|_| panic!("unexpected index {index} returned from Godot function"));
+
+        Some(index_usize)
     }
 }
 
@@ -285,7 +270,7 @@ pub(crate) type GetClassMethod = unsafe extern "C" fn(
 ) -> sys::GDExtensionMethodBindPtr;
 
 /// Newtype around `GDExtensionMethodBindPtr` so we can implement `Sync` and `Send` for it manually.    
-#[derive(Clone, Copy)]
+#[derive(Copy, Clone)]
 pub struct ClassMethodBind(pub sys::GDExtensionMethodBindPtr);
 
 // SAFETY: `sys::GDExtensionMethodBindPtr` is effectively the same as a `unsafe extern "C" fn`. So sharing it between
@@ -401,10 +386,14 @@ pub(crate) fn load_utility_function(
     })
 }
 
-pub(crate) fn read_version_string(version_ptr: &sys::GDExtensionGodotVersion) -> String {
-    let char_ptr = version_ptr.string;
-
-    // SAFETY: GDExtensionGodotVersion has the (manually upheld) invariant of a valid string field.
+/// Extracts the version string from a Godot version struct.
+///
+/// Works transparently with both `GDExtensionGodotVersion` and `GDExtensionGodotVersion2`.
+///
+/// # Safety
+/// The `char_ptr` must point to a valid C string.
+pub(crate) unsafe fn read_version_string(char_ptr: *const std::ffi::c_char) -> String {
+    // SAFETY: Caller guarantees the pointer is valid.
     let c_str = unsafe { std::ffi::CStr::from_ptr(char_ptr) };
 
     let full_version = c_str.to_str().unwrap_or("(invalid UTF-8 in version)");

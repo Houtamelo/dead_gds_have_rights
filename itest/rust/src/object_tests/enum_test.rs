@@ -5,15 +5,17 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::itest;
+use std::collections::HashSet;
+
 use godot::builtin::varray;
 use godot::classes::input::CursorShape;
 use godot::classes::mesh::PrimitiveType;
 use godot::classes::window::LayoutDirection;
-use godot::classes::{time, ArrayMesh};
+use godot::classes::{ArrayMesh, time};
 use godot::global::{Key, Orientation};
 use godot::obj::{EngineEnum, NewGd};
-use std::collections::HashSet;
+
+use crate::framework::itest;
 
 #[itest]
 fn enum_ords() {
@@ -66,10 +68,10 @@ fn enum_hash() {
     assert_eq!(months.len(), 12, "hash collisions in constants");
 }
 
-// Testing https://github.com/godot-rust/gdext/issues/335
+// Tests https://github.com/godot-rust/gdext/issues/335.
 // This fails upon calling the function, we don't actually need to make a good call.
 #[itest]
-fn add_surface_from_arrays() {
+fn enum_add_surface_from_arrays() {
     let mut mesh = ArrayMesh::new_gd();
     mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, &varray![]);
 }
@@ -110,29 +112,6 @@ fn enum_godot_name() {
 
     // Unknown enumerators (might come from the future).
     assert_eq!(godot_name(Key::from_ord(1234)), "");
-}
-
-#[itest]
-#[expect(deprecated)]
-fn enum_godot_name_deprecated() {
-    use godot::obj::EngineEnum;
-    assert_eq!(
-        Orientation::VERTICAL.godot_name(),
-        Orientation::VERTICAL.as_str()
-    );
-    assert_eq!(
-        Orientation::HORIZONTAL.godot_name(),
-        Orientation::HORIZONTAL.as_str()
-    );
-
-    assert_eq!(Key::NONE.godot_name(), "KEY_NONE");
-    assert_eq!(Key::SPECIAL.godot_name(), "KEY_SPECIAL");
-    assert_eq!(Key::ESCAPE.godot_name(), "KEY_ESCAPE");
-    assert_eq!(Key::TAB.godot_name(), "KEY_TAB");
-    assert_eq!(Key::A.godot_name(), "KEY_A");
-
-    // Unknown enumerators (might come from the future).
-    assert_eq!(Key::from_ord(1234).godot_name(), "");
 }
 
 fn godot_name<T: EngineEnum + Eq + PartialEq + 'static>(value: T) -> &'static str {

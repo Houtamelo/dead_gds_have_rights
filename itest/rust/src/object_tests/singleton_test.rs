@@ -5,10 +5,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::itest;
 use godot::builtin::GString;
 use godot::classes::{Input, Os};
-use godot::obj::Gd;
+use godot::obj::{Gd, Singleton};
+use godot::register::{GodotClass, godot_api};
+
+use crate::framework::itest;
 
 #[itest]
 fn singleton_is_unique() {
@@ -42,4 +44,24 @@ fn singleton_is_operational() {
 
     let read_value = os.get_environment(&key);
     assert_eq!(read_value, value);
+}
+
+#[itest]
+fn user_singleton() {
+    // Must be registered with the library and accessible at this point.
+    let value = SomeUserSingleton::singleton().bind().some_method();
+    assert_eq!(value, 42);
+}
+
+#[derive(GodotClass)]
+// `#[class(tool, base = Object)]` is implied by `#[class(singleton)]`.
+#[class(init, singleton)]
+struct SomeUserSingleton {}
+
+#[godot_api]
+impl SomeUserSingleton {
+    #[func]
+    fn some_method(&self) -> u32 {
+        42
+    }
 }

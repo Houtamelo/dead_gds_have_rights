@@ -4,126 +4,61 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-
-use godot::builtin::{vdict, vslice, Color, Dictionary, GString, Variant, VariantType};
-use godot::classes::{INode, IRefCounted, Node, Object, RefCounted, Resource, Texture};
-use godot::global::{PropertyHint, PropertyUsageFlags};
-use godot::meta::{GodotConvert, PropertyHintInfo, ToGodot};
-use godot::obj::{Base, EngineBitfield, EngineEnum, Gd, NewAlloc, NewGd, OnEditor};
+use godot::builtin::{
+    Color, GString, PackedInt32Array, VarDictionary, Variant, VariantType, vdict, vslice,
+};
+use godot::classes::{INode, IRefCounted, Node, Object, RefCounted, Resource};
+use godot::init::GdextBuild;
+use godot::meta::shape::GodotShape;
+use godot::meta::{FromGodot, GodotConvert, ToGodot};
+use godot::obj::{Base, Gd, NewAlloc, NewGd, OnEditor};
+use godot::register::info::{ParamMetadata, PropertyHint, PropertyHintInfo, PropertyUsageFlags};
 use godot::register::property::{Export, Var};
-use godot::register::{godot_api, Export, GodotClass, GodotConvert, Var};
+use godot::register::{GodotClass, godot_api};
 use godot::test::itest;
-
-// No tests currently, tests using these classes are in Godot scripts.
 
 #[derive(GodotClass)]
 #[class(base=Node)]
 struct HasProperty {
     #[var]
-    int_val: i32,
-
-    #[var(get = get_int_val_read)]
-    int_val_read: i32,
-
-    #[var(set = set_int_val_write)]
-    int_val_write: i32,
-
-    #[var(get = get_int_val_rw, set = set_int_val_rw)]
-    int_val_rw: i32,
-
-    #[var(get = get_int_val_getter, set)]
-    int_val_getter: i32,
-
-    #[var(get, set = set_int_val_setter)]
-    int_val_setter: i32,
-
-    #[var(get = get_string_val, set = set_string_val)]
     string_val: GString,
 
     #[var(get = get_object_val, set = set_object_val)]
     object_val: Option<Gd<Object>>,
 
     #[var]
-    texture_val: OnEditor<Gd<Texture>>,
+    resource_var: OnEditor<Gd<Resource>>,
 
-    #[var(get = get_texture_val, set = set_texture_val, hint = RESOURCE_TYPE, hint_string = "Texture")]
-    texture_val_rw: Option<Gd<Texture>>,
+    #[var(get = get_resource_rw, set = set_resource_rw, hint = RESOURCE_TYPE, hint_string = "Resource")]
+    resource_rw: Option<Gd<Resource>>,
+
+    #[var]
+    packed_int_array: PackedInt32Array,
+
+    #[var(pub, rename = renamed_variable)]
+    unused_name: GString,
 }
 
 #[godot_api]
 impl HasProperty {
     #[func]
-    pub fn get_int_val_read(&self) -> i32 {
-        self.int_val_read
+    pub fn get_object_val(&self) -> Option<Gd<Object>> {
+        self.object_val.clone()
     }
 
     #[func]
-    pub fn set_int_val_write(&mut self, val: i32) {
-        self.int_val_write = val;
-    }
-
-    // Odd name to make sure it doesn't interfere with "get_*".
-    #[func]
-    pub fn retrieve_int_val_write(&mut self) -> i32 {
-        self.int_val_write
+    pub fn set_object_val(&mut self, val: Option<Gd<Object>>) {
+        self.object_val = val;
     }
 
     #[func]
-    pub fn get_int_val_rw(&self) -> i32 {
-        self.int_val_rw
+    pub fn get_resource_rw(&self) -> Option<Gd<Resource>> {
+        self.resource_rw.clone()
     }
 
     #[func]
-    pub fn set_int_val_rw(&mut self, val: i32) {
-        self.int_val_rw = val;
-    }
-
-    #[func]
-    pub fn get_int_val_getter(&self) -> i32 {
-        self.int_val_getter
-    }
-
-    #[func]
-    pub fn set_int_val_setter(&mut self, val: i32) {
-        self.int_val_setter = val;
-    }
-
-    #[func]
-    pub fn get_string_val(&self) -> GString {
-        self.string_val.clone()
-    }
-
-    #[func]
-    pub fn set_string_val(&mut self, val: GString) {
-        self.string_val = val;
-    }
-
-    #[func]
-    pub fn get_object_val(&self) -> Variant {
-        if let Some(object_val) = self.object_val.as_ref() {
-            object_val.to_variant()
-        } else {
-            Variant::nil()
-        }
-    }
-
-    #[func]
-    pub fn set_object_val(&mut self, val: Gd<Object>) {
-        self.object_val = Some(val);
-    }
-
-    #[func]
-    pub fn get_texture_val_rw(&self) -> Variant {
-        if let Some(texture_val) = self.texture_val_rw.as_ref() {
-            texture_val.to_variant()
-        } else {
-            Variant::nil()
-        }
-    }
-
-    #[func]
-    pub fn set_texture_val_rw(&mut self, val: Gd<Texture>) {
-        self.texture_val_rw = Some(val);
+    pub fn set_resource_rw(&mut self, val: Option<Gd<Resource>>) {
+        self.resource_rw = val;
     }
 }
 
@@ -131,18 +66,57 @@ impl HasProperty {
 impl INode for HasProperty {
     fn init(_base: Base<Node>) -> Self {
         HasProperty {
-            int_val: 0,
-            int_val_read: 2,
-            int_val_write: 0,
-            int_val_rw: 0,
-            int_val_getter: 0,
-            int_val_setter: 0,
-            object_val: None,
             string_val: GString::new(),
-            texture_val: OnEditor::default(),
-            texture_val_rw: None,
+            object_val: None,
+            resource_var: OnEditor::default(),
+            resource_rw: None,
+            packed_int_array: PackedInt32Array::new(),
+            unused_name: GString::new(),
         }
     }
+}
+
+#[itest]
+fn test_renamed_variable_reflection() {
+    let mut obj = HasProperty::new_alloc();
+
+    let prop_list = obj.get_property_list();
+    assert!(
+        prop_list
+            .iter_shared()
+            .any(|d| d.get("name") == Some("renamed_variable".to_variant()))
+    );
+    assert!(
+        !prop_list
+            .iter_shared()
+            .any(|d| d.get("name") == Some("unused_name".to_variant()))
+    );
+
+    assert_eq!(obj.get("renamed_variable"), GString::new().to_variant());
+    assert_eq!(obj.get("unused_name"), Variant::nil());
+
+    let new_value = "variable changed".to_variant();
+    obj.set("renamed_variable", &new_value);
+    obj.set("unused_name", &"something different".to_variant());
+    assert_eq!(obj.get("renamed_variable"), new_value);
+    assert_eq!(obj.get("unused_name"), Variant::nil());
+
+    obj.free();
+}
+
+#[itest]
+fn test_renamed_variable_getter_setter() {
+    let mut obj = HasProperty::new_alloc();
+    obj.bind_mut()
+        .set_renamed_variable(GString::from("changed"));
+
+    assert!(obj.has_method("get_renamed_variable"));
+    assert!(obj.has_method("set_renamed_variable"));
+    assert!(!obj.has_method("get_unused_name"));
+    assert!(!obj.has_method("get_unused_name"));
+    assert_eq!(obj.bind().get_renamed_variable(), "changed");
+
+    obj.free();
 }
 
 #[derive(Default, Copy, Clone)]
@@ -156,56 +130,92 @@ enum SomeCStyleEnum {
 
 impl GodotConvert for SomeCStyleEnum {
     type Via = i64;
+
+    // Deliberately uses GodotShape::Custom to test the legacy manual-impl path.
+    // Most user enums should use GodotShape::Enum instead (see ManualEnumShape below).
+    fn godot_shape() -> GodotShape {
+        GodotShape::Custom {
+            variant_type: VariantType::INT,
+            var_hint: PropertyHintInfo {
+                hint: PropertyHint::ENUM,
+                hint_string: GString::from("A,B,C"),
+            },
+            export_hint: PropertyHintInfo {
+                hint: PropertyHint::ENUM,
+                hint_string: GString::from("A,B,C"),
+            },
+            class_name: None,
+            usage_flags: PropertyUsageFlags::NONE,
+            metadata: ParamMetadata::NONE,
+        }
+    }
 }
 
 impl Var for SomeCStyleEnum {
-    fn get_property(&self) -> Self::Via {
-        (*self) as i64
+    type PubType = Self;
+
+    fn var_get(field: &Self) -> Self::Via {
+        (*field) as i64
     }
 
-    fn set_property(&mut self, value: Self::Via) {
+    fn var_set(field: &mut Self, value: Self::Via) {
         match value {
-            0 => *self = Self::A,
-            1 => *self = Self::B,
-            2 => *self = Self::C,
+            0 => *field = Self::A,
+            1 => *field = Self::B,
+            2 => *field = Self::C,
             other => panic!("unexpected variant {other}"),
         }
     }
-}
 
-impl Export for SomeCStyleEnum {
-    fn export_hint() -> PropertyHintInfo {
-        PropertyHintInfo {
-            hint: PropertyHint::ENUM,
-            hint_string: GString::from("A,B,C"),
-        }
+    fn var_pub_get(field: &Self) -> Self::PubType {
+        *field
+    }
+
+    fn var_pub_set(field: &mut Self, value: Self::PubType) {
+        *field = value;
     }
 }
 
-#[derive(Default)]
+impl Export for SomeCStyleEnum {}
+
+#[derive(Default, Clone)]
 struct NotExportable {
     a: i64,
     b: i64,
 }
 
 impl GodotConvert for NotExportable {
-    type Via = Dictionary;
+    type Via = VarDictionary;
+
+    fn godot_shape() -> GodotShape {
+        <VarDictionary as GodotConvert>::godot_shape()
+    }
 }
 
 impl Var for NotExportable {
-    fn get_property(&self) -> Self::Via {
+    type PubType = Self;
+
+    fn var_get(field: &Self) -> Self::Via {
         vdict! {
-            "a": self.a,
-            "b": self.b
+            "a" => field.a,
+            "b" => field.b
         }
     }
 
-    fn set_property(&mut self, value: Self::Via) {
+    fn var_set(field: &mut Self, value: Self::Via) {
         let a = value.get("a").unwrap().to::<i64>();
         let b = value.get("b").unwrap().to::<i64>();
 
-        self.a = a;
-        self.b = b;
+        field.a = a;
+        field.b = b;
+    }
+
+    fn var_pub_get(field: &Self) -> Self::PubType {
+        field.clone()
+    }
+
+    fn var_pub_set(field: &mut Self, value: Self::PubType) {
+        *field = value;
     }
 }
 
@@ -319,7 +329,9 @@ struct CheckAllExports {
     color_no_alpha: Color,
 }
 
-#[derive(GodotConvert, Var, Export, Eq, PartialEq, Debug)]
+// TODO(v0.6): consider if the below enums all need Clone -- they didn't in v0.4.
+// Reason is that #[derive(Var)] implements Var::var_pub_get() in a way that requires cloning, effectively requiring Clone.
+#[derive(GodotConvert, Var, Export, Clone, Eq, PartialEq, Debug)]
 #[godot(via = i64)]
 #[repr(i64)]
 pub enum TestEnum {
@@ -328,7 +340,7 @@ pub enum TestEnum {
     C = 2,
 }
 
-#[derive(GodotConvert, Var)]
+#[derive(Clone, GodotConvert, Var)]
 #[godot(via = i64)]
 pub enum Behavior {
     Peaceful,
@@ -336,7 +348,7 @@ pub enum Behavior {
     Aggressive = (3 + 4),
 }
 
-#[derive(GodotConvert, Var)]
+#[derive(Clone, GodotConvert, Var)]
 #[godot(via = GString)]
 pub enum StrBehavior {
     Peaceful,
@@ -346,36 +358,131 @@ pub enum StrBehavior {
 
 #[derive(GodotClass)]
 #[class(no_init)]
-pub struct DeriveProperty {
-    #[var]
+pub struct EnumVars {
+    #[var(pub)]
     pub my_enum: TestEnum,
+
+    #[var]
+    pub legacy_enum: TestEnum,
 }
 
 #[itest]
-fn derive_property() {
-    let mut class = DeriveProperty {
+fn property_enum_var() {
+    let mut obj = EnumVars {
         my_enum: TestEnum::B,
+        legacy_enum: TestEnum::B,
     };
-    assert_eq!(class.get_my_enum(), TestEnum::B as i64);
 
-    class.set_my_enum(TestEnum::C as i64);
-    assert_eq!(class.my_enum, TestEnum::C);
+    // From v0.5 and #[var(pub)] getters/setters use the Rust type directly (not Via type).
+    assert_eq!(obj.get_my_enum(), TestEnum::B);
+
+    obj.set_my_enum(TestEnum::C);
+    assert_eq!(obj.my_enum, TestEnum::C);
+}
+
+#[itest]
+#[expect(deprecated)]
+fn property_enum_var_legacy() {
+    let mut obj = EnumVars {
+        my_enum: TestEnum::B,
+        legacy_enum: TestEnum::B,
+    };
+
+    assert_eq!(obj.get_legacy_enum(), TestEnum::B as i64);
+
+    obj.set_legacy_enum(TestEnum::A as i64);
+    assert_eq!(obj.legacy_enum, TestEnum::A);
 }
 
 // Regression test for https://github.com/godot-rust/gdext/issues/1009.
 #[itest]
 fn enum_var_hint() {
-    let int_prop = <Behavior as Var>::var_hint();
+    let int_prop = Behavior::godot_shape().var_hint();
     assert_eq!(int_prop.hint, PropertyHint::ENUM);
-    assert_eq!(
-        int_prop.hint_string,
-        "Peaceful:0,Defend:1,Aggressive:7".into()
-    );
+    assert_eq!(int_prop.hint_string, "Peaceful:0,Defend:1,Aggressive:7");
 
-    let str_prop = <StrBehavior as Var>::var_hint();
+    let str_prop = StrBehavior::godot_shape().var_hint();
     assert_eq!(str_prop.hint, PropertyHint::ENUM);
-    assert_eq!(str_prop.hint_string, "Peaceful,Defend,Aggressive".into());
+    assert_eq!(str_prop.hint_string, "Peaceful,Defend,Aggressive");
 }
+
+#[itest]
+fn enum_manual_shape() {
+    // Test GodotShape::Enum with manually constructed enumerators (the recommended way for manual impls).
+    let shape = ManualEnumShape::godot_shape();
+    assert!(matches!(shape, GodotShape::Enum { .. }));
+
+    let var = ManualEnumShape::godot_shape().var_hint();
+    assert_eq!(var.hint, PropertyHint::ENUM);
+    assert_eq!(var.hint_string, "X:0,Y:1");
+
+    let exp = ManualEnumShape::godot_shape().export_hint();
+    assert_eq!(exp.hint, PropertyHint::ENUM);
+    assert_eq!(exp.hint_string, "X:0,Y:1");
+}
+
+/// Minimal manual enum using `GodotShape::Enum` (recommended approach for manual `GodotConvert` impls).
+#[derive(Default, Copy, Clone)]
+#[repr(i64)]
+enum ManualEnumShape {
+    #[default]
+    X = 0,
+    Y = 1,
+}
+
+impl GodotConvert for ManualEnumShape {
+    type Via = i64;
+
+    fn godot_shape() -> GodotShape {
+        use godot::meta::shape::{EnumeratorShape, GodotShape};
+
+        const ENUMERATORS: &[EnumeratorShape] = &[
+            EnumeratorShape::new_int("X", 0),
+            EnumeratorShape::new_int("Y", 1),
+        ];
+        GodotShape::Enum {
+            variant_type: VariantType::INT,
+            enumerators: std::borrow::Cow::Borrowed(ENUMERATORS),
+            godot_name: None,
+            is_bitfield: false,
+        }
+    }
+}
+
+impl ToGodot for ManualEnumShape {
+    type Pass = godot::meta::conv::ByValue;
+    fn to_godot(&self) -> i64 {
+        *self as i64
+    }
+}
+
+impl FromGodot for ManualEnumShape {
+    fn try_from_godot(via: i64) -> Result<Self, godot::meta::error::ConvertError> {
+        match via {
+            0 => Ok(Self::X),
+            1 => Ok(Self::Y),
+            _ => Err(godot::meta::error::ConvertError::new("invalid")),
+        }
+    }
+}
+
+impl Var for ManualEnumShape {
+    type PubType = Self;
+    fn var_get(field: &Self) -> i64 {
+        *field as i64
+    }
+    fn var_set(field: &mut Self, value: i64) {
+        *field = Self::try_from_godot(value).unwrap();
+    }
+    fn var_pub_get(field: &Self) -> Self {
+        *field
+    }
+    fn var_pub_set(field: &mut Self, value: Self) {
+        *field = value;
+    }
+}
+
+impl Export for ManualEnumShape {}
 
 #[derive(GodotClass)]
 pub struct DeriveExport {
@@ -407,10 +514,10 @@ fn derive_export() {
         .unwrap();
     // `class_name` should be empty for non-Object variants.
     check_property(&property, "class_name", "");
-    check_property(&property, "type", VariantType::INT.ord());
-    check_property(&property, "hint", PropertyHint::ENUM.ord());
+    check_property(&property, "type", VariantType::INT);
+    check_property(&property, "hint", PropertyHint::ENUM);
     check_property(&property, "hint_string", "A:0,B:1,C:2");
-    check_property(&property, "usage", PropertyUsageFlags::DEFAULT.ord());
+    check_property(&property, "usage", PropertyUsageFlags::DEFAULT);
 }
 
 #[derive(GodotClass)]
@@ -442,13 +549,13 @@ fn export_resource() {
         .find(|c| c.get_or_nil("name") == "my_resource".to_variant())
         .unwrap();
     check_property(&property, "class_name", "CustomResource");
-    check_property(&property, "type", VariantType::OBJECT.ord());
-    check_property(&property, "hint", PropertyHint::RESOURCE_TYPE.ord());
+    check_property(&property, "type", VariantType::OBJECT);
+    check_property(&property, "hint", PropertyHint::RESOURCE_TYPE);
     check_property(&property, "hint_string", "CustomResource");
     check_property(
         &property,
         "usage",
-        PropertyUsageFlags::DEFAULT.ord() | PropertyUsageFlags::EDITOR_INSTANTIATE_OBJECT.ord(),
+        PropertyUsageFlags::DEFAULT | PropertyUsageFlags::EDITOR_INSTANTIATE_OBJECT,
     );
 
     let property = class
@@ -457,10 +564,10 @@ fn export_resource() {
         .find(|c| c.get_or_nil("name") == "renamed_resource".to_variant())
         .unwrap();
     check_property(&property, "class_name", "NewNameCustomResource");
-    check_property(&property, "type", VariantType::OBJECT.ord());
-    check_property(&property, "hint", PropertyHint::RESOURCE_TYPE.ord());
+    check_property(&property, "type", VariantType::OBJECT);
+    check_property(&property, "hint", PropertyHint::RESOURCE_TYPE);
     check_property(&property, "hint_string", "NewNameCustomResource");
-    check_property(&property, "usage", PropertyUsageFlags::DEFAULT.ord());
+    check_property(&property, "usage", PropertyUsageFlags::DEFAULT);
 
     class.free();
 }
@@ -504,12 +611,12 @@ fn override_export() {
         .find(|c| c.get_or_nil("name") == "resource".to_variant())
         .unwrap();
 
-    check_property(&property, "hint", PropertyHint::GLOBAL_FILE.ord());
+    check_property(&property, "hint", PropertyHint::GLOBAL_FILE);
     check_property(&property, "hint_string", "SomethingRandom");
-    check_property(&property, "usage", PropertyUsageFlags::GROUP.ord());
+    check_property(&property, "usage", PropertyUsageFlags::GROUP);
 }
 
-fn check_property(property: &Dictionary, key: &str, expected: impl ToGodot) {
+fn check_property(property: &VarDictionary, key: &str, expected: impl ToGodot) {
     assert_eq!(property.get_or_nil(key), expected.to_variant());
 }
 
@@ -517,38 +624,36 @@ fn check_property(property: &Dictionary, key: &str, expected: impl ToGodot) {
 // Guaranteed order is necessary to make groups and subgroups work properly.
 #[itest]
 fn guaranteed_ordering() {
+    // Common flag combinations.
+    let editor_storage = PropertyUsageFlags::EDITOR | PropertyUsageFlags::STORAGE;
+
+    // In Godot 4.7, the INTERNAL flag was added to the script property.
+    let script_flags = if GdextBuild::since_api("4.7") {
+        PropertyUsageFlags::NEVER_DUPLICATE
+            | PropertyUsageFlags::EDITOR
+            | PropertyUsageFlags::STORAGE
+            | PropertyUsageFlags::INTERNAL
+    } else {
+        PropertyUsageFlags::NEVER_DUPLICATE
+            | PropertyUsageFlags::EDITOR
+            | PropertyUsageFlags::STORAGE
+    };
+
     let expected_order = [
         // Note: Category, displayed at the very top of the inspector.
         ("ExportOverride", PropertyUsageFlags::CATEGORY),
         ("some group", PropertyUsageFlags::GROUP),
-        (
-            "first",
-            PropertyUsageFlags::EDITOR | PropertyUsageFlags::STORAGE,
-        ),
+        ("first", editor_storage),
         // Breaks out of some group.
         ("", PropertyUsageFlags::GROUP),
-        (
-            "broke_out_of_some_group",
-            PropertyUsageFlags::EDITOR | PropertyUsageFlags::STORAGE,
-        ),
+        ("broke_out_of_some_group", editor_storage),
         ("some subgroup", PropertyUsageFlags::SUBGROUP),
-        (
-            "b_second",
-            PropertyUsageFlags::EDITOR | PropertyUsageFlags::STORAGE,
-        ),
+        ("b_second", editor_storage),
         ("resource", PropertyUsageFlags::GROUP),
-        (
-            "last",
-            PropertyUsageFlags::EDITOR | PropertyUsageFlags::STORAGE,
-        ),
+        ("last", editor_storage),
         // Inherited from RefCounted – category and script.
         ("RefCounted", PropertyUsageFlags::CATEGORY),
-        (
-            "script",
-            PropertyUsageFlags::NEVER_DUPLICATE
-                | PropertyUsageFlags::EDITOR
-                | PropertyUsageFlags::STORAGE,
-        ),
+        ("script", script_flags),
     ];
 
     let class = ExportOverride::new_gd();
@@ -628,6 +733,33 @@ fn test_var_with_renamed_funcs() {
     obj.free();
 }
 
+// Tests that CoW packed-arrays' changes are reflected from Rust. See:
+// * Rust (sync does work): https://github.com/godot-rust/gdext/pull/576
+// * GDScript (not synced): https://github.com/godotengine/godot/issues/76150
+#[itest]
+fn test_copy_on_write_var() {
+    let mut obj = HasProperty::new_alloc();
+
+    // Mutate property via reflection -> verify change is reflected in Rust.
+    obj.set(
+        "packed_int_array",
+        &PackedInt32Array::from([1, 2, 3]).to_variant(),
+    );
+    assert_eq!(
+        obj.bind().packed_int_array,
+        PackedInt32Array::from(&[1, 2, 3])
+    );
+
+    // Mutate property in Rust -> verify change is reflected in Godot.
+    obj.bind_mut().packed_int_array.push(4);
+    assert_eq!(
+        obj.get("packed_int_array").to::<PackedInt32Array>(),
+        PackedInt32Array::from(&[1, 2, 3, 4])
+    );
+
+    obj.free();
+}
+
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
 #[derive(GodotClass)]
@@ -670,7 +802,7 @@ fn test_duplicate_retains_properties() {
     }
 
     // Create duplicate and verify all properties are copied correctly.
-    let duplicated: Gd<Duplicator> = original.duplicate().unwrap().cast();
+    let duplicated: Gd<Duplicator> = original.duplicate_node();
     {
         let duplicated = duplicated.bind();
         assert_eq!(duplicated.int_export, 5);

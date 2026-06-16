@@ -8,7 +8,7 @@
 use std::num::NonZeroU64;
 
 use godot_ffi as sys;
-use sys::{ffi_methods, static_assert, static_assert_eq_size_align, ExtVariantType, GodotFfi};
+use sys::{ExtVariantType, GodotFfi, ffi_methods, static_assert, static_assert_eq_size_align};
 
 /// A RID ("resource ID") is an opaque handle that refers to a Godot `Resource`.
 ///
@@ -139,4 +139,4 @@ unsafe impl GodotFfi for Rid {
     }
 }
 
-crate::meta::impl_godot_as_self!(Rid);
+crate::meta::impl_godot_as_self!(Rid: ByValue);

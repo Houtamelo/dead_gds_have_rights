@@ -6,17 +6,15 @@
  */
 
 use godot_ffi as sys;
-use sys::{ffi_methods, ExtVariantType, GodotFfi};
+use sys::{ExtVariantType, GodotFfi, ffi_methods};
 
-use crate::builtin::math::ApproxEq;
-use crate::builtin::{real, Plane, Vector3, Vector3Axis};
+use crate::builtin::math::{ApproxEq, FloatExt};
+use crate::builtin::{Plane, Vector3, Vector3Axis, real};
 
 /// Axis-aligned bounding box in 3D space.
 ///
 /// `Aabb` consists of a position, a size, and several utility functions. It is typically used for
 /// fast overlap tests.
-///
-/// Currently most methods are only available through [`InnerAabb`](super::inner::InnerAabb).
 ///
 /// # All bounding-box types
 ///
@@ -28,8 +26,11 @@ use crate::builtin::{real, Plane, Vector3, Vector3Axis};
 /// [`Rect2`]: crate::builtin::Rect2
 /// [`Rect2i`]: crate::builtin::Rect2i
 ///
-/// # Godot docs
+/// # Soft invariants
+/// `Aabb` requires non-negative size for certain operations, which is validated only on a best-effort basis. Violations may
+/// cause panics in Debug mode. See also [_Builtin API design_](../__docs/index.html#6-public-fields-and-soft-invariants).
 ///
+/// # Godot docs
 /// [`AABB`](https://docs.godotengine.org/en/stable/classes/class_aabb.html)
 #[derive(Default, Copy, Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -50,9 +51,15 @@ impl Aabb {
 
     /// Create a new `Aabb` with the first corner at `position` and opposite corner at `end`.
     #[inline]
-    pub fn from_corners(position: Vector3, end: Vector3) -> Self {
+    pub fn from_position_end(position: Vector3, end: Vector3) -> Self {
         // Cannot use floating point arithmetic in const functions.
         Self::new(position, end - position)
+    }
+
+    #[inline]
+    #[deprecated = "Renamed to `from_position_end`."]
+    pub fn from_corners(position: Vector3, end: Vector3) -> Self {
+        Self::from_position_end(position, end)
     }
 
     /// Returns an AABB with the same geometry, with most-negative corner as `position` and non-negative `size`.
@@ -96,10 +103,10 @@ impl Aabb {
         self.assert_nonnegative();
         b.assert_nonnegative();
 
-        let position = self.position.coord_min(b.position);
-        let end = self.end().coord_max(b.end());
+        let position = Vector3::coord_min(self.position, b.position);
+        let end = Vector3::coord_max(self.end(), b.end());
 
-        Self::from_corners(position, end)
+        Self::from_position_end(position, end)
     }
 
     /// Returns the volume of the AABB.
@@ -149,13 +156,13 @@ impl Aabb {
 
     /// Returns if this bounding box has a surface or a length, i.e. at least one component of [`Self::size`] is greater than 0.
     #[inline]
-    pub fn has_surface(self) -> bool {
+    pub const fn has_surface(self) -> bool {
         (self.size.x > 0.0) || (self.size.y > 0.0) || (self.size.z > 0.0)
     }
 
     /// Returns true if the AABB has a volume, and false if the AABB is flat, linear, empty, or has a negative size.
     #[inline]
-    pub fn has_volume(self) -> bool {
+    pub const fn has_volume(self) -> bool {
         self.size.x > 0.0 && self.size.y > 0.0 && self.size.z > 0.0
     }
 
@@ -193,12 +200,29 @@ impl Aabb {
         self.position + self.size
     }
 
+    /// Returns the position of one of the 8 vertices that compose this bounding box.
+    ///
+    /// Matches GDScript's ordering for `get_endpoint`. With an `idx` of 0 this is the same as position, and an `idx` of 7 is the same as end.
+    ///
+    /// # Panics
+    /// If `idx` is greater than 7.
+    ///
+    /// _Godot equivalent: `get_endpoint`_
+    #[inline]
+    #[doc(alias = "get_endpoint")]
+    pub fn get_corner(self, idx: usize) -> Vector3 {
+        *self
+            .corners()
+            .get(idx)
+            .expect("Tried to retrieve vertex no. {idx} from Aabb which has only 8 vertices")
+    }
+
     /// Set size based on desired end-point.
     ///
     /// NOTE: This does not make the AABB absolute, and `Aabb.abs()` should be called if the size becomes negative.
     #[inline]
     pub fn set_end(&mut self, end: Vector3) {
-        self.size = end - self.position
+        self.size = end - self.position;
     }
 
     /// Returns the normalized longest axis of the AABB.
@@ -219,9 +243,9 @@ impl Aabb {
 
     /// Returns the scalar length of the longest axis of the AABB.
     #[inline]
-    pub fn longest_axis_size(self) -> real {
+    pub const fn longest_axis_size(self) -> real {
         let size = self.size;
-        size.x.max(size.y).max(size.z)
+        real::max(size.x, size.y).max(size.z)
     }
 
     /// Returns the normalized shortest axis of the AABB.
@@ -242,24 +266,32 @@ impl Aabb {
 
     /// Returns the scalar length of the shortest axis of the AABB.
     #[inline]
-    pub fn shortest_axis_size(self) -> real {
-        self.size.x.min(self.size.y.min(self.size.z))
+    pub const fn shortest_axis_size(self) -> real {
+        let size = self.size;
+        real::min(size.x, size.y).min(size.z)
+    }
+
+    #[inline]
+    #[deprecated = "Renamed to `get_support`."]
+    pub fn support(self, dir: Vector3) -> Vector3 {
+        self.get_support(dir)
     }
 
     /// Returns the support point in a given direction. This is useful for collision detection algorithms.
     #[inline]
-    #[doc(alias = "get_support")]
-    pub fn support(self, dir: Vector3) -> Vector3 {
-        let half_extents = self.size * 0.5;
-        let relative_center_point = self.position + half_extents;
+    pub fn get_support(self, dir: Vector3) -> Vector3 {
+        let mut support = self.position;
+        if dir.x > 0. {
+            support.x += self.size.x;
+        }
+        if dir.y > 0. {
+            support.y += self.size.y;
+        }
+        if dir.z > 0. {
+            support.z += self.size.z;
+        }
 
-        let signs = Vector3 {
-            x: dir.x.signum(),
-            y: dir.y.signum(),
-            z: dir.z.signum(),
-        };
-
-        half_extents * signs + relative_center_point
+        support
     }
 
     /// Checks whether two AABBs have at least one point in common.
@@ -299,20 +331,27 @@ impl Aabb {
             && end.z > b.position.z
     }
 
-    /// Returns `true` if the AABB is on both sides of a plane.
+    /// Returns the 8 vertices that compose this bounding box.
+    ///
+    /// The vertex ordering matches GDScript's ordering for `get_endpoint`. The first vertex is the same as `position`, and the last is the same as `end`.
     #[inline]
-    pub fn intersects_plane(self, plane: Plane) -> bool {
-        // The set of the edges of the AABB.
-        let points = [
+    pub fn corners(self) -> [Vector3; 8] {
+        [
             self.position,
             self.position + Vector3::new(0.0, 0.0, self.size.z),
             self.position + Vector3::new(0.0, self.size.y, 0.0),
-            self.position + Vector3::new(self.size.x, 0.0, 0.0),
-            self.position + Vector3::new(self.size.x, self.size.y, 0.0),
-            self.position + Vector3::new(self.size.x, 0.0, self.size.z),
             self.position + Vector3::new(0.0, self.size.y, self.size.z),
+            self.position + Vector3::new(self.size.x, 0.0, 0.0),
+            self.position + Vector3::new(self.size.x, 0.0, self.size.z),
+            self.position + Vector3::new(self.size.x, self.size.y, 0.0),
             self.position + self.size,
-        ];
+        ]
+    }
+
+    /// Returns `true` if the AABB is on both sides of a plane.
+    #[inline]
+    pub fn intersects_plane(self, plane: Plane) -> bool {
+        let points = self.corners();
 
         let mut over = false;
         let mut under = false;
@@ -363,7 +402,7 @@ impl Aabb {
     // Credits: https://tavianator.com/2011/ray_box.html
     fn compute_ray_tnear_tfar(self, ray_from: Vector3, ray_dir: Vector3) -> (real, real) {
         self.assert_nonnegative();
-        debug_assert!(
+        sys::balanced_assert!(
             ray_dir != Vector3::ZERO,
             "ray direction must not be zero; use contains_point() for point checks"
         );
@@ -377,26 +416,35 @@ impl Aabb {
         let t1 = tmin.coord_min(tmax);
         let t2 = tmin.coord_max(tmax);
 
-        let tnear = t1.x.max(t1.y).max(t1.z);
-        let tfar = t2.x.min(t2.y).min(t2.z);
+        let tnear = real::max(t1.x, t1.y).max(t1.z);
+        let tfar = real::min(t2.x, t2.y).min(t2.z);
 
         (tnear, tfar)
     }
 
-    /// Returns `true` if the given ray intersects with this AABB. Segment length is finite.
+    /// Returns minimal distance to intersection with a segment iff this bounding box and the given segment intersect.
     ///
     /// # Panics
     /// If `self.size` is negative.
-    #[inline]
-    pub fn intersects_segment(self, from: Vector3, to: Vector3) -> bool {
+    fn intersect_segment_inner(self, from: Vector3, to: Vector3) -> Option<real> {
         self.assert_nonnegative();
 
         let segment_dir = to - from;
 
+        // Distance to intersect (enter) the AABB.
         let mut t_min: real = 0.0;
+        // Distance to exit the AABB.
         let mut t_max: real = 1.0;
 
         for axis in [Vector3Axis::X, Vector3Axis::Y, Vector3Axis::Z] {
+            if segment_dir[axis].is_zero_approx() {
+                // Bail if the ray can't possibly enter the box.
+                if from[axis] < self.position[axis] || from[axis] > self.end()[axis] {
+                    return None;
+                }
+                continue;
+            }
+
             let inv_dir = 1.0 / segment_dir[axis];
 
             let t1 = (self.position[axis] - from[axis]) * inv_dir;
@@ -404,25 +452,46 @@ impl Aabb {
 
             let (t_near, t_far) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
 
-            // Update t_min and t_max
-            t_min = t_min.max(t_near);
-            t_max = t_max.min(t_far);
+            t_min = real::max(t_min, t_near);
+            t_max = real::min(t_max, t_far);
 
             if t_min > t_max {
-                // No intersection or segment completely outside the AABB
-                return false;
+                // Aabb is missed since we "exit" before entering it.
+                return None;
             }
         }
 
-        true
+        Some(t_min)
+    }
+
+    /// Returns `true` if this bounding box and the given segment intersect.
+    ///
+    /// # Panics
+    /// If `self.size` is negative.
+    ///
+    /// _Godot equivalent: `bool(intersects_segment(from, to))`_
+    #[inline]
+    pub fn intersects_segment(self, from: Vector3, to: Vector3) -> bool {
+        self.intersect_segment_inner(from, to).is_some()
+    }
+
+    /// Returns the first point where this bounding box and the given segment intersect.
+    ///
+    /// # Panics
+    /// If `self.size` is negative.
+    ///
+    /// _Godot equivalent: `intersects_segment`_
+    #[inline]
+    pub fn intersect_segment(self, from: Vector3, to: Vector3) -> Option<Vector3> {
+        let t_min = self.intersect_segment_inner(from, to)?;
+        Some(from + (to - from) * t_min)
     }
 
     /// Assert that the size of the `Aabb` is not negative.
     ///
     /// Most functions will fail to give a correct result if the size is negative.
     #[inline]
-    /// TODO(v0.3): make private, change to debug_assert().
-    pub fn assert_nonnegative(self) {
+    fn assert_nonnegative(self) {
         assert!(
             self.size.x >= 0.0 && self.size.y >= 0.0 && self.size.z >= 0.0,
             "size {:?} is negative",
@@ -453,7 +522,7 @@ unsafe impl GodotFfi for Aabb {
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }
 
-crate::meta::impl_godot_as_self!(Aabb);
+crate::meta::impl_godot_as_self!(Aabb: ByValue);
 
 impl ApproxEq for Aabb {
     /// Returns `true` if the two `Aabb`s are approximately equal, by calling `is_equal_approx` on
@@ -761,9 +830,8 @@ mod test {
         );
     }
 
-    #[test]
-    #[should_panic]
-    #[cfg(debug_assertions)]
+    #[test] // cfg_attr: no panic in disengaged level (although current CI doesn't run unit-tests).
+    #[cfg_attr(safeguards_balanced, should_panic)]
     fn test_intersect_ray_zero_dir_inside() {
         let aabb = Aabb {
             position: Vector3::new(-1.5, 2.0, -2.5),
@@ -774,8 +842,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    #[cfg(debug_assertions)]
+    #[cfg_attr(safeguards_balanced, should_panic)]
     fn test_intersect_ray_zero_dir_outside() {
         let aabb = Aabb {
             position: Vector3::new(-1.5, 2.0, -2.5),

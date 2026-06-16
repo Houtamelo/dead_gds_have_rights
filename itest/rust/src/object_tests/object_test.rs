@@ -11,17 +11,17 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use godot::builtin::{GString, StringName, Variant, Vector3};
+use godot::builtin::{Array, GString, StringName, Variant, Vector3};
 use godot::classes::{
-    file_access, Engine, FileAccess, IRefCounted, Node, Node2D, Node3D, Object, RefCounted,
+    Engine, FileAccess, IRefCounted, Node, Node2D, Node3D, Object, RefCounted, file_access,
 };
-#[allow(deprecated)]
+use godot::global::godot_str;
 use godot::meta::{FromGodot, GodotType, ToGodot};
-use godot::obj::{Base, Gd, Inherits, InstanceId, NewAlloc, NewGd, RawGd};
-use godot::register::{godot_api, GodotClass};
-use godot::sys::{self, interface_fn, GodotFfi};
+use godot::obj::{Base, Gd, Inherits, InstanceId, NewAlloc, NewGd, RawGd, Singleton};
+use godot::register::{GodotClass, godot_api};
+use godot::sys::{self, GodotFfi, interface_fn};
 
-use crate::framework::{expect_panic, itest, TestContext};
+use crate::framework::{TestContext, expect_panic, expect_panic_or_ub, itest};
 
 // TODO:
 // * make sure that ptrcalls are used when possible (i.e. when type info available; maybe GDScript integration test)
@@ -100,17 +100,20 @@ fn object_engine_roundtrip() {
 }
 
 #[itest]
-fn object_null_argument() {
-    // Objects currently use ObjectArg instead of RefArg, so this scenario shouldn't occur. Test can be updated if code is refactored.
+fn object_option_argument() {
+    // Tests following things:
+    // - to_godot() returns Option<&T>
+    // - None maps to None
+    // - Some(gd) maps to Some(&gd)
 
-    let null_obj = Option::<Gd<Node>>::None;
+    let null_obj = None::<Gd<Node>>;
+    let via: Option<&Gd<Node>> = null_obj.to_godot();
+    assert_eq!(via, None);
 
-    let via = null_obj.to_godot();
-    let ffi = via.to_ffi();
-
-    expect_panic("not yet implemented: pass objects through RefArg", || {
-        ffi.to_godot();
-    });
+    let refc = RefCounted::new_gd();
+    let some_obj = Some(refc.clone());
+    let via: Option<&Gd<RefCounted>> = some_obj.to_godot();
+    assert_eq!(via, Some(&refc));
 }
 
 #[itest]
@@ -168,7 +171,7 @@ fn object_instance_id_when_freed() {
     assert!(!node.is_instance_valid());
 
     /*
-    expect_panic("instance_id() on dead object", move || {
+    expect_panic_or_ub("instance_id() on dead object", move || {
         node.instance_id();
     });
     */
@@ -233,7 +236,7 @@ fn object_user_bind_after_free() {
     let copy = obj.clone();
     obj.free();
 
-    expect_panic("bind() on dead user object", move || {
+    expect_panic_or_ub("bind() on dead user object", move || {
         let _ = copy.bind();
     });
 }
@@ -245,7 +248,7 @@ fn object_user_free_during_bind() {
 
     let copy = obj.clone(); // TODO clone allowed while bound?
 
-    expect_panic("direct free() on user while it's bound", move || {
+    expect_panic_or_ub("direct free() on user while it's bound", move || {
         copy.free();
     });
 
@@ -273,7 +276,7 @@ fn object_engine_freed_argument_passing(ctx: &TestContext) {
 
     // Destroy object and then pass it to a Godot engine API.
     node.free();
-    expect_panic("pass freed Gd<T> to Godot engine API (T=Node)", || {
+    expect_panic_or_ub("pass freed Gd<T> to Godot engine API (T=Node)", || {
         tree.add_child(&node2);
     });
 }
@@ -286,10 +289,10 @@ fn object_user_freed_casts() {
 
     // Destroy object and then pass it to a Godot engine API (upcast itself works, see other tests).
     obj.free();
-    expect_panic("Gd<T>::upcast() on dead object (T=user)", || {
+    expect_panic_or_ub("Gd<T>::upcast() on dead object (T=user)", || {
         let _ = obj2.upcast::<Object>();
     });
-    expect_panic("Gd<T>::cast() on dead object (T=user)", || {
+    expect_panic_or_ub("Gd<T>::cast() on dead object (T=user)", || {
         let _ = base_obj.cast::<ObjPayload>();
     });
 }
@@ -304,7 +307,7 @@ fn object_user_freed_argument_passing() {
 
     // Destroy object and then pass it to a Godot engine API (upcast itself works, see other tests).
     obj.free();
-    expect_panic("pass freed Gd<T> to Godot engine API (T=user)", || {
+    expect_panic_or_ub("pass freed Gd<T> to Godot engine API (T=user)", || {
         engine.register_singleton("NeverRegistered", &obj2);
     });
 }
@@ -342,7 +345,7 @@ fn object_user_call_after_free() {
     let mut copy = obj.clone();
     obj.free();
 
-    expect_panic("call() on dead user object", move || {
+    expect_panic_or_ub("call() on dead user object", move || {
         let _ = copy.call("get_instance_id", &[]);
     });
 }
@@ -353,7 +356,7 @@ fn object_engine_use_after_free() {
     let copy = node;
     node.free();
 
-    expect_panic("call method on dead engine object", move || {
+    expect_panic_or_ub("call method on dead engine object", move || {
         copy.get_position();
     });
 }
@@ -364,7 +367,7 @@ fn object_engine_use_after_free_varcall() {
     let mut copy = node;
     node.free();
 
-    expect_panic("call method on dead engine object", move || {
+    expect_panic_or_ub("call method on dead engine object", move || {
         copy.call_deferred("get_position", &[]);
     });
 }
@@ -684,7 +687,7 @@ fn object_engine_accept_polymorphic() {
 
     // Node::set_name() changed to accept StringName, in https://github.com/godotengine/godot/pull/76560.
     #[cfg(before_api = "4.5")]
-    node.set_name(expected_name.arg());
+    node.set_name(&GString::from(&expected_name));
     #[cfg(since_api = "4.5")]
     node.set_name(&expected_name);
 
@@ -865,6 +868,10 @@ fn object_get_scene_tree(ctx: &TestContext) {
 
     let count = tree.get_child_count();
     assert_eq!(count, 1);
+
+    // Explicit type as regression test: https://github.com/godot-rust/gdext/pull/1385
+    let nodes: Array<Gd<Node>> = tree.get_children();
+    assert_eq!(nodes.len(), 1);
 } // implicitly tested: node does not leak
 
 #[itest]
@@ -930,7 +937,7 @@ impl IRefCounted for RefcPayload {
     }
 
     fn to_string(&self) -> GString {
-        format!("value={}", self.value).into()
+        godot_str!("value={}", self.value)
     }
 }
 
@@ -1017,7 +1024,7 @@ pub mod object_test_gd {
 
         #[func]
         fn return_nested_self() -> Array<Gd<<Self as GodotClass>::Base>> {
-            array![&Self::return_self().upcast()]
+            array![&Self::return_self()] // implicit upcast
         }
 
         #[func]

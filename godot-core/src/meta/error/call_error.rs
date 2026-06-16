@@ -5,14 +5,19 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::error::Error;
+use std::fmt;
+
+use godot_ffi::join_debug;
+
 use crate::builtin::{Variant, VariantType};
 use crate::meta::error::{ConvertError, ErasedConvertError};
 use crate::meta::{CallContext, ToGodot};
 use crate::private::PanicPayload;
 use crate::sys;
-use godot_ffi::join_debug;
-use std::error::Error;
-use std::fmt;
+
+/// Result type for function calls that can fail.
+pub(crate) type CallResult<R> = Result<R, CallError>;
 
 /// Error capable of representing failed function calls.
 ///
@@ -21,7 +26,7 @@ use std::fmt;
 /// _Varcall_ refers to the "variant call" calling convention, meaning that arguments and return values are passed as `Variant` (as opposed
 /// to _ptrcall_, which passes direct pointers to Rust objects).
 ///
-/// Allows to inspect the involved class and method via `class_name()` and `method_name()`. Implements the `std::error::Error` trait, so
+/// Allows to inspect the involved class and method via `class_id()` and `method_name()`. Implements the `std::error::Error` trait, so
 /// it comes with `Display` and `Error::source()` APIs.
 ///
 /// # Possible error causes
@@ -84,6 +89,8 @@ struct InnerCallError {
     call_expr: String,
     reason: String,
     source: Option<SourceError>,
+    /// Whether this error was caused by a Rust panic. If so, the panic hook already printed it.
+    caused_by_panic: bool,
 }
 
 impl CallError {
@@ -117,20 +124,24 @@ impl CallError {
     #[allow(clippy::result_large_err)]
     pub fn check_arg_count(
         call_ctx: &CallContext,
-        arg_count: usize,
-        param_count: usize,
+        arg_count: usize,           // Arguments passed by the caller.
+        default_value_count: usize, // Fallback/default values, *not* arguments.
+        param_count: usize,         // Parameters declared by the function.
     ) -> Result<(), Self> {
-        // This will need to be adjusted once optional parameters are supported in #[func].
-        if arg_count == param_count {
+        // Valid if both:
+        // - Provided args + available defaults (fallbacks) are enough to fill all parameters.
+        // - Provided args don't exceed parameter count.
+        if arg_count + default_value_count >= param_count && arg_count <= param_count {
             return Ok(());
         }
 
-        Err(Self::failed_param_count(call_ctx, arg_count, param_count))
+        let call_error = Self::failed_param_count(call_ctx, arg_count, param_count);
+        Err(call_error)
     }
 
     /// Checks the Godot side of a varcall (low-level `sys::GDExtensionCallError`).
     #[allow(clippy::result_large_err)]
-    pub(crate) fn check_out_varcall<T: ToGodot>(
+    pub fn check_out_varcall<T: ToGodot>(
         call_ctx: &CallContext,
         err: sys::GDExtensionCallError,
         explicit_args: &[T],
@@ -173,12 +184,12 @@ impl CallError {
     // Constructors returning Self; guaranteed failure
 
     /// Returns an error for a failed parameter conversion.
-    pub(crate) fn failed_param_conversion<P>(
+    pub fn failed_param_conversion<P>(
         call_ctx: &CallContext,
-        param_index: isize,
+        param_index: usize,
         convert_error: ConvertError,
     ) -> Self {
-        let param_ty = std::any::type_name::<P>();
+        let param_ty = sys::short_type_name::<P>();
 
         Self::new(
             call_ctx,
@@ -249,7 +260,7 @@ impl CallError {
         // This specializes on reflection-style calls, e.g. call(), rpc() etc.
         // In these cases, varargs are the _actual_ arguments, with required args being metadata such as method name.
 
-        debug_assert_ne!(err.error, sys::GDEXTENSION_CALL_OK); // already checked outside
+        sys::strict_assert_ne!(err.error, sys::GDEXTENSION_CALL_OK); // already checked outside
 
         let sys::GDExtensionCallError {
             error,
@@ -307,13 +318,19 @@ impl CallError {
 
     #[doc(hidden)]
     pub fn failed_by_user_panic(call_ctx: &CallContext, panic_payload: PanicPayload) -> Self {
-        // This can cause the panic message to be printed twice in some scenarios (e.g. bind_mut() borrow failure).
-        // But in other cases (e.g. itest `dynamic_call_with_panic`), it is only printed once.
-        // Would need some work to have a consistent experience.
+        // Reason will not be printed, since panic itself already prints -- but is still accessible in CallError's Display/Error impls.
+        let reason = format!("function panicked: {}", panic_payload.into_panic_message());
 
-        let reason = panic_payload.into_panic_message();
+        let mut err = Self::new(call_ctx, reason, None);
+        err.b.caused_by_panic = true;
+        err
+    }
 
-        Self::new(call_ctx, format!("function panicked: {reason}"), None)
+    /// Whether this error was caused by a Rust panic (as opposed to a Godot or godot-rust error).
+    ///
+    /// If true, the panic hook has already printed the error; callers can avoid printing it again.
+    pub(crate) fn caused_by_panic(&self) -> bool {
+        self.b.caused_by_panic
     }
 
     fn new(
@@ -330,6 +347,7 @@ impl CallError {
                 value: e.value().map_or_else(String::new, |v| format!("{v:?}")),
                 erased_error: e.into(),
             }),
+            caused_by_panic: false, // set to true after construction if needed.
         };
 
         Self { b: Box::new(inner) }
@@ -435,9 +453,5 @@ fn join_args(args: impl Iterator<Item = Variant>) -> String {
 }
 
 fn plural(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if count == 1 { "" } else { "s" }
 }

@@ -5,12 +5,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+
 use godot_ffi as sys;
-use sys::{ffi_methods, ExtVariantType, GodotFfi};
+use sys::{ExtVariantType, GodotFfi, ffi_methods};
 
 use crate::builtin::math::{ApproxEq, FloatExt, GlamConv, GlamType};
-use crate::builtin::{inner, real, Basis, EulerOrder, RQuat, RealConv, Vector3};
-use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use crate::builtin::{Basis, EulerOrder, RQuat, RealConv, Vector3, inner, real};
 
 /// Unit quaternion to represent 3D rotations.
 ///
@@ -76,11 +77,11 @@ impl Quaternion {
     ///
     /// *Godot equivalent: `Quaternion(arc_from: Vector3, arc_to: Vector3)`*
     pub fn from_rotation_arc(arc_from: Vector3, arc_to: Vector3) -> Self {
-        debug_assert!(
+        sys::balanced_assert!(
             arc_from.is_normalized(),
             "input 1 (`arc_from`) in `Quaternion::from_rotation_arc` must be a unit vector"
         );
-        debug_assert!(
+        sys::balanced_assert!(
             arc_to.is_normalized(),
             "input 2 (`arc_to`) in `Quaternion::from_rotation_arc` must be a unit vector"
         );
@@ -342,7 +343,7 @@ unsafe impl GodotFfi for Quaternion {
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }
 
-crate::meta::impl_godot_as_self!(Quaternion);
+crate::meta::impl_godot_as_self!(Quaternion: ByValue);
 
 impl std::fmt::Display for Quaternion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

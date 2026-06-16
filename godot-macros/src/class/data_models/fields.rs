@@ -5,10 +5,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use proc_macro2::{Punct, TokenStream};
+
+use crate::ParseResult;
 use crate::class::Field;
 use crate::util::bail;
-use crate::ParseResult;
-use proc_macro2::{Punct, TokenStream};
 
 pub struct Fields {
     /// All fields except `base_field`.
@@ -22,6 +23,9 @@ pub struct Fields {
 
     /// Errors during macro evaluation that shouldn't abort the execution of the macro.
     pub errors: Vec<venial::Error>,
+
+    /// True if any `#[export_tool_button]` has been declared.
+    pub has_tool_button: bool,
 }
 
 /// Fetches data for all named fields for a struct.

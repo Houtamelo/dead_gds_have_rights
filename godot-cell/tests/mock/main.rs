@@ -67,13 +67,16 @@ macro_rules! setup_mock {
 
             let instance = guard.get(&key).unwrap();
 
-            let ptr: *mut InstanceStorage<T> = instance.0 as *mut _;
+            // Convert *mut c_void to *mut InstanceStorage<T>.
+            let ptr = instance.0.cast::<InstanceStorage<T>>();
 
-            &*ptr
+            unsafe { &*ptr }
         }
 
         unsafe fn call_immut_method<T>(key: usize, method: fn(&T)) -> Result<(), Box<dyn Error>> {
-            let storage = get_instance::<T>(key);
+            // SAFETY: Caller must ensure `key` is a valid instance ID.
+            let storage = unsafe { get_instance::<T>(key) };
+
             let instance = storage.cell.borrow()?;
             method(&*instance);
 
@@ -81,7 +84,8 @@ macro_rules! setup_mock {
         }
 
         unsafe fn call_mut_method<T>(key: usize, method: fn(&mut T)) -> Result<(), Box<dyn Error>> {
-            let storage = get_instance::<T>(key);
+            // SAFETY: Caller must ensure `key` is a valid instance ID.
+            let storage = unsafe { get_instance::<T>(key) };
 
             let mut instance = storage.cell.borrow_mut()?;
             method(&mut *instance);
@@ -135,7 +139,7 @@ macro_rules! setup_mock {
 
                 while let Some(guard) = guard_opt.take() {
                     if let Err(new_guard) = std::mem::ManuallyDrop::into_inner(guard).try_drop() {
-                        guard_opt = Some(new_guard);
+                        guard_opt = Some(std::mem::ManuallyDrop::new(new_guard));
                         std::hint::spin_loop()
                     }
                 }

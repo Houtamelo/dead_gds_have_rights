@@ -1,8 +1,8 @@
 [package]
 name = "godot-bindings"
-version = "0.3.4"
-edition = "2021"
-rust-version = "1.87"
+version = "0.4.4"
+edition.workspace = true
+rust-version.workspace = true
 license = "MPL-2.0"
 keywords = ["gamedev", "godot", "engine", "ffi", "sys"]
 categories = ["game-engines", "graphics"]
@@ -19,16 +19,11 @@ experimental-wasm-nothreads = []
 
 # [version-sync] [[
 #  [line] api-$kebabVersion = []
-api-4-1 = []
-api-4-1-1 = []
-api-4-1-2 = []
-api-4-1-3 = []
-api-4-1-4 = []
 api-4-2 = []
-api-4-2-1 = []
-api-4-2-2 = []
 api-4-3 = []
 api-4-4 = []
+api-4-5 = []
+api-4-6 = []
 # ]]
 
 default = []
@@ -36,6 +31,10 @@ default = []
 api-custom = ["dep:bindgen", "dep:regex", "dep:which"]
 api-custom-json = ["dep:nanoserde", "dep:bindgen", "dep:regex", "dep:which"]
 api-custom-extheader = []
+
+# Safeguard levels (see godot/lib.rs for detailed documentation).
+safeguards-dev-balanced = []
+safeguards-release-disengaged = []
 
 [dependencies]
 gdextension-api = { workspace = true }

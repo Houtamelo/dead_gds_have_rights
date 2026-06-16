@@ -4,13 +4,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-use crate::framework::itest;
+
+use std::ops::DerefMut;
+
 use godot::obj::WithBaseField;
 use godot::prelude::*;
 use godot::task::{SignalFuture, TaskHandle};
-use std::ops::DerefMut;
+
+use crate::framework::itest;
 
 const ACCEPTED_NAME: &str = "touched";
+
+trait ForwardTrait {
+    fn forward(&mut self);
+}
 
 #[derive(GodotClass)]
 #[class(init,base=Node2D)]
@@ -26,6 +33,14 @@ impl DeferredTestNode {
     #[func]
     fn accept(&mut self) {
         self.base_mut().set_name(ACCEPTED_NAME);
+    }
+
+    fn accept_gd(mut this: Gd<Self>) {
+        this.set_name(ACCEPTED_NAME);
+    }
+
+    fn accept_dyn_gd(mut this: DynGd<Object, dyn ForwardTrait>) {
+        this.dyn_bind_mut().forward();
     }
 
     fn create_assertion_task(&mut self) -> TaskHandle {
@@ -58,6 +73,13 @@ impl INode2D for DeferredTestNode {
     }
 }
 
+#[godot_dyn]
+impl ForwardTrait for DeferredTestNode {
+    fn forward(&mut self) {
+        self.accept();
+    }
+}
+
 #[itest(async)]
 fn call_deferred_untyped(ctx: &crate::framework::TestContext) -> TaskHandle {
     let mut test_node = DeferredTestNode::new_alloc();
@@ -66,42 +88,69 @@ fn call_deferred_untyped(ctx: &crate::framework::TestContext) -> TaskHandle {
     // Called through Godot and therefore requires #[func] on the method.
     test_node.call_deferred("accept", &[]);
 
-    let mut gd_mut = test_node.bind_mut();
-    gd_mut.create_assertion_task()
+    let mut guard = test_node.bind_mut();
+    guard.create_assertion_task()
 }
 
 #[itest(async)]
-fn call_deferred_godot_class(ctx: &crate::framework::TestContext) -> TaskHandle {
+fn run_deferred_user_class(ctx: &crate::framework::TestContext) -> TaskHandle {
     let mut test_node = DeferredTestNode::new_alloc();
     ctx.scene_tree.clone().add_child(&test_node);
 
-    let mut gd_mut = test_node.bind_mut();
+    let mut guard = test_node.bind_mut();
+
     // Explicitly check that this can be invoked on &mut T.
-    let godot_class_ref: &mut DeferredTestNode = gd_mut.deref_mut();
-    godot_class_ref.apply_deferred(DeferredTestNode::accept);
+    let godot_class_ref: &mut DeferredTestNode = guard.deref_mut();
+    godot_class_ref.run_deferred(DeferredTestNode::forward);
 
-    gd_mut.create_assertion_task()
+    guard.create_assertion_task()
 }
 
 #[itest(async)]
-fn call_deferred_gd_user_class(ctx: &crate::framework::TestContext) -> TaskHandle {
+fn run_deferred_dyn(ctx: &crate::framework::TestContext) -> TaskHandle {
     let mut test_node = DeferredTestNode::new_alloc();
     ctx.scene_tree.clone().add_child(&test_node);
 
-    test_node.apply_deferred(DeferredTestNode::accept);
+    // Explicitly check that this can be invoked on `DynGd` (NOT deref to &T).
+    let mut dyn_gd: DynGd<Object, dyn ForwardTrait> = test_node.clone().into_dyn().upcast();
+    dyn_gd.run_deferred(ForwardTrait::forward);
 
-    let mut gd_mut = test_node.bind_mut();
-    gd_mut.create_assertion_task()
+    let mut guard = test_node.bind_mut();
+    guard.create_assertion_task()
 }
 
 #[itest(async)]
-fn call_deferred_gd_engine_class(ctx: &crate::framework::TestContext) -> TaskHandle {
+fn run_deferred_dyn_gd(ctx: &crate::framework::TestContext) -> TaskHandle {
+    let mut test_node = DeferredTestNode::new_alloc();
+    ctx.scene_tree.clone().add_child(&test_node);
+
+    // Explicitly check that this can be invoked on `DynGd` (NOT deref to &T).
+    let mut dyn_gd: DynGd<Object, dyn ForwardTrait> = test_node.clone().into_dyn().upcast();
+    dyn_gd.run_deferred_gd(DeferredTestNode::accept_dyn_gd);
+
+    let mut guard = test_node.bind_mut();
+    guard.create_assertion_task()
+}
+
+#[itest(async)]
+fn run_deferred_gd_user_class(ctx: &crate::framework::TestContext) -> TaskHandle {
+    let mut test_node = DeferredTestNode::new_alloc();
+    ctx.scene_tree.clone().add_child(&test_node);
+
+    test_node.run_deferred_gd(DeferredTestNode::accept_gd);
+
+    let mut guard = test_node.bind_mut();
+    guard.create_assertion_task()
+}
+
+#[itest(async)]
+fn run_deferred_engine_class(ctx: &crate::framework::TestContext) -> TaskHandle {
     let mut test_node = DeferredTestNode::new_alloc();
     ctx.scene_tree.clone().add_child(&test_node);
 
     let mut node = test_node.clone().upcast::<Node>();
-    node.apply_deferred(|that_node| that_node.set_name(ACCEPTED_NAME));
+    node.run_deferred_gd(|mut that_node| that_node.set_name(ACCEPTED_NAME));
 
-    let mut gd_mut = test_node.bind_mut();
-    gd_mut.create_assertion_task()
+    let mut guard = test_node.bind_mut();
+    guard.create_assertion_task()
 }

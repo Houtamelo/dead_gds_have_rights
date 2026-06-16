@@ -48,8 +48,9 @@ mod godot_version;
 #[cfg(feature = "api-custom")]
 #[path = ""]
 mod depend_on_custom {
-    use super::*;
     use std::borrow::Cow;
+
+    use super::*;
 
     pub(crate) mod godot_exe;
     pub(crate) mod godot_version;
@@ -82,9 +83,9 @@ pub use depend_on_custom::*;
 #[cfg(feature = "api-custom-json")]
 #[path = ""]
 mod depend_on_custom_json {
-    use super::*;
-
     use std::borrow::Cow;
+
+    use super::*;
 
     pub(crate) mod godot_json;
     pub(crate) mod godot_version;
@@ -121,6 +122,34 @@ mod depend_on_prebuilt {
         prebuilt::load_gdextension_json()
     }
 
+    /// Determines the **target** (e.g. cross-compilation).
+    ///
+    /// The target is different from the host platform where the build is running. In build scripts, it needs to be evaluated at "runtime"
+    /// (aka. build execution time) via environment variables. Using `#[cfg(...)]` attributes would yield the host platform instead.
+    fn select_target_platform() -> prebuilt::TargetPlatform {
+        let target_os =
+            std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS must be set by Cargo");
+
+        match target_os.as_str() {
+            // Windows.
+            "windows" => prebuilt::TargetPlatform::Windows,
+
+            // MacOS, including iOS.
+            "ios" | "macos" => prebuilt::TargetPlatform::MacOS,
+
+            // Linux, including other Unix-like systems such as BSD and Android.
+            "android" | "dragonfly" | "freebsd" | "linux" | "netbsd" | "openbsd" => {
+                prebuilt::TargetPlatform::Linux
+            }
+
+            // WebAssembly: Godot requires Emscripten.
+            "emscripten" => prebuilt::TargetPlatform::Wasm,
+
+            // Others are currently unsupported. If needed, better to add explicit than accidental support.
+            other => panic!("Unsupported target OS `{other}`."),
+        }
+    }
+
     pub fn write_gdextension_headers(h_path: &Path, rs_path: &Path, watch: &mut StopWatch) {
         // Note: prebuilt artifacts just return a static str.
         let h_contents = prebuilt::load_gdextension_header_h();
@@ -128,7 +157,8 @@ mod depend_on_prebuilt {
             .unwrap_or_else(|e| panic!("failed to write gdextension_interface.h: {e}"));
         watch.record("write_header_h");
 
-        let rs_contents = prebuilt::load_gdextension_header_rs();
+        let platform = select_target_platform();
+        let rs_contents = prebuilt::load_gdextension_header_rs_for_platform(platform);
         std::fs::write(rs_path, rs_contents.as_ref())
             .unwrap_or_else(|e| panic!("failed to write gdextension_interface.rs: {e}"));
         watch.record("write_header_rs");
@@ -265,4 +295,56 @@ pub fn before_api(major_minor: &str) -> bool {
 
 pub fn since_api(major_minor: &str) -> bool {
     !before_api(major_minor)
+}
+
+pub fn emit_safeguard_levels() {
+    // Levels: disengaged (0), balanced (1), strict (2)
+    let mut safeguards_level = if cfg!(debug_assertions) { 2 } else { 1 };
+
+    // Override default level with Cargo feature, in dev/release profiles.
+    #[cfg(debug_assertions)]
+    if cfg!(feature = "safeguards-dev-balanced") {
+        safeguards_level = 1;
+    }
+    #[cfg(not(debug_assertions))]
+    if cfg!(feature = "safeguards-release-disengaged") {
+        safeguards_level = 0;
+    }
+
+    println!(r#"cargo:rustc-check-cfg=cfg(safeguards_balanced)"#);
+    println!(r#"cargo:rustc-check-cfg=cfg(safeguards_strict)"#);
+
+    // Emit #[cfg]s cumulatively: strict builds get both balanced and strict.
+    if safeguards_level >= 1 {
+        println!(r#"cargo:rustc-cfg=safeguards_balanced"#);
+    }
+    if safeguards_level >= 2 {
+        println!(r#"cargo:rustc-cfg=safeguards_strict"#);
+    }
+}
+
+/// Try `new_name` env var first, fall back to `old_name` with a deprecation warning (only from `godot-codegen` build).
+/// The `once` static ensures the warning is emitted at most once per build.
+// TODO(v0.6): remove old names.
+#[cfg(any(feature = "api-custom", feature = "api-custom-json"))]
+pub(crate) fn env_var_or_deprecated(
+    once: &'static std::sync::Once,
+    new_name: &str,
+    old_name: &str,
+) -> Result<String, std::env::VarError> {
+    std::env::var(new_name).or_else(|_| {
+        let result = std::env::var(old_name);
+        if result.is_ok()
+            && std::env::var("CARGO_PKG_NAME")
+                .map(|name| name == "godot-codegen")
+                .unwrap_or(false)
+        {
+            once.call_once(|| {
+                println!(
+                    "cargo:warning=env var `{old_name}` is deprecated, use `{new_name}` instead."
+                );
+            });
+        }
+        result
+    })
 }

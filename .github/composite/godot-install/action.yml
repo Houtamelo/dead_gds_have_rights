@@ -26,7 +26,7 @@ runs:
       run: |
         runnerDir=$(echo "${{ runner.temp }}" | sed "s!\\\\!/!")
         echo "RUNNER_DIR=$runnerDir" >> $GITHUB_ENV
-        echo "GODOT4_BIN=$runnerDir/godot_bin/${{ inputs.godot-binary }}" >> $GITHUB_ENV
+        echo "GDRUST_GODOT_BIN=$runnerDir/godot_bin/${{ inputs.godot-binary }}" >> $GITHUB_ENV
       shell: bash
 
 #    - name: "Check cache for installed Godot version"
@@ -50,11 +50,17 @@ runs:
           url="https://nightly.link/Bromeon/godot4-nightly/workflows/compile-godot-stable/master/$ARTIFACT_NAME.zip"
         fi
         
-        curl "$url" -Lo artifact.zip --retry 3
+        # `--retry-all-errors` needed, because default `--retry` only covers timeouts (error 28) and HTTP 5xx,
+        # but not recv failures (error 56) which can occur on flaky networks.
+        curl "$url" -Lo artifact.zip \
+          --retry 3 \
+          --retry-delay 3 \
+          --retry-all-errors \
+          --connect-timeout 10
         unzip -q artifact.zip -d $RUNNER_DIR/godot_bin
       shell: bash
 
     - name: "Prepare Godot executable"
       run: |
-        chmod +x $GODOT4_BIN
+        chmod +x $GDRUST_GODOT_BIN
       shell: bash

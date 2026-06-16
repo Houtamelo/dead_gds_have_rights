@@ -5,11 +5,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::itest;
-
 use godot::classes::{mesh, window};
 use godot::global::{InlineAlignment, Key, KeyModifierMask, Orientation};
 use godot::obj::{EngineBitfield, EngineEnum};
+use godot::register::info::PropertyUsageFlags;
+
+use crate::framework::itest;
 
 #[itest]
 fn enum_with_masked_bitfield_ord() {
@@ -190,4 +191,44 @@ fn bitfield_all_constants() {
     assert_eq!(shift_constant.godot_name(), "KEY_MASK_SHIFT");
     assert_eq!(shift_constant.value(), KeyModifierMask::SHIFT);
     assert_eq!(shift_constant.value().ord(), 1 << 25);
+}
+
+#[itest]
+fn bitfield_debug() {
+    let flags = KeyModifierMask::CTRL | KeyModifierMask::ALT | KeyModifierMask::SHIFT;
+    assert_eq!(
+        format!("{flags:?}"),
+        "KeyModifierMask { SHIFT | ALT | CTRL }"
+    );
+
+    let flags = PropertyUsageFlags::EDITOR | PropertyUsageFlags::READ_ONLY;
+    assert_eq!(
+        format!("{flags:?}"),
+        "PropertyUsageFlags { EDITOR | READ_ONLY }"
+    );
+
+    // Zero bits (here NONE) are only included if no other bits are found.
+    let flags = PropertyUsageFlags::NONE;
+    assert_eq!(format!("{flags:?}"), "PropertyUsageFlags { NONE }");
+
+    // Multi-bit constants (DEFAULT) are included individually and with all expanded bits.
+    let flags = PropertyUsageFlags::DEFAULT;
+    assert_eq!(
+        format!("{flags:?}"),
+        "PropertyUsageFlags { STORAGE | EDITOR | DEFAULT | NO_EDITOR }"
+    );
+}
+
+#[itest]
+fn bitfield_debug_unknown() {
+    let flags = KeyModifierMask::from_ord(77);
+    assert_eq!(format!("{flags:?}"), "KeyModifierMask { Unknown(0x4D) }");
+
+    let flags = PropertyUsageFlags::EDITOR
+        | PropertyUsageFlags::READ_ONLY
+        | PropertyUsageFlags::from_ord(1 << 31);
+    assert_eq!(
+        format!("{flags:?}"),
+        "PropertyUsageFlags { EDITOR | READ_ONLY | Unknown(0x80000000) }"
+    );
 }

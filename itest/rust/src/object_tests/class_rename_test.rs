@@ -5,8 +5,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::itest;
 use godot::prelude::*;
+
+use crate::framework::itest;
 
 pub mod dont_rename {
     use super::*;
@@ -27,9 +28,9 @@ pub mod rename {
 #[itest]
 fn renaming_changes_the_name() {
     assert_ne!(
-        dont_rename::RepeatMe::class_name(),
-        rename::RepeatMe::class_name()
+        dont_rename::RepeatMe::class_id(),
+        rename::RepeatMe::class_id()
     );
-    assert_eq!(dont_rename::RepeatMe::class_name().to_string(), "RepeatMe");
-    assert_eq!(rename::RepeatMe::class_name().to_string(), "NoRepeat");
+    assert_eq!(dont_rename::RepeatMe::class_id().to_string(), "RepeatMe");
+    assert_eq!(rename::RepeatMe::class_id().to_string(), "NoRepeat");
 }

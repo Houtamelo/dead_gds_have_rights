@@ -1,8 +1,8 @@
 [package]
 name = "godot-core"
-version = "0.3.4"
-edition = "2021"
-rust-version = "1.87"
+version = "0.4.4"
+edition.workspace = true
+rust-version.workspace = true
 license = "MPL-2.0"
 keywords = ["gamedev", "godot", "engine", "2d", "3d"] # possibly: "ffi"
 categories = ["game-engines", "graphics"]
@@ -30,29 +30,28 @@ api-custom = ["godot-ffi/api-custom", "godot-codegen/api-custom"]
 api-custom-json = ["godot-codegen/api-custom-json"]
 # [version-sync] [[
 #  [line] api-$kebabVersion = ["godot-ffi/api-$kebabVersion"]
-api-4-1 = ["godot-ffi/api-4-1"]
-api-4-1-1 = ["godot-ffi/api-4-1-1"]
-api-4-1-2 = ["godot-ffi/api-4-1-2"]
-api-4-1-3 = ["godot-ffi/api-4-1-3"]
-api-4-1-4 = ["godot-ffi/api-4-1-4"]
 api-4-2 = ["godot-ffi/api-4-2"]
-api-4-2-1 = ["godot-ffi/api-4-2-1"]
-api-4-2-2 = ["godot-ffi/api-4-2-2"]
 api-4-3 = ["godot-ffi/api-4-3"]
 api-4-4 = ["godot-ffi/api-4-4"]
+api-4-5 = ["godot-ffi/api-4-5"]
+api-4-6 = ["godot-ffi/api-4-6"]
 # ]]
 
+# Safeguard levels (see godot/lib.rs for detailed documentation).
+safeguards-dev-balanced = ["godot-ffi/safeguards-dev-balanced"]
+safeguards-release-disengaged = ["godot-ffi/safeguards-release-disengaged"]
+
 [dependencies]
-godot-ffi = { path = "../godot-ffi", version = "=0.3.4" }
+godot-ffi = { path = "../godot-ffi", version = "=0.4.4" }
 
 # See https://docs.rs/glam/latest/glam/index.html#feature-gates
 glam = { workspace = true }
 serde = { workspace = true, optional = true }
-godot-cell = { path = "../godot-cell", version = "=0.3.4" }
+godot-cell = { path = "../godot-cell", version = "=0.4.4" }
 
 [build-dependencies]
-godot-bindings = { path = "../godot-bindings", version = "=0.3.4" }
-godot-codegen = { path = "../godot-codegen", version = "=0.3.4" }
+godot-bindings = { path = "../godot-bindings", version = "=0.4.4" }
+godot-codegen = { path = "../godot-codegen", version = "=0.4.4" }
 
 # Reverse dev dependencies so doctests can use `godot::` prefix.
 [dev-dependencies]

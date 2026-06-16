@@ -5,8 +5,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::itest;
-use godot::prelude::*; // Expect match_class! to be in prelude.
+use godot::prelude::*;
+
+use crate::framework::itest; // Expect match_class! to be in prelude.
 
 // Ensure static types are as expected.
 fn require_object(_: &Object) {}
@@ -125,7 +126,7 @@ fn match_class_named_fallback_matched() {
         // Named fallback with access to original object.
         other => {
             require_object(&other);
-            assert_eq!(other.get_class(), "Resource".into());
+            assert_eq!(other.get_class(), "Resource");
             3
         }
     };
@@ -144,7 +145,7 @@ fn match_class_named_mut_fallback_matched() {
         // Named fallback with access to original object.
         mut other => {
             require_mut_object(&mut other);
-            assert_eq!(other.get_class(), "Resource".into());
+            assert_eq!(other.get_class(), "Resource");
             3
         }
     };

@@ -5,13 +5,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::util::ident;
-use crate::SubmitFn;
+use std::fs;
+use std::path::Path;
+
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::quote;
 use regex::Regex;
-use std::fs;
-use std::path::Path;
+
+use crate::SubmitFn;
+use crate::util::{ident, make_load_safety_doc};
 
 pub fn generate_sys_interface_file(
     h_path: &Path,
@@ -75,20 +77,21 @@ fn generate_proc_address_funcs(h_path: &Path) -> TokenStream {
     }
 
     // Do not derive Copy -- even though the struct is bitwise-copyable, this is rarely needed and may point to an error.
+    let safety_doc = make_load_safety_doc();
     let code = quote! {
         pub struct GDExtensionInterface {
             #( #fptr_decls )*
         }
 
         impl GDExtensionInterface {
-            // TODO: Figure out the right safety preconditions. This currently does not have any because incomplete safety docs
-            // can cause issues with people assuming they are sufficient.
-            #[allow(clippy::missing_safety_doc)]
+            #safety_doc
             pub(crate) unsafe fn load(
                 get_proc_address: crate::GDExtensionInterfaceGetProcAddress,
             ) -> Self {
                 let get_proc_address = get_proc_address.expect("invalid get_proc_address function pointer");
 
+                // SAFETY: transmute relies on GDExtensionInterfaceFunctionPtr and specific function pointer types
+                // having the same layout (both are Option<unsafe extern "C" fn(...)>).
                 Self {
                     #( #fptr_inits )*
                 }

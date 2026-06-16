@@ -5,13 +5,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::ops::Neg;
+
 use godot_ffi as sys;
-use sys::{ffi_methods, ExtVariantType, GodotFfi};
+use sys::{ExtVariantType, GodotFfi, ffi_methods};
 
 use crate::builtin::math::{ApproxEq, FloatExt};
-use crate::builtin::{real, Vector3};
-
-use std::ops::Neg;
+use crate::builtin::{Vector3, real};
 
 /// 3D plane in [Hessian normal form](https://mathworld.wolfram.com/HessianNormalForm.html).
 ///
@@ -23,8 +23,11 @@ use std::ops::Neg;
 /// unit length and will panic if this invariant is violated. This is not separately
 /// annotated for each method.
 ///
-/// # Godot docs
+/// # Soft invariants
+/// `Plane` requires that the normal vector has unit length for most operations, which is validated only on a best-effort basis. Violations may
+/// cause panics in Debug mode. See also [_Builtin API design_](../__docs/index.html#6-public-fields-and-soft-invariants).
 ///
+/// # Godot docs
 /// [Plane (stable)](https://docs.godotengine.org/en/stable/classes/class_plane.html)
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -283,7 +286,7 @@ unsafe impl GodotFfi for Plane {
     }
 }
 
-crate::meta::impl_godot_as_self!(Plane);
+crate::meta::impl_godot_as_self!(Plane: ByValue);
 
 impl ApproxEq for Plane {
     /// Finds whether the two planes are approximately equal.
@@ -317,10 +320,8 @@ impl std::fmt::Display for Plane {
 
 #[cfg(test)]
 mod test {
-    use crate::assert_eq_approx;
-    use crate::assert_ne_approx;
-
     use super::*;
+    use crate::{assert_eq_approx, assert_ne_approx};
 
     /// Tests that none of the constructors panic for some simple planes.
     #[test]

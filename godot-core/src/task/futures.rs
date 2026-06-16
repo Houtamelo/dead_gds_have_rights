@@ -15,11 +15,16 @@ use std::thread::ThreadId;
 
 use crate::builtin::{Callable, RustCallable, Signal, Variant};
 use crate::classes::object::ConnectFlags;
-use crate::meta::sealed::Sealed;
+use crate::global::godot_error;
 use crate::meta::InParamTuple;
-use crate::obj::{EngineBitfield, Gd, GodotClass, WithSignals};
-use crate::registry::signal::TypedSignal;
+use crate::meta::sealed::Sealed;
+use crate::obj::signal::TypedSignal;
+use crate::obj::{Gd, GodotClass, WithSignals};
+use crate::sys;
 
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Internal re-exports
+#[rustfmt::skip] // Do not reorder.
 pub(crate) use crate::impl_dynamic_send;
 
 /// The panicking counter part to the [`FallibleSignalFuture`].
@@ -111,7 +116,7 @@ impl<R: IntoDynamicSend> PartialEq for SignalFutureResolver<R> {
 }
 
 impl<R: InParamTuple + IntoDynamicSend> RustCallable for SignalFutureResolver<R> {
-    fn invoke(&mut self, args: &[&Variant]) -> Result<Variant, ()> {
+    fn invoke(&mut self, args: &[&Variant]) -> Variant {
         let waker = {
             let mut data = self.data.lock().unwrap();
             data.state = SignalFutureState::Ready(R::from_variant_array(args).into_dynamic_send());
@@ -124,7 +129,7 @@ impl<R: InParamTuple + IntoDynamicSend> RustCallable for SignalFutureResolver<R>
             waker.wake();
         }
 
-        Ok(Variant::nil())
+        Variant::nil()
     }
 }
 
@@ -193,9 +198,11 @@ pub struct FallibleSignalFuture<R: InParamTuple + IntoDynamicSend> {
 
 impl<R: InParamTuple + IntoDynamicSend> FallibleSignalFuture<R> {
     fn new(signal: Signal) -> Self {
-        debug_assert!(
+        sys::strict_assert!(
             !signal.is_null(),
-            "Failed to create a future for an invalid Signal!\nEither the signal object was already freed or the signal was not registered in the object before using it.",
+            "Failed to create future for invalid signal:\n\
+            Either the signal object was already freed, or it\n\
+            was not registered in the object before being used.",
         );
 
         let data = Arc::new(Mutex::new(SignalFutureData::default()));
@@ -203,9 +210,9 @@ impl<R: InParamTuple + IntoDynamicSend> FallibleSignalFuture<R> {
         // The callable currently requires that the return value is Sync + Send.
         let callable = SignalFutureResolver::new(data.clone());
 
-        signal.connect(
+        signal.connect_flags(
             &Callable::from_custom(callable.clone()),
-            ConnectFlags::ONE_SHOT.ord() as i64,
+            ConnectFlags::ONE_SHOT,
         );
 
         Self {
@@ -231,7 +238,9 @@ impl<R: InParamTuple + IntoDynamicSend> FallibleSignalFuture<R> {
             SignalFutureState::Dead => Poll::Ready(Err(FallibleSignalFutureError)),
             SignalFutureState::Ready(value) => {
                 let Some(value) = DynamicSend::extract_if_safe(value) else {
-                    panic!("the awaited signal was not emitted on the main-thread, but contained a non Send argument");
+                    panic!(
+                        "the awaited signal was not emitted on the main-thread, but contained a non Send argument"
+                    );
                 };
 
                 Poll::Ready(Ok(value))
@@ -372,8 +381,10 @@ pub unsafe trait DynamicSend: Send + Sealed {
 }
 
 /// Value that can be sent across threads, but only accessed on its original thread.
+///
+/// When moved to another thread, the inner value can no longer be accessed and will be leaked when the `ThreadConfined` is dropped.
 pub struct ThreadConfined<T> {
-    value: T,
+    value: Option<T>,
     thread_id: ThreadId,
 }
 
@@ -383,13 +394,37 @@ unsafe impl<T> Send for ThreadConfined<T> {}
 impl<T> ThreadConfined<T> {
     pub(crate) fn new(value: T) -> Self {
         Self {
-            value,
+            value: Some(value),
             thread_id: std::thread::current().id(),
         }
     }
 
-    pub(crate) fn extract(self) -> Option<T> {
-        (self.thread_id == std::thread::current().id()).then_some(self.value)
+    /// Retrieve the inner value, if the current thread is the one in which the `ThreadConfined` was created.
+    ///
+    /// If this fails, the value will be leaked immediately.
+    pub(crate) fn extract(mut self) -> Option<T> {
+        if self.is_original_thread() {
+            self.value.take()
+        } else {
+            None // causes Drop -> leak.
+        }
+    }
+
+    fn is_original_thread(&self) -> bool {
+        self.thread_id == std::thread::current().id()
+    }
+}
+
+impl<T> Drop for ThreadConfined<T> {
+    fn drop(&mut self) {
+        if !self.is_original_thread() {
+            std::mem::forget(self.value.take());
+
+            // Cannot panic, potentially during unwind already.
+            godot_error!(
+                "Dropped ThreadConfined<T> on a different thread than it was created on. The inner T value will be leaked."
+            );
+        }
     }
 }
 
@@ -433,10 +468,6 @@ macro_rules! impl_dynamic_send {
                 }
             }
         )+
-    };
-
-    (Send; builtin::{$($ty:ident),+}) => {
-        impl_dynamic_send!(Send; $($crate::builtin::$ty),+);
     };
 
     (tuple; $($arg:ident: $ty:ident),*) => {
@@ -496,12 +527,13 @@ macro_rules! impl_dynamic_send {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
+    use super::{SignalFutureResolver, ThreadConfined};
     use crate::classes::Object;
     use crate::obj::Gd;
     use crate::sys;
-
-    use super::SignalFutureResolver;
 
     /// Test that the hash of a cloned future resolver is equal to its original version. With this equality in place, we can create new
     /// Callables that are equal to their original version but have separate reference counting.
@@ -514,5 +546,48 @@ mod tests {
         let hash_b = sys::hash_value(&resolver_b);
 
         assert_eq!(hash_a, hash_b);
+    }
+
+    // Test that dropping ThreadConfined<T> on another thread leaks the inner value.
+    #[test]
+    #[cfg_attr(
+        all(target_family = "wasm", not(target_feature = "atomics")),
+        ignore = "Threading not available"
+    )]
+    fn thread_confined_extract() {
+        let confined = ThreadConfined::new(772);
+        assert_eq!(confined.extract(), Some(772));
+
+        let confined = ThreadConfined::new(772);
+
+        let handle = thread::spawn(move || {
+            assert!(confined.extract().is_none());
+        });
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        all(target_family = "wasm", not(target_feature = "atomics")),
+        ignore = "Threading not available"
+    )]
+    fn thread_confined_leak_on_other_thread() {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        struct DropCounter;
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drop_counter = DropCounter;
+        let confined = ThreadConfined::new(drop_counter);
+
+        let handle = thread::spawn(move || drop(confined));
+        handle.join().unwrap();
+
+        // The counter should still be 0, meaning Drop was not called (leaked).
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 0);
     }
 }

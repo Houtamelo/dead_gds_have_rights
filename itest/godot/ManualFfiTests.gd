@@ -26,29 +26,73 @@ func test_to_string():
 	
 	assert_eq(str(ffi), "VirtualMethodTest[integer=0]")
 
+func test_var_accessors():
+	var obj = VarAccessors.new()
+
+	# a) generated getter + setter.
+	assert_eq(obj.a_default, 0)
+	obj.a_default = 1
+	assert_eq(obj.a_default, 1)
+
+	# b) custom getter (default name), generated setter.
+	assert_eq(obj.b_get, "")
+	obj.b_get = "two"
+	assert_eq(obj.b_get, "two")
+
+	# c) generated getter, custom setter (default name).
+	obj.c_set = 3
+	assert_eq(obj.c_set, 3)
+
+	# d) custom getter (custom name), generated setter.
+	obj.d_myget = 4
+	assert_eq(obj.my_custom_get(), 4 + 0 + 0) # d+h+j.
+
+	# e) generated getter, custom setter (custom name).
+	obj.my_custom_set(5) # Sets e, i, j to 5.
+	assert_eq(obj.e_myset, 5)
+
+	# f) read-only (no setter).
+	assert_eq(obj.f_noset, 0)
+
+	# g) write-only (no getter).
+	obj.g_noget = 7
+	assert_eq(obj.gdscript_get("g"), 7)
+
+	# h) custom getter (custom name), no setter.
+	assert_eq(obj.my_custom_get(), 4 + 0 + 5) # d+h+j (h starts at 0).
+
+	# i) no getter, custom setter (custom name).
+	obj.my_custom_set(6) # Sets e, i, j to 6.
+	assert_eq(obj.gdscript_get("i"), 6)
+
+	# j) custom getter (custom name), custom setter (custom name).
+	assert_eq(obj.j_myget_myset, 4 + 0 + 6) # d+h+j via my_custom_get().
+	assert_eq(obj.my_custom_get(), 4 + 0 + 6) # Same.
+
+	obj.free()
+
+func test_var_no_get_panics_on_read():
+	mark_test_pending()
+
+	var obj = VarAccessors.new()
+	# Getter is registered (panicking), unlike old behavior where no getter existed.
+	assert_that(obj.has_method("__disabled_get_g_noget"), "panicking getter should be registered")
+
+	obj.g_noget = 7
+	Engine.print_error_messages = false
+	var val = obj.g_noget # Getter panics in Rust; returns default, execution continues.
+	Engine.print_error_messages = true
+
+	# Panic was caught: returned default (0) instead of actual field value (7).
+	assert_eq(val, 0, "no_get getter should return default after panic")
+	# The field itself is intact.
+	assert_eq(obj.gdscript_get("g"), 7, "actual field value should be preserved")
+
+	obj.free()
+	mark_test_succeeded()
+
 func test_export():
 	var obj = HasProperty.new()
-
-	assert_eq(obj.int_val, 0)
-	obj.int_val = 1
-	assert_eq(obj.int_val, 1)
-
-	assert_eq(obj.int_val_read, 2)
-
-	obj.int_val_write = 3
-	assert_eq(obj.retrieve_int_val_write(), 3)
-
-	assert_eq(obj.int_val_rw, 0)
-	obj.int_val_rw = 4
-	assert_eq(obj.int_val_rw, 4)
-
-	assert_eq(obj.int_val_getter, 0)
-	obj.int_val_getter = 5
-	assert_eq(obj.int_val_getter, 5)
-
-	assert_eq(obj.int_val_setter, 0)
-	obj.int_val_setter = 5
-	assert_eq(obj.int_val_setter, 5)
 
 	obj.string_val = "test val"
 	assert_eq(obj.string_val, "test val")
@@ -56,15 +100,26 @@ func test_export():
 	var node = Node.new()
 	obj.object_val = node
 	assert_eq(obj.object_val, node)
-	
-	var texture_val_meta = obj.get_property_list().filter(
-		func(el): return el["name"] == "texture_val_rw"
+
+	# Test resource_var (OnEditor with default #[var]).
+	var res1 = Resource.new()
+	obj.resource_var = res1
+	assert_eq(obj.resource_var, res1)
+
+	# Test resource_rw (custom getter/setter).
+	var res2 = Resource.new()
+	obj.resource_rw = res2
+	assert_eq(obj.resource_rw, res2)
+
+	# Test resource_rw property metadata.
+	var resource_rw_meta = obj.get_property_list().filter(
+		func(el): return el["name"] == "resource_rw"
 	).front()
-	
-	assert_that(texture_val_meta != null, "'texture_val_rw' is defined")
-	assert_eq(texture_val_meta["hint"], PropertyHint.PROPERTY_HINT_RESOURCE_TYPE)
-	assert_eq(texture_val_meta["hint_string"], "Texture")
-	
+
+	assert_that(resource_rw_meta != null, "'resource_rw' is defined")
+	assert_eq(resource_rw_meta["hint"], PropertyHint.PROPERTY_HINT_RESOURCE_TYPE)
+	assert_eq(resource_rw_meta["hint_string"], "Resource")
+
 	obj.free()
 	node.free()
 
@@ -323,6 +378,39 @@ func test_custom_property_wrong_values_2():
 	has_property.not_exportable = {"a": "hello", "b": Callable()} # Causes current function to fail. Following code unreachable.
 
 	assert_fail("HasCustomProperty.not_exportable should only accept dictionaries with float values")
+
+func test_phantom_var():
+	var obj := HasPhantomVar.new()
+
+	assert_eq(obj.read_only, 0)
+	assert_eq(obj.read_write, 0)
+
+	obj.read_write = 1
+
+	assert_eq(obj.read_only, 1)
+	assert_eq(obj.read_write, 1)
+
+func test_phantom_var_writing_read_only():
+	if runs_release():
+		return
+
+	# This must be untyped, otherwise the parser complains about our invalid write.
+	var obj = HasPhantomVar.new()
+	expect_fail()
+	obj.read_only = 1
+	assert_fail("HasPhantomVar.read_only should not be writable")
+
+func test_phantom_var_enum():
+	var obj := HasPhantomVar.new()
+
+	assert_eq(obj.read_write_engine_enum, VerticalAlignment.VERTICAL_ALIGNMENT_CENTER)
+	assert_eq(obj.read_write_bit_enum, KeyModifierMask.KEY_MASK_ALT | KeyModifierMask.KEY_MASK_CTRL)
+
+	obj.read_write_engine_enum = VerticalAlignment.VERTICAL_ALIGNMENT_TOP
+	obj.read_write_bit_enum = KeyModifierMask.KEY_MASK_ALT | KeyModifierMask.KEY_MASK_SHIFT
+
+	assert_eq(obj.read_write_engine_enum, VerticalAlignment.VERTICAL_ALIGNMENT_TOP)
+	assert_eq(obj.read_write_bit_enum, KeyModifierMask.KEY_MASK_ALT | KeyModifierMask.KEY_MASK_SHIFT)
 
 func test_option_export():
 	var obj := OptionExportFfiTest.new()

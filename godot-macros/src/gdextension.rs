@@ -6,10 +6,10 @@
  */
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{ToTokens, quote};
 
-use crate::util::{bail, ident, validate_impl, KvParser};
 use crate::ParseResult;
+use crate::util::{KvParser, bail, extract_typename, ident, validate_impl};
 
 pub fn attribute_gdextension(item: venial::Item) -> ParseResult<TokenStream> {
     let mut impl_decl = match item {
@@ -26,6 +26,11 @@ pub fn attribute_gdextension(item: venial::Item) -> ParseResult<TokenStream> {
     }
 
     let drained_attributes = std::mem::take(&mut impl_decl.attributes);
+
+    if is_dependency_gdextension(&impl_decl.self_ty) {
+        return Ok(impl_decl.to_token_stream());
+    }
+
     let mut parser = KvParser::parse_required(&drained_attributes, "gdextension", &impl_decl)?;
     let entry_point = parser.handle_ident("entry_point")?;
     let entry_symbol = parser.handle_ident("entry_symbol")?;
@@ -54,90 +59,12 @@ pub fn attribute_gdextension(item: venial::Item) -> ParseResult<TokenStream> {
         #deprecation
         #impl_decl
 
-        // This cfg cannot be checked from the outer proc-macro since its 'target' is the build
-        // host. See: https://github.com/rust-lang/rust/issues/42587
-        #[cfg(target_os = "emscripten")]
-        fn emscripten_preregistration() {
-            let pkg_name = env!("CARGO_PKG_NAME");
-            let wasm_binary = <#impl_ty as ::godot::init::ExtensionLibrary>::override_wasm_binary()
-                .map_or_else(
-                    || std::string::String::from("null"),
-                    |bin| format!("'{}'", bin.replace("\\", "\\\\").replace("'", "\\'"))
-                );
-
-            // Module is documented here[1] by emscripten, so perhaps we can consider it a part
-            // of its public API? In any case for now we mutate global state directly in order
-            // to get things working.
-            // [1] https://emscripten.org/docs/api_reference/module.html
-            //
-            // Warning: It may be possible that in the process of executing the code leading up
-            // to `emscripten_run_script` that we might trigger usage of one of the symbols we
-            // wish to monkey patch? It seems fairly unlikely, especially as long as no i64 are
-            // involved, but I don't know what guarantees we have here.
-            //
-            // We should keep an eye out for these sorts of failures!
-            let script = format!(
-                r#"var pkgName = '{pkg_name}';
-                var wasmBinary = {wasm_binary};
-                if (wasmBinary === null) {{
-                    var snakePkgName = pkgName.replaceAll('-', '_');
-                    var normalLibName = snakePkgName + '.wasm';
-                    var threadedLibName = snakePkgName + '.threads.wasm';
-                    if (normalLibName in LDSO.loadedLibsByName) {{
-                        var libName = normalLibName;
-                    }} else if (threadedLibName in LDSO.loadedLibsByName) {{
-                        var libName = threadedLibName;
-                    }} else {{
-                        // Always print to console, even if the error is suppressed.
-                        console.error(`godot-rust could not find the Wasm module '${{normalLibName}}' nor '${{threadedLibName}}', one of which is needed by default to load the '${{pkgName}}' crate. This indicates its '.wasm' binary file was renamed to an unexpected name.\n\nPlease ensure its Wasm binary file has one of those names in the game's web export files. This may require updating Wasm paths in the crate's corresponding '.gdextension' file, or just renaming the Wasm file to one of the expected names otherwise.\n\nIf that GDExtension uses a different Wasm filename, please ensure it informs this new name to godot-rust by returning 'Some("newname.wasm")' from 'ExtensionLibrary::override_wasm_binary'.`);
-                        throw new Error(`Wasm module '${{normalLibName}}' not found. Check the console for more information.`);
-                    }}
-                }} else if (!wasmBinary.endsWith(".wasm")) {{
-                    console.error(`godot-rust received an invalid Wasm binary name ('${{wasmBinary}}') from crate '${{pkgName}}', as the '.wasm' extension was missing.\n\nPlease ensure the 'ExtensionLibrary::override_wasm_binary' function for that GDExtension always returns a filename with the '.wasm' extension and try again.`);
-                    throw new Error(`Invalid Wasm module '${{wasmBinary}}' (missing '.wasm' extension). Check the console for more information.`);
-                }} else if (wasmBinary in LDSO.loadedLibsByName) {{
-                    var libName = wasmBinary;
-                }} else {{
-                    console.error(`godot-rust could not find the Wasm module '${{wasmBinary}}', needed to load the '${{pkgName}}' crate. This indicates its '.wasm' binary file was renamed to an unexpected name.\n\nPlease ensure its Wasm binary file is named '${{wasmBinary}}' in the game's web export files. This may require updating Wasm paths in the crate's corresponding '.gdextension' file, or just renaming the Wasm file to the expected name otherwise.`);
-                    throw new Error(`Wasm module '${{wasmBinary}}' not found. Check the console for more information.`);
-                }}
-                var dso = LDSO.loadedLibsByName[libName];
-                // This property was renamed as of emscripten 3.1.34
-                var dso_exports = "module" in dso ? dso["module"] : dso["exports"];
-                var registrants = [];
-                for (sym in dso_exports) {{
-                    if (sym.startsWith("dynCall_")) {{
-                        if (!(sym in Module)) {{
-                            console.log(`Patching Module with ${{sym}}`);
-                            Module[sym] = dso_exports[sym];
-                        }}
-                    }} else if (sym.startsWith("__godot_rust_registrant_")) {{
-                        registrants.push(sym);
-                    }}
-                }}
-                for (sym of registrants) {{
-                    console.log(`Running registrant ${{sym}}`);
-                    dso_exports[sym]();
-                }}
-                console.log("Added",  registrants.length, "plugins to registry!");
-            "#);
-
-            let script = std::ffi::CString::new(script).expect("Unable to create CString from script");
-
-            extern "C" { fn emscripten_run_script(script: *const std::ffi::c_char); }
-            unsafe { emscripten_run_script(script.as_ptr()); }
-        }
-
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         unsafe extern "C" fn #entry_point(
             get_proc_address: ::godot::sys::GDExtensionInterfaceGetProcAddress,
             library: ::godot::sys::GDExtensionClassLibraryPtr,
             init: *mut ::godot::sys::GDExtensionInitialization,
         ) -> ::godot::sys::GDExtensionBool {
-            // Required due to the lack of a constructor facility such as .init_array in rust wasm
-            #[cfg(target_os = "emscripten")]
-            emscripten_preregistration();
-
             ::godot::init::__gdext_load_library::<#impl_ty>(
                 get_proc_address,
                 library,
@@ -153,4 +80,17 @@ pub fn attribute_gdextension(item: venial::Item) -> ParseResult<TokenStream> {
         #[cfg(target_os = "linux")]
         ::godot::sys::register_hot_reload_workaround!();
     })
+}
+
+/// Returns `true` if given crate is being used as a dependency for some other GDExtension.
+///
+/// Dependencies shouldn't generate any code related to library registration (such as Wasm preregistration, entry point, hotreload workaround),
+/// delegating this burden to the specified "main" GDExtension library instead.
+fn is_dependency_gdextension(implementor_ty: &venial::TypeExpr) -> bool {
+    let Some(main_gdextension) = option_env!("GDRUST_MAIN_EXTENSION") else {
+        return false;
+    };
+    let typename =
+        extract_typename(implementor_ty).expect("`impl ExtensionLibrary` must have a typename");
+    typename.ident != main_gdextension
 }

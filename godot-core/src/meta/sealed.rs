@@ -10,7 +10,7 @@
 // To ensure the user does not implement `GodotType` for their own types.
 use crate::builtin::*;
 use crate::meta;
-use crate::meta::traits::{ArrayElement, GodotNullableFfi, GodotType};
+use crate::meta::traits::{Element, GodotNullableFfi, GodotType};
 use crate::obj::{DynGd, Gd, GodotClass, RawGd};
 
 pub trait Sealed {}
@@ -31,17 +31,11 @@ impl Sealed for Color {}
 impl Sealed for GString {}
 impl Sealed for StringName {}
 impl Sealed for NodePath {}
-impl Sealed for PackedByteArray {}
-impl Sealed for PackedInt32Array {}
-impl Sealed for PackedInt64Array {}
-impl Sealed for PackedFloat32Array {}
-impl Sealed for PackedFloat64Array {}
-impl Sealed for PackedStringArray {}
-impl Sealed for PackedVector2Array {}
-impl Sealed for PackedVector3Array {}
-#[cfg(since_api = "4.3")]
-impl Sealed for PackedVector4Array {}
-impl Sealed for PackedColorArray {}
+// Generic implementation for all PackedArray<T> types.
+use crate::builtin::PackedArray;
+
+// Implement Sealed for the generic PackedArray<T> type.
+impl<T: meta::PackedElement> Sealed for PackedArray<T> {}
 impl Sealed for Plane {}
 impl Sealed for Projection {}
 impl Sealed for Rid {}
@@ -50,7 +44,6 @@ impl Sealed for Rect2i {}
 impl Sealed for Signal {}
 impl Sealed for Transform2D {}
 impl Sealed for Transform3D {}
-impl Sealed for Dictionary {}
 impl Sealed for bool {}
 impl Sealed for i64 {}
 impl Sealed for i32 {}
@@ -64,17 +57,19 @@ impl Sealed for f64 {}
 impl Sealed for f32 {}
 impl Sealed for () {}
 impl Sealed for Variant {}
-impl<T: ArrayElement> Sealed for Array<T> {}
+impl<T: Element> Sealed for Array<T> {}
 impl<T: GodotClass> Sealed for Gd<T> {}
 impl<T: GodotClass> Sealed for RawGd<T> {}
 impl<T: GodotClass, D: ?Sized> Sealed for DynGd<T, D> {}
-impl<T: GodotClass> Sealed for meta::ObjectArg<T> {}
+impl<T: GodotClass, D: ?Sized + 'static> Sealed for Option<DynGd<T, D>> {}
 impl<T> Sealed for Option<T>
 where
     T: GodotType,
     T::Ffi: GodotNullableFfi,
 {
 }
+impl<T> Sealed for *mut T {} // FfiRawPointer.
+impl<T> Sealed for *const T {} // FfiRawPointer.
 impl<T1> Sealed for (T1,) {}
 impl<T1, T2> Sealed for (T1, T2) {}
 impl<T1, T2, T3> Sealed for (T1, T2, T3) {}

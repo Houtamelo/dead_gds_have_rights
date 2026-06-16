@@ -62,7 +62,6 @@ pub fn ptr_list_into_sys<T>(list: Vec<T>) -> (*const T, u32) {
 /// - `ptr` must have been returned from a call to `list_into_sys`.
 /// - `ptr` must be passed to this function exactly once and not used in any other context.
 #[cfg(since_api = "4.3")]
-#[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe fn ptr_list_from_sys<T>(ptr: *const T, len: u32) -> Box<[T]> {
     let ptr: *mut T = ptr.cast_mut();
     let len: usize = sys::conv::u32_to_usize(len);
@@ -80,7 +79,7 @@ pub const SYS_FALSE: sys::GDExtensionBool = bool_to_sys(false);
 
 #[cfg(test)]
 mod test {
-    use crate::conv::{bool_to_sys, u32_to_usize, SYS_FALSE, SYS_TRUE};
+    use crate::conv::{SYS_FALSE, SYS_TRUE, bool_to_sys, u32_to_usize};
 
     #[test]
     fn sys_bool() {

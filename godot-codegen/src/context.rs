@@ -5,6 +5,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::collections::{HashMap, HashSet};
+
+use proc_macro2::{Ident, TokenStream};
+use quote::{ToTokens, format_ident};
+
 use crate::generator::method_tables::MethodTableKey;
 use crate::generator::notifications;
 use crate::models::domain::{ArgPassing, GodotTy, RustTy, TyName};
@@ -12,10 +17,7 @@ use crate::models::json::{
     JsonBuiltinClass, JsonBuiltinMethod, JsonClass, JsonClassConstant, JsonClassMethod,
 };
 use crate::util::option_as_slice;
-use crate::{special_cases, util, JsonExtensionApi};
-use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, ToTokens};
-use std::collections::{HashMap, HashSet};
+use crate::{JsonExtensionApi, special_cases, util};
 
 #[derive(Default)]
 pub struct Context<'a> {
@@ -208,7 +210,7 @@ impl<'a> Context<'a> {
         methods: &[JsonBuiltinMethod],
         ctx: &mut Context,
     ) {
-        let builtin_ty = TyName::from_godot(builtin.name.as_str());
+        let builtin_ty = TyName::from_godot_builtin(builtin);
         if special_cases::is_builtin_type_deleted(&builtin_ty) {
             return;
         }
@@ -248,6 +250,15 @@ impl<'a> Context<'a> {
             .method_table_indices
             .get(key)
             .unwrap_or_else(|| panic!("did not register table index for key {key:?}"))
+    }
+
+    /// Yields cached sys pointer types – various pointer types declared in `gdextension_interface`
+    /// and used as parameters in exposed Godot APIs.
+    #[allow(dead_code)] // Currently unused, as RawPtr<P> covers all raw pointers.
+    pub fn cached_sys_pointer_types(&self) -> impl Iterator<Item = &RustTy> {
+        self.cached_rust_types
+            .values()
+            .filter(|rust_ty| rust_ty.is_sys_pointer())
     }
 
     /// Whether an interface trait is generated for a class.

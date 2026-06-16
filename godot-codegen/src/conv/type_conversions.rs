@@ -7,13 +7,14 @@
 
 //! Type and expression conversions (Godot -> Rust)
 
-use proc_macro2::{Ident, Literal, TokenStream};
-use quote::{quote, ToTokens};
 use std::fmt;
+
+use proc_macro2::{Ident, Literal, TokenStream};
+use quote::{ToTokens, quote};
 
 use crate::context::Context;
 use crate::conv;
-use crate::models::domain::{ArgPassing, GodotTy, ModName, RustTy, TyName};
+use crate::models::domain::{ArgPassing, FlowDirection, GodotTy, ModName, RustTy, TyName};
 use crate::special_cases::is_builtin_type_scalar;
 use crate::util::ident;
 
@@ -21,7 +22,7 @@ use crate::util::ident;
 // Godot -> Rust types
 
 /// Returns `(identifier, is_copy)` for a hardcoded Rust type, if it exists.
-fn to_hardcoded_rust_ident(full_ty: &GodotTy) -> Option<&str> {
+fn to_hardcoded_rust_ident(full_ty: &GodotTy) -> Option<Ident> {
     let ty = full_ty.ty.as_str();
     let meta = full_ty.meta.as_deref();
 
@@ -49,10 +50,22 @@ fn to_hardcoded_rust_ident(full_ty: &GodotTy) -> Option<&str> {
         ("double", None) => "f64",
         ("double", Some(meta)) => panic!("unhandled type double with meta {meta:?}"),
 
-        // Others
+        // Others. Keep in sync with BuiltinClass::from_json().
         ("bool", None) => "bool",
         ("String", None) => "GString",
-        ("Array", None) => "VariantArray",
+
+        // Arrays/Dictionaries use flexibility for parameters (Rust->Godot), and strong typing for returns (Godot->Rust).
+        // Keep also in line with default-exprs e.g. `Array::new()`.
+        ("Array", None) => match full_ty.flow {
+            Some(FlowDirection::RustToGodot) => "AnyArray",
+            Some(FlowDirection::GodotToRust) => "VarArray",
+            None => "_unused__Array_must_not_appear_in_idents",
+        },
+        ("Dictionary", None) => match full_ty.flow {
+            Some(FlowDirection::RustToGodot) => "AnyDictionary",
+            Some(FlowDirection::GodotToRust) => "VarDictionary",
+            None => "_unused__Dictionary_must_not_appear_in_idents",
+        },
 
         // Types needed for native structures mapping
         ("uint8_t", None) => "u8",
@@ -66,15 +79,19 @@ fn to_hardcoded_rust_ident(full_ty: &GodotTy) -> Option<&str> {
         ("real_t", None) => "real",
         ("void", None) => "c_void",
 
-        (ty, Some(meta)) => panic!("unhandled type {ty:?} with meta {meta:?}"),
+        // meta="required" is a special case of non-null object parameters/return types.
+        // Other metas are unrecognized.
+        (ty, Some(meta)) if meta != "required" => {
+            panic!("unhandled type {ty:?} with meta {meta:?}")
+        }
 
         _ => return None,
     };
 
-    Some(result)
+    Some(ident(result))
 }
 
-fn to_hardcoded_rust_enum(ty: &str) -> Option<&str> {
+fn to_hardcoded_rust_enum(ty: &str) -> Option<Ident> {
     // Some types like Vector2[i].Axis may not appear in Godot's current JSON, but they are encountered
     // in custom Godot builds, e.g. when extending PhysicsServer2D.
     let result = match ty {
@@ -87,7 +104,8 @@ fn to_hardcoded_rust_enum(ty: &str) -> Option<&str> {
         "enum::Vector3i.Axis" => "Vector3Axis",
         _ => return None,
     };
-    Some(result)
+
+    Some(ident(result))
 }
 
 /// Maps an input type to a Godot type with the same C representation. This is subtly different from [`to_rust_type`],
@@ -119,7 +137,7 @@ pub(crate) fn to_rust_type_abi(ty: &str, ctx: &mut Context) -> (RustTy, bool) {
             ty: ident("f64"),
             arg_passing: ArgPassing::ByValue,
         },
-        _ => to_rust_type(ty, None, ctx),
+        _ => to_rust_temporary_type(ty, ctx),
     };
 
     (ty, is_obj)
@@ -129,14 +147,29 @@ pub(crate) fn to_rust_type_abi(ty: &str, ctx: &mut Context) -> (RustTy, bool) {
 ///
 /// Uses an internal cache (via `ctx`), as several types are ubiquitous.
 // TODO take TyName as input
-pub(crate) fn to_rust_type<'a>(ty: &'a str, meta: Option<&'a String>, ctx: &mut Context) -> RustTy {
-    let full_ty = GodotTy {
-        ty: ty.to_string(),
-        meta: meta.cloned(),
+pub(crate) fn to_rust_type<'a>(
+    json_ty: &'a str,
+    meta: Option<&'a String>,
+    flow: Option<FlowDirection>,
+    ctx: &mut Context,
+) -> RustTy {
+    // Flow is only relevant for Array and Dictionary, which map to different Rust types depending on direction (e.g. AnyArray vs VarArray).
+    // For all other types, flow is don't-care and set to None. Nested collections like Array[Array] or Array[Dictionary] need flow preserved
+    // because the element type is recursively resolved via to_rust_type(), and the element itself may be Array or Dictionary.
+    let flow = match json_ty {
+        "Array" | "Dictionary" | "typedarray::Array" | "typedarray::Dictionary" => flow,
+        _ if json_ty.starts_with("typeddictionary::") => flow, // Hard to test, as of 4.6 there are no such methods in the JSON.
+        _ => None, // Do not panic if not set (used in to_temporary_rust_type()).
     };
 
-    // Separate find + insert slightly slower, but much easier with lifetimes
-    // The insert path will be hit less often and thus doesn't matter
+    let full_ty = GodotTy {
+        ty: json_ty.to_string(),
+        meta: meta.cloned(),
+        flow,
+    };
+
+    // Separate find + insert slightly slower, but much easier with lifetimes.
+    // The insert path will be hit less often and thus doesn't matter.
     if let Some(rust_ty) = ctx.find_rust_type(&full_ty) {
         rust_ty.clone()
     } else {
@@ -144,6 +177,17 @@ pub(crate) fn to_rust_type<'a>(ty: &'a str, meta: Option<&'a String>, ctx: &mut 
         ctx.insert_rust_type(full_ty, rust_ty.clone());
         rust_ty
     }
+}
+
+/// Converts a Godot type to a Rust type without caching, suitable for cases where only parts of the returned RustTy are needed.
+///
+/// This is a lightweight alternative to [`to_rust_type()`] for scenarios where only parts of the returned `RustTy` are needed (e.g.
+/// just the identifier name).
+///
+/// The returned type may have inaccuracies in fields that depend on metad or flow direction, so this should only be used when
+/// those fields are not needed. This allows for simpler call sites in code that doesn't require complete type information.
+pub(crate) fn to_rust_temporary_type(ty: &str, ctx: &mut Context) -> RustTy {
+    to_rust_type(ty, None, None, ctx)
 }
 
 fn to_rust_type_uncached(full_ty: &GodotTy, ctx: &mut Context) -> RustTy {
@@ -169,9 +213,21 @@ fn to_rust_type_uncached(full_ty: &GodotTy, ctx: &mut Context) -> RustTy {
             ty = ty.replace("const ", "");
         }
 
+        // Sys pointer type defined in `gdextension_interface` and used as param for given method, e.g. `GDExtensionInitializationFunction`.
+        // Note: we branch here to avoid clashes with actual GDExtension classes.
+        if ty.starts_with("GDExtension") {
+            let ty = rustify_ty(&ty);
+            return RustTy::RawPointer {
+                inner: Box::new(RustTy::SysPointerType {
+                    tokens: quote! { sys::#ty },
+                }),
+                is_const,
+            };
+        }
+
         // .trim() is necessary here, as Godot places a space between a type and the stars when representing a double pointer.
         // Example: "int*" but "int **".
-        let inner_type = to_rust_type(ty.trim(), None, ctx);
+        let inner_type = to_rust_type(ty.trim(), None, None, ctx);
         return RustTy::RawPointer {
             inner: Box::new(inner_type),
             is_const,
@@ -179,18 +235,19 @@ fn to_rust_type_uncached(full_ty: &GodotTy, ctx: &mut Context) -> RustTy {
     }
 
     // Only place where meta is relevant is here.
-    if !ty.starts_with("typedarray::") {
-        if let Some(hardcoded) = to_hardcoded_rust_ident(full_ty) {
-            return RustTy::BuiltinIdent {
-                ty: ident(hardcoded),
-                arg_passing: ctx.get_builtin_arg_passing(full_ty),
-            };
-        }
+    if !ty.starts_with("typedarray::")
+        && !ty.starts_with("typeddictionary::")
+        && let Some(hardcoded) = to_hardcoded_rust_ident(full_ty)
+    {
+        return RustTy::BuiltinIdent {
+            ty: hardcoded,
+            arg_passing: ctx.get_builtin_arg_passing(full_ty),
+        };
     }
 
     if let Some(hardcoded) = to_hardcoded_rust_enum(ty) {
         return RustTy::EngineEnum {
-            tokens: ident(hardcoded).to_token_stream(),
+            tokens: hardcoded.to_token_stream(),
             surrounding_class: None, // would need class passed in
             is_bitfield: false,
         };
@@ -209,16 +266,32 @@ fn to_rust_type_uncached(full_ty: &GodotTy, ctx: &mut Context) -> RustTy {
             };
         }
     } else if let Some(elem_ty) = ty.strip_prefix("typedarray::") {
-        let rust_elem_ty = to_rust_type(elem_ty, full_ty.meta.as_ref(), ctx);
-        return if ctx.is_builtin(elem_ty) {
-            RustTy::BuiltinArray {
-                elem_type: quote! { Array<#rust_elem_ty> },
-            }
-        } else {
-            RustTy::EngineArray {
-                tokens: quote! { Array<#rust_elem_ty> },
-                elem_class: elem_ty.to_string(),
-            }
+        // In Array, store Gd and not Option<Gd> elements.
+        let rust_elem_ty = to_rust_type(elem_ty, full_ty.meta.as_ref(), full_ty.flow, ctx);
+        let tokens = rust_elem_ty.tokens_non_null();
+
+        return RustTy::TypedArray {
+            tokens: quote! { Array<#tokens> },
+            #[cfg(not(feature = "codegen-full"))]
+            elem_class: (!ctx.is_builtin(elem_ty)).then(|| elem_ty.to_string()),
+        };
+    } else if let Some(kv_ty) = ty.strip_prefix("typeddictionary::") {
+        let (key_ty, value_ty) = kv_ty
+            .split_once(';')
+            .unwrap_or_else(|| panic!("typeddictionary missing ';' separator: {ty}"));
+
+        // In Dictionary, store Gd and not Option<Gd> elements.
+        let rust_key_ty = to_rust_type(key_ty, None, full_ty.flow, ctx);
+        let rust_value_ty = to_rust_type(value_ty, None, full_ty.flow, ctx);
+        let key_tokens = rust_key_ty.tokens_non_null();
+        let value_tokens = rust_value_ty.tokens_non_null();
+
+        return RustTy::TypedDictionary {
+            tokens: quote! { Dictionary<#key_tokens, #value_tokens> },
+            #[cfg(not(feature = "codegen-full"))]
+            key_class: (!ctx.is_builtin(key_ty)).then(|| key_ty.to_string()),
+            #[cfg(not(feature = "codegen-full"))]
+            value_class: (!ctx.is_builtin(value_ty)).then(|| value_ty.to_string()),
         };
     }
 
@@ -231,14 +304,30 @@ fn to_rust_type_uncached(full_ty: &GodotTy, ctx: &mut Context) -> RustTy {
             arg_passing: ctx.get_builtin_arg_passing(full_ty),
         }
     } else {
-        let ty = rustify_ty(ty);
-        let qualified_class = quote! { crate::classes::#ty };
+        let is_nullable = if cfg!(since_api = "4.6") {
+            full_ty.meta.as_ref().is_none_or(|m| m != "required")
+        } else {
+            true
+        };
+
+        let inner_class = rustify_ty(ty);
+        let qualified_class = quote! { crate::classes::#inner_class };
+
+        // Stores unwrapped Gd<T> directly in `gd_tokens`.
+        let gd_tokens = quote! { Gd<#qualified_class> };
+
+        // Use Option for `impl_as_object_arg` if nullable.
+        let impl_as_object_arg = if is_nullable {
+            quote! { impl AsArg<Option<Gd<#qualified_class>>> }
+        } else {
+            quote! { impl AsArg<Gd<#qualified_class>> }
+        };
 
         RustTy::EngineClass {
-            tokens: quote! { Gd<#qualified_class> },
-            object_arg: quote! { ObjectArg<#qualified_class> },
-            impl_as_object_arg: quote! { impl AsObjectArg<#qualified_class> },
-            inner_class: ty,
+            gd_tokens,
+            impl_as_object_arg,
+            inner_class,
+            is_nullable,
         }
     }
 }
@@ -295,8 +384,14 @@ fn to_rust_expr_inner(expr: &str, ty: &RustTy, is_inner: bool) -> TokenStream {
         "true" => return quote! { true },
         "false" => return quote! { false },
         "[]" | "{}" if is_inner => return quote! {},
-        "[]" => return quote! { Array::new() }, // VariantArray or Array<T>
-        "{}" => return quote! { Dictionary::new() },
+        "[]" if matches!(ty, RustTy::BuiltinIdent { ty, .. } if ty == "AnyArray") => {
+            return quote! { AnyArray::new_untyped() };
+        }
+        "[]" => return quote! { Array::new() }, // VarArray or Array<T>
+        "{}" if matches!(ty, RustTy::BuiltinIdent { ty, .. } if ty == "AnyDictionary") => {
+            return quote! { AnyDictionary::new_untyped() };
+        }
+        "{}" => return quote! { Dictionary::new() }, // VarDictionary or Dictionary<K, V>
         "null" => {
             return match ty {
                 RustTy::BuiltinIdent { ty: ident, .. } if ident == "Variant" => {
@@ -306,17 +401,16 @@ fn to_rust_expr_inner(expr: &str, ty: &RustTy, is_inner: bool) -> TokenStream {
                     quote! { Gd::null_arg() }
                 }
                 _ => panic!("null not representable in target type {ty:?}"),
-            }
+            };
         }
-        // empty string appears only for Callable/Rid in 4.0; default ctor syntax in 4.1+
-        "" | "RID()" | "Callable()" if !is_inner => {
+        "RID()" | "Callable()" if !is_inner => {
             return match ty {
                 RustTy::BuiltinIdent { ty: ident, .. } if ident == "Rid" => quote! { Rid::Invalid },
                 RustTy::BuiltinIdent { ty: ident, .. } if ident == "Callable" => {
                     quote! { Callable::invalid() }
                 }
                 _ => panic!("empty string not representable in target type {ty:?}"),
-            }
+            };
         }
         _ => {}
     }
@@ -629,9 +723,10 @@ fn gdscript_to_rust_expr() {
 
     for (gdscript, ty, rust) in table {
         // Use arbitrary type if not specified -> should not be read
-        let ty_dontcare = RustTy::EngineArray {
+        let ty_dontcare = RustTy::TypedArray {
             tokens: TokenStream::new(),
-            elem_class: String::new(),
+            #[cfg(not(feature = "codegen-full"))]
+            elem_class: None,
         };
         let ty = ty.unwrap_or(&ty_dontcare);
 

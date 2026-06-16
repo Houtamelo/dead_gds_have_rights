@@ -7,11 +7,12 @@
 
 // Note: some code duplication with godot-codegen crate.
 
-use crate::class::FuncDefinition;
-use crate::ParseResult;
 use proc_macro2::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 use quote::spanned::Spanned;
-use quote::{format_ident, quote, ToTokens, TokenStreamExt};
+use quote::{ToTokens, TokenStreamExt, format_ident, quote};
+
+use crate::ParseResult;
+use crate::class::FuncDefinition;
 
 mod kv_parser;
 mod list_parser;
@@ -19,8 +20,20 @@ mod list_parser;
 pub(crate) use kv_parser::KvParser;
 pub(crate) use list_parser::ListParser;
 
+/// Creates an identifier with a fresh `Span::call_site()` span.
+///
+/// Use this to generate internal/synthetic identifiers that should *not* be attributed to user code. This prevents IDE features
+/// (like "unsafe call site" syntax highlighting) from pointing to unrelated user symbols.
+///
+/// For identifiers that *should* map back to user code (for navigation, error messages), use `format_ident!("...", span = original.span())`.
 pub fn ident(s: &str) -> Ident {
     format_ident!("{}", s)
+}
+
+pub fn ident_respan(existing_ident: &Ident, span: Span) -> Ident {
+    let mut ident = existing_ident.clone();
+    ident.set_span(span);
+    ident
 }
 
 pub fn c_str(string: &str) -> Literal {
@@ -30,7 +43,7 @@ pub fn c_str(string: &str) -> Literal {
 
 pub fn class_name_obj(class: &impl ToTokens) -> TokenStream {
     let class = class.to_token_stream();
-    quote! { <#class as ::godot::obj::GodotClass>::class_name() }
+    quote! { <#class as ::godot::obj::GodotClass>::class_id() }
 }
 
 pub fn bail_fn<R, T>(msg: impl AsRef<str>, tokens: T) -> ParseResult<R>
@@ -44,13 +57,13 @@ where
 }
 
 macro_rules! bail {
-    ($tokens:expr, $format_string:literal $($rest:tt)*) => {
+    ($tokens:expr_2021, $format_string:literal $($rest:tt)*) => {
         $crate::util::bail_fn(format!($format_string $($rest)*), $tokens)
     }
 }
 
 macro_rules! require_api_version {
-    ($min_version:literal, $span:expr, $attribute:literal) => {
+    ($min_version:literal, $span:expr_2021, $attribute:literal) => {
         if !cfg!(since_api = $min_version) {
             bail!(
                 $span,
@@ -76,7 +89,7 @@ pub fn error_fn<T: Spanned>(msg: impl AsRef<str>, tokens: T) -> venial::Error {
 }
 
 macro_rules! error {
-    ($tokens:expr, $format_string:literal $($rest:tt)*) => {
+    ($tokens:expr_2021, $format_string:literal $($rest:tt)*) => {
         $crate::util::error_fn(format!($format_string $($rest)*), $tokens)
     }
 }
@@ -154,7 +167,10 @@ fn delimiter_opening_char(delimiter: Delimiter) -> char {
 /// declaration of the form `impl MyTrait for SomeType`. The type `SomeType` is irrelevant in this example.
 pub(crate) fn is_impl_named(original_impl: &venial::Impl, name: &str) -> bool {
     let trait_name = original_impl.trait_ty.as_ref().unwrap(); // unwrap: already checked outside
-    extract_typename(trait_name).is_some_and(|seg| seg.ident == name)
+    let implementor =
+        extract_typename(trait_name).expect("`impl ExtensionLibrary` must have a typename");
+
+    implementor.ident == name
 }
 
 /// Validates either:
@@ -208,20 +224,23 @@ pub(crate) fn validate_trait_impl_virtual(
 }
 
 fn validate_self(original_impl: &venial::Impl, attr: &str) -> ParseResult<Ident> {
-    if let Some(segment) = extract_typename(&original_impl.self_ty) {
-        if segment.generic_args.is_none() {
-            Ok(segment.ident)
-        } else {
+    match extract_typename(&original_impl.self_ty) {
+        Some(segment) => {
+            if segment.generic_args.is_none() {
+                Ok(segment.ident)
+            } else {
+                bail!(
+                    original_impl,
+                    "#[{attr}] for does currently not support generic arguments",
+                )
+            }
+        }
+        _ => {
             bail!(
                 original_impl,
-                "#[{attr}] for does currently not support generic arguments",
+                "#[{attr}] requires Self type to be a simple path",
             )
         }
-    } else {
-        bail!(
-            original_impl,
-            "#[{attr}] requires Self type to be a simple path",
-        )
     }
 }
 
@@ -252,25 +271,46 @@ pub(crate) fn path_ends_with_complex(path: &venial::TypeExpr, expected: &str) ->
     })
 }
 
+pub fn is_cfg_or_cfg_attr(attr: &venial::Attribute) -> bool {
+    let Some(attr_name) = attr.get_single_path_segment() else {
+        return false;
+    };
+
+    // #[cfg(condition)]
+    if attr_name == "cfg" {
+        return true;
+    }
+
+    // #[cfg_attr(condition, attributes...)]. Multiple attributes can be separated by comma.
+    if attr_name == "cfg_attr" && attr.value.to_token_stream().to_string().contains("cfg(") {
+        return true;
+    }
+
+    false
+}
+
+/// Returns group representing properly spanned tuple (e.g. `(arg1, arg2, arg3)`).
+///
+/// Use it to preserve span in case if tuple in question is empty (will create properly spanned `()` in such a case).
+pub fn to_spanned_tuple(items: &[impl ToTokens], span: Span) -> Group {
+    let mut group = Group::new(Delimiter::Parenthesis, quote! { #(#items,)* });
+    group.set_span(span);
+
+    group
+}
+
 pub(crate) fn extract_cfg_attrs(
     attrs: &[venial::Attribute],
 ) -> impl IntoIterator<Item = &venial::Attribute> {
+    attrs.iter().filter(|attr| is_cfg_or_cfg_attr(attr))
+}
+
+pub(crate) fn extract_doc_attrs(
+    attrs: &[venial::Attribute],
+) -> impl IntoIterator<Item = &venial::Attribute> {
     attrs.iter().filter(|attr| {
-        let Some(attr_name) = attr.get_single_path_segment() else {
-            return false;
-        };
-
-        // #[cfg(condition)]
-        if attr_name == "cfg" {
-            return true;
-        }
-
-        // #[cfg_attr(condition, attributes...)]. Multiple attributes can be seperated by comma.
-        if attr_name == "cfg_attr" && attr.value.to_token_stream().to_string().contains("cfg(") {
-            return true;
-        }
-
-        false
+        attr.get_single_path_segment()
+            .is_some_and(|attr_name| attr_name == "doc")
     })
 }
 
@@ -306,6 +346,9 @@ pub fn safe_ident(s: &str) -> Ident {
 
         // Reserved 2018+
         | "try"
+
+        // Reserved 2024+
+        | "gen"
            => format_ident!("{}_", s),
 
          _ => ident(s)
@@ -362,14 +405,14 @@ pub fn make_funcs_collection_constants(
 /// a constant is used as indirection.
 pub fn make_funcs_collection_constant(
     class_name: &Ident,
-    func_name: &Ident,
+    rust_function_name: &Ident,
     registered_name: Option<&String>,
     attributes: &[&venial::Attribute],
 ) -> TokenStream {
-    let const_name = format_funcs_collection_constant(class_name, func_name);
-    let const_value = match &registered_name {
+    let const_name = format_funcs_collection_constant(class_name, rust_function_name);
+    let const_value = match registered_name {
         Some(renamed) => renamed.to_string(),
-        None => func_name.to_string(),
+        None => rust_function_name.to_string(),
     };
 
     quote! {
@@ -381,6 +424,8 @@ pub fn make_funcs_collection_constant(
 }
 
 /// Converts `path::class` to `path::new_class`.
+///
+/// Used to derive the funcs collection path from the class path (e.g. `nested::__godot_MyClass_Funcs`).
 pub fn replace_class_in_path(path: venial::Path, new_class: Ident) -> venial::Path {
     match path.segments.as_slice() {
         // Can't happen, you have at least one segment (the class name).
@@ -412,8 +457,18 @@ pub fn replace_class_in_path(path: venial::Path, new_class: Ident) -> venial::Pa
 
 /// Returns the name of the constant inside the func "collection" struct.
 pub fn format_funcs_collection_constant(_class_name: &Ident, func_name: &Ident) -> Ident {
-    format_ident!("{func_name}")
+    format_ident!("{func_name}", span = func_name.span())
 }
+
+/// Returns the name of the macro used to deny manual `init()` for incompatible init strategies.
+///
+/// Retains span because it's designed to appear in user-facing compile errors.
+pub fn format_class_deny_manual_init_macro(class_name: &Ident) -> Ident {
+    format_ident!("__deny_manual_init_{class_name}", span = class_name.span())
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Internal ident formatters. No span retained, as these are unlikely to surface in user-facing errors.
 
 /// Returns the name of the struct used as collection for all function name constants.
 pub fn format_funcs_collection_struct(class_name: &Ident) -> Ident {
@@ -428,9 +483,4 @@ pub fn format_class_visibility_macro(class_name: &Ident) -> Ident {
 /// Returns the name of the macro used to communicate whether the `struct` (class) contains a base field.
 pub fn format_class_base_field_macro(class_name: &Ident) -> Ident {
     format_ident!("__godot_{class_name}_has_base_field_macro")
-}
-
-/// Returns the name of the macro used to deny manual `init()` for incompatible init strategies.
-pub fn format_class_deny_manual_init_macro(class_name: &Ident) -> Ident {
-    format_ident!("__deny_manual_init_{class_name}")
 }

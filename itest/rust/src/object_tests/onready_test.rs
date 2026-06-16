@@ -7,13 +7,15 @@
 
 // Integration of OnReady with #[init(load = "PATH")] is tested in save_load_test.rs.
 
-use crate::framework::{expect_panic, itest};
+use std::ops::{Deref, DerefMut};
+
 use godot::classes::notify::NodeNotification;
 use godot::classes::{INode, Node};
-use godot::register::{godot_api, GodotClass};
-
 use godot::obj::{Gd, NewAlloc, OnReady};
 use godot::prelude::{Base, ToGodot};
+use godot::register::{GodotClass, godot_api};
+
+use crate::framework::{expect_panic, itest};
 
 #[itest]
 fn onready_deref() {
@@ -29,6 +31,39 @@ fn onready_deref() {
     let l = l;
     let shared_ref: &i32 = &l;
     assert_eq!(*shared_ref, 42);
+
+    node.free();
+}
+
+#[itest]
+fn onready_poisoned() {
+    let node = Node::new_alloc();
+    let mut l = OnReady::<i32>::new(|| panic!("Auto init failure."));
+    expect_panic("Auto init must fail", || {
+        godot::private::auto_init(&mut l, &node)
+    });
+    expect_panic("Calling `init` after failed auto init fails", || {
+        l.init(44);
+    });
+
+    expect_panic(
+        "Calling `auto_init` again after failed auto init fails",
+        || {
+            godot::private::auto_init(&mut l, &node);
+        },
+    );
+    expect_panic(
+        "Panic on deref after automatic initialization failure",
+        || {
+            let _failed_deref = Deref::deref(&l);
+        },
+    );
+    expect_panic(
+        "Panic on deref mut after automatic initialization failure",
+        || {
+            let _failed_deref = DerefMut::deref_mut(&mut l);
+        },
+    );
 
     node.free();
 }
@@ -87,6 +122,24 @@ fn onready_lifecycle() {
 
         *obj.auto = 33;
         assert_eq!(*obj.auto, 33);
+    }
+
+    obj.free();
+}
+
+#[itest]
+fn onready_lifecycle_gd_self() {
+    let mut obj = OnReadyWithImplGdSelf::create(true);
+
+    obj.notify(NodeNotification::READY);
+
+    {
+        let mut obj = obj.bind_mut();
+        assert_eq!(*obj.auto, 77);
+        assert_eq!(*obj.manual, 55);
+
+        *obj.auto = 44;
+        assert_eq!(*obj.auto, 44);
     }
 
     obj.free();
@@ -165,7 +218,7 @@ fn init_attribute_node_key_lifecycle() {
 
     {
         let obj = obj.bind();
-        assert_eq!(obj.node.get_name(), "child".into());
+        assert_eq!(obj.node.get_name(), "child");
         assert_eq!(obj.self_name.as_str(), "CustomNodeName");
     }
 
@@ -267,6 +320,45 @@ impl INode for OnReadyWithImplWithoutReady {
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
+// Class that has overridden ready() with Gd<Self> receiver. Used to test whether variables are still initialized.
+#[derive(GodotClass)]
+#[class(no_init, base=Node)]
+struct OnReadyWithImplGdSelf {
+    base: Base<Node>,
+    #[hint(onready)]
+    auto: OnReady<i32>,
+    #[hint(no_onready)]
+    manual: OnReady<i32>,
+    runs_manual_init: bool,
+}
+
+impl OnReadyWithImplGdSelf {
+    fn create(runs_manual_init: bool) -> Gd<OnReadyWithImplGdSelf> {
+        Gd::from_init_fn(|base| Self {
+            base,
+            auto: OnReady::new(|| 77),
+            manual: OnReady::manual(),
+            runs_manual_init,
+        })
+    }
+}
+
+#[godot_api]
+impl INode for OnReadyWithImplGdSelf {
+    #[func(gd_self)]
+    fn ready(mut this: Gd<Self>) {
+        let mut this_bind = this.bind_mut();
+        assert_eq!(*this_bind.auto, 77);
+
+        if this_bind.runs_manual_init {
+            this_bind.manual.init(55);
+            assert_eq!(*this_bind.manual, 55);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
 // #[init(node = "NodePath")] Attribute
 // Used to test whether `node` keys sets variables' expected values.
 #[derive(GodotClass)]
@@ -282,7 +374,7 @@ struct InitWithNodeOrBase {
 #[godot_api]
 impl INode for InitWithNodeOrBase {
     fn ready(&mut self) {
-        assert_eq!(self.node.get_name(), "child".into());
+        assert_eq!(self.node.get_name(), "child");
         assert_eq!(self.self_name.as_str(), "CustomNodeName");
     }
 }

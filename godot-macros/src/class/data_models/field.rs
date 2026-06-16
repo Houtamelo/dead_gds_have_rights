@@ -5,11 +5,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use proc_macro2::{Ident, Span, TokenStream};
+use quote::{ToTokens, quote};
+
 use crate::class::data_models::group_export::FieldGroup;
 use crate::class::{FieldExport, FieldVar};
-use crate::util::{error, KvParser};
-use proc_macro2::{Ident, Span, TokenStream};
-use quote::{quote, ToTokens};
+use crate::util::{KvParser, error};
 
 pub struct Field {
     pub name: Ident,
@@ -21,6 +22,7 @@ pub struct Field {
     pub subgroup: Option<FieldGroup>,
     pub is_onready: bool,
     pub is_oneditor: bool,
+    pub is_phantomvar: bool,
     #[cfg(feature = "register-docs")]
     pub attributes: Vec<venial::Attribute>,
     pub span: Span,
@@ -38,6 +40,7 @@ impl Field {
             subgroup: None,
             is_onready: false,
             is_oneditor: false,
+            is_phantomvar: false,
             #[cfg(feature = "register-docs")]
             attributes: field.attributes.clone(),
             span: field.span(),

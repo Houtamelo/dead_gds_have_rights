@@ -10,6 +10,7 @@ mod conversion_test;
 mod derive_godotconvert_test;
 mod func_test;
 mod gdscript_ffi_test;
+mod multiple_impl_blocks_secondary;
 mod multiple_impl_blocks_test;
 mod naming_tests;
 mod option_ffi_test;
@@ -18,6 +19,8 @@ mod register_docs_test;
 mod rpc_test;
 mod var_test;
 
+#[cfg(feature = "test-gdextension-dependency")]
+mod dependency_test;
 #[cfg(since_api = "4.3")]
 mod func_virtual_test;
 

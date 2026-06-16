@@ -9,9 +9,9 @@ use godot_ffi as sys;
 use sys::interface_fn;
 
 use crate::builtin::{StringName, Variant};
-use crate::global::MethodFlags;
-use crate::meta::{ClassName, GodotConvert, GodotType, ParamTuple, PropertyInfo, Signature};
+use crate::meta::{ClassId, GodotConvert, ParamTuple, Signature};
 use crate::obj::GodotClass;
+use crate::registry::info::{MethodFlags, PropertyInfo};
 
 /// Info relating to an argument or return type in a method.
 pub struct MethodParamOrReturnInfo {
@@ -23,17 +23,37 @@ impl MethodParamOrReturnInfo {
     pub fn new(info: PropertyInfo, metadata: sys::GDExtensionClassMethodArgumentMetadata) -> Self {
         Self { info, metadata }
     }
+
+    /// Creates parameter info for type `T`.
+    pub fn for_parameter<T: GodotConvert>(param_name: &str) -> Self {
+        let shape = T::godot_shape();
+        Self {
+            info: shape.to_method_signature_property(param_name),
+            metadata: shape.param_metadata().to_sys(),
+        }
+    }
+
+    /// Creates return type info for type `T`.
+    pub fn for_return<T: GodotConvert>() -> Option<Self> {
+        let shape = T::godot_shape();
+        Some(Self {
+            info: shape.to_method_signature_property(""),
+            metadata: shape.param_metadata().to_sys(),
+        })
+    }
 }
 
 /// All info needed to register a method for a class with Godot.
 pub struct ClassMethodInfo {
-    pub class_name: ClassName,
+    pub class_id: ClassId,
     pub method_name: StringName,
     pub call_func: sys::GDExtensionClassMethodCall,
     pub ptrcall_func: sys::GDExtensionClassMethodPtrCall,
     pub method_flags: MethodFlags,
     pub return_value: Option<MethodParamOrReturnInfo>,
     pub arguments: Vec<MethodParamOrReturnInfo>,
+    /// Whether default arguments are real "arguments" is controversial. From the function PoV they are, but for the caller,
+    /// they are just pre-set values to fill in for missing arguments.
     pub default_arguments: Vec<Variant>,
 }
 
@@ -59,19 +79,18 @@ impl ClassMethodInfo {
         ptrcall_func: sys::GDExtensionClassMethodPtrCall,
         method_flags: MethodFlags,
         param_names: &[&str],
-        // default_arguments: Vec<Variant>, - not yet implemented
+        default_arguments: Vec<Variant>,
     ) -> Self {
-        let return_value = Ret::Via::return_info();
+        let return_value = MethodParamOrReturnInfo::for_return::<Ret>();
         let arguments = Signature::<Params, Ret>::param_names(param_names);
 
-        let default_arguments = vec![]; // not yet implemented.
         assert!(
             default_arguments.len() <= arguments.len(),
             "cannot have more default arguments than arguments"
         );
 
         Self {
-            class_name: C::class_name(),
+            class_id: C::class_id(),
             method_name,
             call_func,
             ptrcall_func,
@@ -141,7 +160,7 @@ impl ClassMethodInfo {
         unsafe {
             interface_fn!(classdb_register_extension_class_method)(
                 sys::get_library(),
-                self.class_name.string_sys(),
+                self.class_id.string_sys(),
                 std::ptr::addr_of!(method_info_sys),
             )
         }
@@ -168,7 +187,7 @@ impl ClassMethodInfo {
         unsafe {
             interface_fn!(classdb_register_extension_class_virtual_method)(
                 sys::get_library(),
-                self.class_name.string_sys(),
+                self.class_id.string_sys(),
                 std::ptr::addr_of!(method_info_sys),
             )
         }

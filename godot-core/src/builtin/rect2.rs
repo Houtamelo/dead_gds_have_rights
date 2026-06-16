@@ -6,10 +6,10 @@
  */
 
 use godot_ffi as sys;
-use sys::{ffi_methods, ExtVariantType, GodotFfi};
+use sys::{ExtVariantType, GodotFfi, ffi_methods};
 
 use crate::builtin::math::ApproxEq;
-use crate::builtin::{real, Rect2i, Side, Vector2};
+use crate::builtin::{Rect2i, Side, Vector2, real};
 
 /// 2D axis-aligned bounding box.
 ///
@@ -27,8 +27,11 @@ use crate::builtin::{real, Rect2i, Side, Vector2};
 ///
 /// [`Aabb`]: crate::builtin::Aabb
 ///
-/// # Godot docs
+/// # Soft invariants
+/// `Rect2` requires non-negative size for certain operations, which is validated only on a best-effort basis. Violations may
+/// cause panics in Debug mode. See also [_Builtin API design_](../__docs/index.html#6-public-fields-and-soft-invariants).
 ///
+/// # Godot docs
 /// [`Rect2` (stable)](https://docs.godotengine.org/en/stable/classes/class_rect2.html)
 #[derive(Default, Copy, Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -49,9 +52,15 @@ impl Rect2 {
 
     /// Create a new `Rect2` with the first corner at `position` and the opposite corner at `end`.
     #[inline]
-    pub fn from_corners(position: Vector2, end: Vector2) -> Self {
+    pub fn from_position_end(position: Vector2, end: Vector2) -> Self {
         // Cannot use floating point arithmetic in const functions.
         Self::new(position, end - position)
+    }
+
+    #[inline]
+    #[deprecated = "Renamed to `from_position_end`."]
+    pub fn from_corners(position: Vector2, end: Vector2) -> Self {
+        Self::from_position_end(position, end)
     }
 
     /// Create a new `Rect2` from four reals representing position `(x,y)` and size `(width,height)`.
@@ -115,7 +124,7 @@ impl Rect2 {
         let position = self.position.coord_min(b.position);
         let end = self.end().coord_max(b.end());
 
-        Self::from_corners(position, end)
+        Self::from_position_end(position, end)
     }
 
     /// Returns the area of the rectangle.
@@ -274,7 +283,7 @@ unsafe impl GodotFfi for Rect2 {
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }
 
-crate::meta::impl_godot_as_self!(Rect2);
+crate::meta::impl_godot_as_self!(Rect2: ByValue);
 
 impl ApproxEq for Rect2 {
     /// Returns if the two `Rect2`s are approximately equal, by comparing `position` and `size` separately.

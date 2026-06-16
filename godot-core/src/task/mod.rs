@@ -8,22 +8,32 @@
 //! Integrates async rust code with the engine.
 //!
 //! This module contains:
-//! - Implementations of [`Future`](std::future::Future) for [`Signal`](crate::builtin::Signal) and [`TypedSignal`](crate::registry::signal::TypedSignal).
+//! - Implementations of [`Future`] for [`Signal`][crate::builtin::Signal] and [`TypedSignal`][crate::obj::signal::TypedSignal].
 //! - A way to [`spawn`] new async tasks by using the engine as the async runtime.
 
 mod async_runtime;
 mod futures;
 
-pub(crate) use async_runtime::cleanup;
-pub(crate) use futures::{impl_dynamic_send, ThreadConfined};
-
-pub use async_runtime::{spawn, TaskHandle};
+// Public re-exports
+pub use async_runtime::{TaskHandle, spawn};
 pub use futures::{
     DynamicSend, FallibleSignalFuture, FallibleSignalFutureError, IntoDynamicSend, SignalFuture,
 };
 
-// Only exported for itest.
+// For use in integration tests.
 #[cfg(feature = "trace")]
-pub use async_runtime::has_godot_task_panicked;
+mod reexport_test {
+    pub use super::async_runtime::has_godot_task_panicked;
+    pub use super::futures::{SignalFutureResolver, create_test_signal_future_resolver};
+}
+
 #[cfg(feature = "trace")]
-pub use futures::{create_test_signal_future_resolver, SignalFutureResolver};
+pub use reexport_test::*;
+
+// Crate-local re-exports.
+mod reexport_crate {
+    pub(crate) use super::async_runtime::cleanup;
+    pub(crate) use super::futures::{ThreadConfined, impl_dynamic_send};
+}
+
+pub(crate) use reexport_crate::*;

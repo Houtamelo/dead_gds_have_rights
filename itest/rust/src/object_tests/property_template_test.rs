@@ -12,13 +12,11 @@
 
 use std::collections::HashMap;
 
-use crate::framework::itest;
-use godot::global::PropertyUsageFlags;
 use godot::prelude::*;
+use godot::register::info::PropertyUsageFlags;
 use godot::sys::GdextBuild;
 
-use crate::framework::TestContext;
-
+use crate::framework::{TestContext, itest};
 use crate::register_tests::gen_ffi::PropertyTestsRust;
 
 #[itest]
@@ -28,24 +26,14 @@ fn property_template_test(ctx: &TestContext) {
 
     // Accumulate errors so we can catch all of them in one go.
     let mut errors: Vec<String> = Vec::new();
-    let mut properties: HashMap<String, Dictionary> = HashMap::new();
+    let mut properties: HashMap<String, VarDictionary> = HashMap::new();
 
     for property in rust_properties.get_property_list().iter_shared() {
         let name = property.get("name").unwrap().to::<String>();
 
-        // The format of array properties in Godot 4.2 changed. This doesn't seem to cause issues if we
-        // compile against 4.1 and provide the property in the format 4.1 expects, but run it with Godot 4.2.
-        // However, this test checks that our output matches that of Godot, and so would fail in this circumstance.
-        // For now, just ignore array properties when we compile for 4.1 but run in 4.2.
-        if GdextBuild::since_api("4.2")
-            && cfg!(before_api = "4.2")
-            && name.starts_with("var_array_")
-        {
-            continue;
-        }
-
         // Skip @export_file and similar properties for Array<GString> and PackedStringArray (only supported in Godot 4.3+).
         // Here, we use API and not runtime level, because inclusion/exclusion of GDScript code is determined at build time in godot-bindings.
+        // Anecdote: the format of array properties changed in Godot 4.2.
         //
         // Name can start in `export_file`, `export_global_file`, `export_dir`, `export_global_dir`.
         // Can end in either `_array` or `_parray`.
@@ -59,6 +47,21 @@ fn property_template_test(ctx: &TestContext) {
         }
     }
 
+    // User-defined GDScript enums reference their type by script path (e.g. "res://gen/GenPropertyTests.gd.Tile"), which cannot be reproduced
+    // from Rust. This is a Godot limitation: GDScript enums have script-path-based identity that Rust-side registration can't replicate for
+    // #[var] (ARRAY_TYPE/DICTIONARY_TYPE hints use the type name). The #[export] variants work because they use TYPE_STRING hints with
+    // element type strings (variant_type/hint:hint_string format), which don't require script-path enum names.
+    #[cfg(since_api = "4.4")]
+    {
+        properties.remove("var_array_tile");
+        properties.remove("var_dict_vector2i_tile");
+    }
+
+    // Bitfield properties (e.g. MouseButtonMask) can't be expressed as typed GDScript variables,
+    // so there's no GDScript counterpart to compare against.
+    properties.remove("var_bitfield");
+    properties.remove("export_bitfield");
+
     assert!(!properties.is_empty());
 
     for mut gdscript_prop in gdscript_properties.get_property_list().iter_shared() {
@@ -68,19 +71,19 @@ fn property_template_test(ctx: &TestContext) {
             continue;
         };
 
-        let mut rust_usage = rust_prop.at("usage").to::<i64>();
+        let mut rust_usage = rust_prop.at("usage").to::<PropertyUsageFlags>();
 
         // The GDSscript variables are script variables, and so have `PROPERTY_USAGE_SCRIPT_VARIABLE` set.
         // Before 4.3, `PROPERTY_USAGE_SCRIPT_VARIABLE` did the same thing as `PROPERTY_USAGE_STORAGE` and
         // so GDScript didn't set both if it didn't need to.
         if GdextBuild::before_api("4.3") {
-            if rust_usage == PropertyUsageFlags::STORAGE.ord() as i64 {
-                rust_usage = PropertyUsageFlags::SCRIPT_VARIABLE.ord() as i64
+            if rust_usage == PropertyUsageFlags::STORAGE {
+                rust_usage = PropertyUsageFlags::SCRIPT_VARIABLE
             } else {
-                rust_usage |= PropertyUsageFlags::SCRIPT_VARIABLE.ord() as i64;
+                rust_usage |= PropertyUsageFlags::SCRIPT_VARIABLE;
             }
         } else {
-            rust_usage |= PropertyUsageFlags::SCRIPT_VARIABLE.ord() as i64;
+            rust_usage |= PropertyUsageFlags::SCRIPT_VARIABLE;
         }
 
         rust_prop.set("usage", rust_usage);

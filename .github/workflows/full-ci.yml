@@ -14,11 +14,10 @@ on:
   merge_group:
 #  push:
 
-
 env:
   # Applies to all 'register-docs' features across crates.
-  CLIPPY_FEATURES: '--features register-docs,godot/experimental-godot-api,godot/serde'
-  TEST_FEATURES: ''
+  CLIPPY_FEATURES: "--features register-docs,godot/experimental-godot-api,godot/serde"
+  TEST_FEATURES: ""
   RETRY: ${{ github.workspace }}/.github/other/retry.sh
 
   # ASan options: https://github.com/google/sanitizers/wiki/AddressSanitizerFlags
@@ -26,9 +25,8 @@ env:
   # * report_objects: list individual leaked objects when running LeakSanitizer
   LSAN_OPTIONS: report_objects=1
 
-  CARGO_DENY_VERSION: "0.16.1"
-  CARGO_MACHETE_VERSION: "0.7.0"
-
+  CARGO_DENY_VERSION: "0.18.9"
+  CARGO_MACHETE_VERSION: "0.9.1"
 
 defaults:
   run:
@@ -49,6 +47,7 @@ jobs:
       - name: "Install Rust"
         uses: ./.github/composite/rust
         with:
+          rust: nightly
           components: rustfmt
 
       - name: "Check rustfmt"
@@ -66,28 +65,26 @@ jobs:
             exit 1
           }
 
-
   # Needs to be its own job (apart from sync-doc), because lints don't work with --no-deps, and because it contributes to ci-status.
   doc-lints:
     runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: "Patch Cargo.toml to use nightly extension API"
-      run: .github/other/patch-prebuilt.sh nightly
+      - name: "Patch Cargo.toml to use nightly extension API"
+        run: .github/other/patch-prebuilt.sh nightly
 
-    # rustdoc is included as component.
-    - name: "Install Rust"
-      uses: ./.github/composite/rust
+      # rustdoc is included as component.
+      - name: "Install Rust"
+        uses: ./.github/composite/rust
 
-    - name: "Check rustdoc"
-      env:
-        RUSTDOCFLAGS: >
-          -D rustdoc::broken-intra-doc-links -D rustdoc::private-intra-doc-links -D rustdoc::invalid-codeblock-attributes 
-          -D rustdoc::invalid-rust-codeblocks -D rustdoc::invalid-html-tags -D rustdoc::bare-urls -D rustdoc::unescaped-backticks
-          -D warnings
-      run: cargo doc -p godot --ignore-rust-version
-
+      - name: "Check rustdoc"
+        env:
+          RUSTDOCFLAGS: >
+            -D rustdoc::broken-intra-doc-links -D rustdoc::private-intra-doc-links -D rustdoc::invalid-codeblock-attributes
+            -D rustdoc::invalid-rust-codeblocks -D rustdoc::invalid-html-tags -D rustdoc::bare-urls -D rustdoc::unescaped-backticks
+            -D warnings
+        run: cargo doc -p godot --ignore-rust-version
 
   clippy:
     runs-on: ubuntu-22.04
@@ -145,7 +142,7 @@ jobs:
 
           - name: linux
             os: ubuntu-22.04
-            rust-toolchain: "1.87"
+            rust-toolchain: "1.94"
             rust-special: -msrv
 
     steps:
@@ -162,9 +159,12 @@ jobs:
           rust: ${{ matrix.rust-toolchain || 'stable' }}
           cache-key: ${{ matrix.rust-cache-key }} # only needed when rustc version is possibly the same
 
+      # Set Cargo features also to minimal; detects when doctests refer to API symbols outside the minimal codegen set.
       - name: "Install minimal dependency versions from Cargo"
         if: matrix.rust-special == '-minimal-deps'
-        run: cargo +nightly update -Z minimal-versions
+        run: |
+          cargo +nightly update -Z minimal-versions
+          echo "TEST_FEATURES=--no-default-features" >> $GITHUB_ENV
 
       - name: "Compile tests"
         run: cargo test $TEST_FEATURES --no-run ${{ matrix.rust-extra-args }}
@@ -172,6 +172,43 @@ jobs:
       - name: "Test"
         run: cargo test $TEST_FEATURES ${{ matrix.rust-extra-args }}
 
+  unit-test-web:
+    name: unit-test-web (${{ matrix.name }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Threads
+            command: test-web-t
+          - name: No threads
+            command: test-web-nt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Patch Cargo.toml to use nightly extension API"
+        run: .github/other/patch-prebuilt.sh nightly
+
+      - name: "Install Rust"
+        uses: ./.github/composite/rust
+        with:
+          rust: nightly
+          components: rust-src
+
+      - name: "Install emscripten"
+        env:
+          EMSCRIPTEN_SRC_REF: 4.0.13
+          EMSCRIPTEN_VERSION: 3.1.74
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git --depth 1 --branch "$EMSCRIPTEN_SRC_REF" --single-branch
+          ./emsdk/emsdk install "$EMSCRIPTEN_VERSION"
+          ./emsdk/emsdk activate "$EMSCRIPTEN_VERSION"
+          source ./emsdk/emsdk_env.sh
+          echo "$PATH" >> "$GITHUB_PATH"
+
+      - name: "Test (Wasm)"
+        run: ./check.sh ${{ matrix.command }}
 
   miri-test:
     name: miri-test
@@ -184,7 +221,7 @@ jobs:
         with:
           rust: nightly
           components: miri
-      
+
       - name: "Setup Miri"
         run: cargo miri setup
 
@@ -193,7 +230,7 @@ jobs:
 
       - name: "Test stacked borrows"
         run: cargo miri test -p godot-cell
-      
+
       - name: "Test tree borrows"
         run: MIRIFLAGS="-Zmiri-tree-borrows" cargo miri test -p godot-cell
 
@@ -236,48 +273,31 @@ jobs:
         # - Double + lazy:    Godot nightly, custom, double, lazy func tables
         # - Features + exp:   Godot nightly, custom, threads, serde, experimental API
         # - Memcheck nightly: Godot mem nightly, custom, sanitizer
-        # - Memcheck 4.x:     Godot mem 4.0/4.1, sanitizer
+        # - Memcheck 4.x:     Godot mem 4.2, sanitizer
 
         # Note: Windows uses '--target x86_64-pc-windows-msvc' by default as Cargo argument.
         include:
           # macOS -- for the unintuitive naming, see https://github.com/actions/runner-images?tab=readme-ov-file#available-images
 
-          - name: macos-x86
-            os: macos-13
-            artifact-name: macos-x86-nightly
-            godot-binary: godot.macos.editor.dev.x86_64
-            hot-reload: stable
-
-          - name: macos-double-x86
-            os: macos-13
-            artifact-name: macos-double-x86-nightly
-            godot-binary: godot.macos.editor.dev.double.x86_64
-            rust-extra-args: --features godot/api-custom,godot/double-precision
-
-          - name: macos-x86-4.3
-            os: macos-13
-            artifact-name: macos-x86-4.3
-            godot-binary: godot.macos.editor.dev.x86_64
-            godot-prebuilt-patch: '4.3'
-
           - name: macos-arm
             os: macos-latest
             artifact-name: macos-arm-nightly
             godot-binary: godot.macos.editor.dev.arm64
-            hot-reload: stable
+            hot-reload: stable signal-test
 
-           # api-custom on macOS arm64 not working, due to clang linker issues.
-#          - name: macos-double-arm
-#            os: macos-latest
-#            artifact-name: macos-double-arm-nightly
-#            godot-binary: godot.macos.editor.dev.double.arm64
-#            rust-extra-args: --features godot/api-custom,godot/double-precision
+            # api-custom on macOS arm64 not working, due to clang linker issues.
+          #          - name: macos-double-arm
+          #            os: macos-latest
+          #            artifact-name: macos-double-arm-nightly
+          #            godot-binary: godot.macos.editor.dev.double.arm64
+          #            rust-extra-args: --features godot/api-custom,godot/double-precision
 
-          - name: macos-arm-4.3
+          # Lag one version behind latest release.
+          - name: macos-arm-4.5
             os: macos-latest
-            artifact-name: macos-arm-4.3
+            artifact-name: macos-arm-4.5
             godot-binary: godot.macos.editor.dev.arm64
-            godot-prebuilt-patch: '4.3'
+            godot-prebuilt-patch: "4.5"
 
           # Windows
 
@@ -285,7 +305,7 @@ jobs:
             os: windows-latest
             artifact-name: windows-nightly
             godot-binary: godot.windows.editor.dev.x86_64.exe
-            hot-reload: stable
+            hot-reload: stable signal-test
 
           - name: windows-double
             os: windows-latest
@@ -293,17 +313,12 @@ jobs:
             godot-binary: godot.windows.editor.dev.double.x86_64.exe
             rust-extra-args: --features godot/api-custom,godot/double-precision
 
-          - name: windows-4.3
+          # Lag one version behind latest release.
+          - name: windows-4.5
             os: windows-latest
-            artifact-name: windows-4.3
+            artifact-name: windows-4.5
             godot-binary: godot.windows.editor.dev.x86_64.exe
-            godot-prebuilt-patch: '4.3'
-
-#          - name: windows-4.1
-#            os: windows-latest
-#            artifact-name: windows-4.1
-#            godot-binary: godot.windows.editor.dev.x86_64.exe
-#            godot-prebuilt-patch: '4.1.3'
+            godot-prebuilt-patch: "4.5"
 
           # Linux
 
@@ -316,8 +331,9 @@ jobs:
             os: ubuntu-22.04
             artifact-name: linux-nightly
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            rust-extra-args: --features itest/codegen-full
-            hot-reload: api-custom
+            rust-extra-args: --features itest/codegen-full,itest/test-gdextension-dependency
+            rust-extra-env: GDRUST_MAIN_EXTENSION=IntegrationTests
+            hot-reload: api-custom signal-test
 
           # Combines now a lot of features, but should be OK. lazy-function-tables doesn't work with experimental-threads.
           - name: linux-double-lazy
@@ -351,36 +367,53 @@ jobs:
             rust-extra-args: --release --features itest/codegen-full-experimental
             rust-cache-key: release
 
-          # Linux compat (4.1 disabled, already covered by memcheck)
+          # Linux compat:
           # No hot-reload before 4.4, as the Godot project is 4.4+.
+
+          - name: linux-4.6
+            os: ubuntu-22.04
+            artifact-name: linux-4.6
+            godot-binary: godot.linuxbsd.editor.dev.x86_64
+            #godot-prebuilt-patch: '4.6'
+            hot-reload: stable signal-test
+
+          - name: linux-4.5
+            os: ubuntu-22.04
+            artifact-name: linux-4.5
+            godot-binary: godot.linuxbsd.editor.dev.x86_64
+            godot-prebuilt-patch: "4.5"
+            hot-reload: api-4-5 signal-test
 
           - name: linux-4.4
             os: ubuntu-22.04
             artifact-name: linux-4.4
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            godot-prebuilt-patch: '4.4'
-            hot-reload: stable
+            godot-prebuilt-patch: "4.4"
+            hot-reload: api-4-4 signal-test
 
           - name: linux-4.3
             os: ubuntu-22.04
             artifact-name: linux-4.3
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            godot-prebuilt-patch: '4.3'
+            godot-prebuilt-patch: "4.3"
+            hot-reload: api-4-3
 
+          # Can be disabled in the future (already covered by memcheck). For now kept on to differentiate quicker.
           - name: linux-4.2
             os: ubuntu-22.04
             artifact-name: linux-4.2
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            godot-prebuilt-patch: '4.2.2'
+            godot-prebuilt-patch: "4.2"
+            hot-reload: api-4-2
 
-          # Memory checks: special Godot binaries compiled with AddressSanitizer/LeakSanitizer to detect UB/leaks.
+          # Memory checks: special Godot binaries compiled with AddressSanitizer/LeakSanitizer to detect UB/leaks. Always Linux.
           # See also https://rustc-dev-guide.rust-lang.org/sanitizers.html.
           #
           # Additionally, the Godot source is patched to make dlclose() a no-op, as unloading dynamic libraries loses stacktrace and
           # cause false positives like println!. See https://github.com/google/sanitizers/issues/89.
           #
           # There is also a gcc variant besides clang, which is currently not used.
-          - name: linux-memcheck-nightly
+          - name: memcheck-nightly
             os: ubuntu-22.04
             artifact-name: linux-memcheck-nightly
             godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
@@ -390,11 +423,32 @@ jobs:
             # Sanitizers can't build proc-macros and build scripts; with --target, cargo ignores RUSTFLAGS for those two.
             rust-target: x86_64-unknown-linux-gnu
 
-          - name: linux-memcheck-4.1
+          - name: memcheck-release-disengaged
             os: ubuntu-22.04
-            artifact-name: linux-memcheck-4.1
+            artifact-name: linux-memcheck-nightly
             godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
-            godot-prebuilt-patch: '4.1' # check compat of API 4.1.0 with newer binaries.
+            rust-toolchain: nightly
+            rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
+            # Currently without itest/codegen-full-experimental.
+            rust-extra-args: --release --features godot/safeguards-release-disengaged
+            rust-target: x86_64-unknown-linux-gnu
+            rust-target-dir: release # We're running Godot debug build with Rust release dylib.
+
+          - name: memcheck-dev-balanced
+            os: ubuntu-22.04
+            artifact-name: linux-memcheck-nightly
+            godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
+            rust-toolchain: nightly
+            rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
+            # Currently without itest/codegen-full-experimental.
+            rust-extra-args: --features godot/safeguards-dev-balanced
+            rust-target: x86_64-unknown-linux-gnu
+
+          - name: memcheck-4.2
+            os: ubuntu-22.04
+            artifact-name: linux-memcheck-4.2
+            godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
+            godot-prebuilt-patch: "4.2" # check compat of API 4.2 with newer binaries.
             rust-toolchain: nightly
             rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
             # Sanitizers can't build proc-macros and build scripts; with --target, cargo ignores RUSTFLAGS for those two.
@@ -413,7 +467,9 @@ jobs:
           rust-extra-args: ${{ matrix.rust-extra-args }}
           rust-toolchain: ${{ matrix.rust-toolchain || 'stable' }}
           rust-env-rustflags: ${{ matrix.rust-env-rustflags }}
+          rust-extra-env: ${{ matrix.rust-extra-env }}
           rust-target: ${{ matrix.rust-target }}
+          rust-target-dir: ${{ matrix.rust-target-dir }}
           rust-cache-key: ${{ matrix.rust-cache-key }}
           with-llvm: ${{ contains(matrix.name, 'macos') && contains(matrix.rust-extra-args, 'api-custom') }}
           godot-check-header: ${{ matrix.godot-check-header }}
@@ -426,7 +482,6 @@ jobs:
         # Don't pass in rust-extra-args as environment; they're intended for itest.
         run: $RETRY ./run-test.sh ${{ matrix.hot-reload }}
         shell: bash
-
 
   cargo-deny-machete:
     runs-on: ubuntu-22.04
@@ -453,14 +508,13 @@ jobs:
       - name: "Use machete to cut down dependencies"
         run: cargo machete
 
-
   license-guard:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
       - name: "Check license headers"
-        uses: 'apache/skywalking-eyes/header@v0.6.0'
+        uses: "apache/skywalking-eyes/header@v0.6.0"
         with:
           # log: debug # optional: set the log level. The default value is `info`.
           config: .github/other/licenserc.yml
@@ -468,7 +522,6 @@ jobs:
           # Set to empty ("") to disable commenting on pull request. The default value is ${{ github.token }}
           # mode: # optional: Which mode License-Eye should be run in. Choices are `check` or `fix`. The default value is `check`.
           mode: check
-
 
   # ---------------------------------------------------------------------------------------------------------------------------------------------
   # CI status report
@@ -495,7 +548,7 @@ jobs:
       - name: "Determine success or failure"
         run: |
           DEPENDENCIES='${{ toJson(needs) }}'
-          
+
           echo "Dependency jobs:"
           all_success=true
           for job in $(echo "$DEPENDENCIES" | jq -r 'keys[]'); do
@@ -505,7 +558,7 @@ jobs:
                   all_success=false
               fi
           done
-          
+
           if [[ "$all_success" == "false" ]]; then
               echo "One or more dependency jobs failed or were cancelled."
               exit 1

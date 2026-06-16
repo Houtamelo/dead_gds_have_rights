@@ -5,33 +5,48 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use godot::meta::inspect::ElementType;
+use godot::meta::wrapped;
 use godot::prelude::*;
 
-use crate::framework::{expect_panic, itest};
+use crate::framework::{assert_match, create_gdscript, expect_panic, itest};
 
 #[itest]
 fn array_default() {
-    assert_eq!(VariantArray::default().len(), 0);
+    assert_eq!(VarArray::default().len(), 0);
 }
 
 #[itest]
 fn array_new() {
-    assert_eq!(VariantArray::new().len(), 0);
+    assert_eq!(VarArray::new().len(), 0);
 }
 
 #[itest]
 fn array_eq() {
-    let a = array![1, 2];
-    let b = array![1, 2];
+    let a = iarray![1, 2];
+    let b = iarray![1, 2];
     assert_eq!(a, b);
 
-    let c = array![2, 1];
+    let c = iarray![2, 1];
     assert_ne!(a, c);
 }
 
 #[itest]
+fn array_type_inference() {
+    // Don't check static type, as that might affect inference.
+
+    // Following is inferred as i32, not i64. Reason is blanket impl for Pass=ByValue, which would make it difficult to exclude non-i64 integers
+    // without also excluding enums etc.
+    let a = iarray![1, 2];
+    assert_eq!(godot::sys::short_type_name_of_val(&a), "Array<i32>");
+
+    let a = iarray!["hello"];
+    assert_eq!(godot::sys::short_type_name_of_val(&a), "Array<GString>");
+}
+
+#[itest]
 fn typed_array_from_to_variant() {
-    let array = array![1, 2];
+    let array = iarray![1, 2];
     let variant = array.to_variant();
     let result = Array::try_from_variant(&variant).expect("typed array conversion should succeed");
     assert_eq!(result, array);
@@ -42,20 +57,8 @@ fn untyped_array_from_to_variant() {
     let array = varray![1, 2];
     let variant = array.to_variant();
     let result =
-        VariantArray::try_from_variant(&variant).expect("untyped array conversion should succeed");
+        VarArray::try_from_variant(&variant).expect("untyped array conversion should succeed");
     assert_eq!(result, array);
-}
-
-#[itest]
-fn array_from_packed_array() {
-    let packed_array = PackedInt32Array::from(&[42]);
-    let mut array = VariantArray::from(&packed_array);
-
-    // This tests that the resulting array doesn't secretly have a runtime type assigned to it,
-    // which is not reflected in our static type. It would make sense if it did, but Godot decided
-    // otherwise: we get an untyped array.
-    array.push(&GString::from("hi").to_variant());
-    assert_eq!(array, varray![42, "hi"]);
 }
 
 #[itest]
@@ -78,7 +81,7 @@ fn array_from_slice() {
 
 #[itest]
 fn array_try_into_vec() {
-    let array = array![1, 2];
+    let array = iarray![1, 2];
 
     #[allow(clippy::unnecessary_fallible_conversions)]
     let result = Vec::<i64>::try_from(&array);
@@ -87,7 +90,7 @@ fn array_try_into_vec() {
 
 #[itest]
 fn array_iter_shared() {
-    let array = array![1, 2];
+    let array = iarray![1, 2];
     let mut iter = array.iter_shared();
     assert_eq!(iter.size_hint(), (2, Some(2)));
     assert_eq!(iter.next(), Some(1));
@@ -99,14 +102,15 @@ fn array_iter_shared() {
 
 #[itest]
 fn array_hash() {
-    let array = array![1, 2];
-    // Just testing that it converts successfully from i64 to u32.
-    array.hash();
+    let typed = iarray![1, 2];
+    let untyped = varray![1, 2];
+
+    assert_eq!(typed.hash_u32(), untyped.hash_u32());
 }
 
 #[itest]
-fn array_share() {
-    let mut array = array![1, 2];
+fn array_clone() {
+    let mut array = iarray![1, 2];
     let shared = array.clone();
     array.set(0, 3);
     assert_eq!(shared.at(0), 3);
@@ -114,35 +118,77 @@ fn array_share() {
 
 #[itest]
 fn array_duplicate_shallow() {
-    let subarray = array![2, 3];
-    let array = varray![1, subarray];
+    let subarray = iarray![2, 3];
+    assert_eq!(
+        subarray.duplicate_shallow().element_type(),
+        ElementType::Builtin(VariantType::INT)
+    );
+
+    let array = varray![1, &subarray];
     let duplicate = array.duplicate_shallow();
-    Array::<i64>::try_from_variant(&duplicate.at(1))
-        .unwrap()
-        .set(0, 4);
+    assert_eq!(duplicate.element_type(), ElementType::Untyped);
+
+    Array::<i64>::from_variant(&duplicate.at(1)).set(0, 4);
     assert_eq!(subarray.at(0), 4);
 }
 
 #[itest]
 fn array_duplicate_deep() {
-    let subarray = array![2, 3];
-    let array = varray![1, subarray];
+    let subarray = iarray![2, 3];
+    assert_eq!(
+        subarray.duplicate_deep().element_type(),
+        ElementType::Builtin(VariantType::INT)
+    );
+
+    let array = varray![1, &subarray];
     let duplicate = array.duplicate_deep();
-    Array::<i64>::try_from_variant(&duplicate.at(1))
-        .unwrap()
-        .set(0, 4);
+    assert_eq!(duplicate.element_type(), ElementType::Untyped);
+
+    Array::<i64>::from_variant(&duplicate.at(1)).set(0, 4);
     assert_eq!(subarray.at(0), 2);
 }
 
 #[itest]
+fn array_any_duplicate_deep() {
+    let typed = iarray![2, 3].upcast_any_array();
+    assert_eq!(
+        typed.duplicate_deep().element_type(),
+        ElementType::Builtin(VariantType::INT)
+    );
+
+    let untyped = varray![1, typed].upcast_any_array();
+    assert_eq!(
+        untyped.duplicate_deep().element_type(),
+        ElementType::Untyped
+    );
+}
+
+#[itest]
+#[allow(clippy::reversed_empty_ranges)]
 fn array_subarray_shallow() {
-    let array = array![0, 1, 2, 3, 4, 5];
-    let slice = array.subarray_shallow(5, 1, Some(-2));
+    let array = iarray![0, 1, 2, 3, 4, 5];
+
+    let normal_slice = array.subarray_shallow(4..=5, None);
+    assert_eq!(normal_slice, array![4, 5]);
+
+    let slice = array.subarray_shallow(5..1, Some(-2));
     assert_eq!(slice, array![5, 3]);
 
-    let subarray = array![2, 3];
-    let array = varray![1, subarray];
-    let slice = array.subarray_shallow(1, 2, None);
+    let negative_slice = array.subarray_shallow(wrapped(-1..-5), Some(-2));
+    assert_eq!(negative_slice, array![5, 3]);
+
+    let other_negative_slice = array.subarray_shallow(wrapped(-1..3), Some(-1));
+    assert_eq!(other_negative_slice, array![5, 4]);
+
+    let clamped_slice = array.subarray_shallow(wrapped(100..-1), None);
+    assert_eq!(clamped_slice, array![]);
+
+    let other_clamped_slice = array.subarray_shallow(5.., Some(2));
+    assert_eq!(other_clamped_slice, array![5]);
+
+    let subarray = iarray![2, 3];
+    let array = varray![1, &subarray];
+    let slice = array.subarray_shallow(1..2, None);
     Array::<i64>::try_from_variant(&slice.at(0))
         .unwrap()
         .set(0, 4);
@@ -150,14 +196,31 @@ fn array_subarray_shallow() {
 }
 
 #[itest]
+#[allow(clippy::reversed_empty_ranges)]
 fn array_subarray_deep() {
-    let array = array![0, 1, 2, 3, 4, 5];
-    let slice = array.subarray_deep(5, 1, Some(-2));
+    let array = iarray![0, 1, 2, 3, 4, 5];
+
+    let normal_slice = array.subarray_deep(4..=5, None);
+    assert_eq!(normal_slice, array![4, 5]);
+
+    let slice = array.subarray_deep(5..1, Some(-2));
     assert_eq!(slice, array![5, 3]);
 
-    let subarray = array![2, 3];
-    let array = varray![1, subarray];
-    let slice = array.subarray_deep(1, 2, None);
+    let negative_slice = array.subarray_deep(wrapped(-1..-5), Some(-2));
+    assert_eq!(negative_slice, array![5, 3]);
+
+    let other_negative_slice = array.subarray_deep(wrapped(-1..3), Some(-1));
+    assert_eq!(other_negative_slice, array![5, 4]);
+
+    let clamped_slice = array.subarray_deep(wrapped(100..-1), None);
+    assert_eq!(clamped_slice, array![]);
+
+    let other_clamped_slice = array.subarray_deep(5.., Some(2));
+    assert_eq!(other_clamped_slice, array![5]);
+
+    let subarray = iarray![2, 3];
+    let array = varray![1, &subarray];
+    let slice = array.subarray_deep(1..2, None);
     Array::<i64>::try_from_variant(&slice.at(0))
         .unwrap()
         .set(0, 4);
@@ -166,7 +229,7 @@ fn array_subarray_deep() {
 
 #[itest]
 fn array_get() {
-    let array = array![1, 2];
+    let array = iarray![1, 2];
 
     assert_eq!(array.at(0), 1);
     assert_eq!(array.at(1), 2);
@@ -177,7 +240,7 @@ fn array_get() {
 
 #[itest]
 fn array_try_get() {
-    let array = array![1, 2];
+    let array = iarray![1, 2];
 
     assert_eq!(array.get(0), Some(1));
     assert_eq!(array.get(1), Some(2));
@@ -186,12 +249,12 @@ fn array_try_get() {
 
 #[itest]
 fn array_first_last() {
-    let array = array![1, 2];
+    let array = iarray![1, 2];
 
     assert_eq!(array.front(), Some(1));
     assert_eq!(array.back(), Some(2));
 
-    let empty_array = VariantArray::new();
+    let empty_array = VarArray::new();
 
     assert_eq!(empty_array.front(), None);
     assert_eq!(empty_array.back(), None);
@@ -199,7 +262,7 @@ fn array_first_last() {
 
 #[itest]
 fn array_find() {
-    let array = array![1, 2, 1];
+    let array = iarray![1, 2, 1];
 
     assert_eq!(array.find(0, None), None);
     assert_eq!(array.find(1, None), Some(0));
@@ -208,7 +271,7 @@ fn array_find() {
 
 #[itest]
 fn array_rfind() {
-    let array = array![1, 2, 1];
+    let array = iarray![1, 2, 1];
 
     assert_eq!(array.rfind(0, None), None);
     assert_eq!(array.rfind(1, None), Some(2));
@@ -217,17 +280,17 @@ fn array_rfind() {
 
 #[itest]
 fn array_min_max() {
-    let int_array = array![1, 2];
+    let int_array = iarray![1, 2];
 
     assert_eq!(int_array.min(), Some(1));
     assert_eq!(int_array.max(), Some(2));
 
-    let uncomparable_array = varray![1, GString::from("two")];
+    let uncomparable_array = varray![1, &GString::from("two")];
 
     assert_eq!(uncomparable_array.min(), None);
     assert_eq!(uncomparable_array.max(), None);
 
-    let empty_array = VariantArray::new();
+    let empty_array = VarArray::new();
 
     assert_eq!(empty_array.min(), None);
     assert_eq!(empty_array.max(), None);
@@ -235,13 +298,13 @@ fn array_min_max() {
 
 #[itest]
 fn array_pick_random() {
-    assert_eq!(VariantArray::new().pick_random(), None);
-    assert_eq!(array![1].pick_random(), Some(1));
+    assert_eq!(VarArray::new().pick_random(), None);
+    assert_eq!(iarray![1].pick_random(), Some(1));
 }
 
 #[itest]
 fn array_set() {
-    let mut array = array![1, 2];
+    let mut array = iarray![1, 2];
 
     array.set(0, 3);
     assert_eq!(array.at(0), 3);
@@ -253,14 +316,14 @@ fn array_set() {
 
 #[itest]
 fn array_set_readonly() {
-    let mut array = array![1, 2].into_read_only();
+    let mut array = iarray![1, 2].into_read_only();
 
-    #[cfg(debug_assertions)]
-    expect_panic("Mutating read-only array in Debug mode", || {
+    #[cfg(safeguards_balanced)]
+    expect_panic("Mutating read-only array with balanced safeguards", || {
         array.set(0, 3);
     });
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(safeguards_balanced))]
     array.set(0, 3); // silently fails.
 
     assert_eq!(array.at(0), 1);
@@ -268,7 +331,7 @@ fn array_set_readonly() {
 
 #[itest]
 fn array_push_pop() {
-    let mut array = array![1, 2];
+    let mut array = iarray![1, 2];
 
     array.push(3);
     assert_eq!(array.pop(), Some(3));
@@ -285,7 +348,7 @@ fn array_push_pop() {
 
 #[itest]
 fn array_insert() {
-    let mut array = array![1, 2];
+    let mut array = iarray![1, 2];
 
     array.insert(0, 3);
     assert_eq!(array, array![3, 1, 2]);
@@ -296,22 +359,22 @@ fn array_insert() {
 
 #[itest]
 fn array_extend() {
-    let mut array = array![1, 2];
-    let other = array![3, 4];
+    let mut array = iarray![1, 2];
+    let other = iarray![3, 4];
     array.extend_array(&other);
     assert_eq!(array, array![1, 2, 3, 4]);
 }
 
 #[itest]
 fn array_reverse() {
-    let mut array = array![1, 2];
+    let mut array = iarray![1, 2];
     array.reverse();
     assert_eq!(array, array![2, 1]);
 }
 
 #[itest]
 fn array_shuffle() {
-    let mut array = array![1];
+    let mut array = iarray![1];
     array.shuffle();
     assert_eq!(array, array![1]);
 }
@@ -321,7 +384,7 @@ fn array_mixed_values() {
     let int = 1;
     let string = GString::from("hello");
     let packed_array = PackedByteArray::from(&[1, 2]);
-    let typed_array = array![1, 2];
+    let typed_array = iarray![1, 2];
     let object = Object::new_alloc();
     let node = Node::new_alloc();
     let engine_refc = RefCounted::new_gd();
@@ -329,13 +392,13 @@ fn array_mixed_values() {
 
     let array = varray![
         int,
-        string,
-        packed_array,
-        typed_array,
-        object,
-        node,
-        engine_refc,
-        user_refc,
+        &string,
+        &packed_array,
+        &typed_array,
+        &object,
+        &node,
+        &engine_refc,
+        &user_refc,
     ];
 
     assert_eq!(i64::try_from_variant(&array.at(0)).unwrap(), int);
@@ -375,13 +438,93 @@ fn array_mixed_values() {
     node.free();
 }
 
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// AnyArray interactions
+
 #[itest]
-fn untyped_array_pass_to_godot_func() {
+fn array_typed_conversions() {
+    let typed = iarray![1, 2, 3];
+    let any = typed.clone().upcast_any_array();
+
+    let typed_back = any
+        .clone()
+        .try_cast_array::<i64>()
+        .expect("convert back to typed");
+    assert_eq!(typed_back, typed);
+
+    let untyped_fail = any.try_cast_var_array();
+    assert!(untyped_fail.is_err(), "cannot convert typed to untyped");
+}
+
+#[itest]
+fn array_untyped_conversions() {
+    let untyped = varray![1, 2, 3];
+    let any = untyped.clone().upcast_any_array();
+
+    let untyped_back = any
+        .clone()
+        .try_cast_var_array()
+        .expect("convert back to untyped");
+    assert_eq!(untyped_back, untyped);
+
+    let typed_fail = any.try_cast_array::<i64>();
+    assert!(typed_fail.is_err(), "cannot convert untyped to typed");
+}
+
+#[itest]
+fn array_bad_cast() {
+    let int_array: Array<i64> = array![1, 2, 3];
+    let erased_array = int_array.upcast_any_array();
+
+    erased_array
+        .clone()
+        .try_cast_array::<f64>()
+        .expect_err("must not downcast to differently-typed array");
+
+    erased_array
+        .try_cast_var_array()
+        .expect_err("must not downcast to untyped array");
+}
+
+#[itest]
+fn array_invariant_class_cast() {
+    let refc_array: Array<Gd<RefCounted>> = array![&RefCounted::new_gd()];
+    let erased_array = refc_array.clone().upcast_any_array();
+
+    // Downcast back to Array<Gd<Object>> must *fail*.
+    // Reason: T is not covariant in Array<T>; otherwise it would be possible to insert non-RefCounted Object objects into the array.
+    // There could theoretically be a AnyArray<T> type supporting covariance, but let's only add such complexity if truly needed.
+    let erased_array = erased_array
+        .try_cast_array::<Gd<Object>>()
+        .expect_err("must not downcast to differently-typed class array");
+
+    // Failed Err(self) object can be used further; downcast to original type.
+    let refc_array_back = erased_array
+        .try_cast_array::<Gd<RefCounted>>()
+        .expect("should cast back to Array<Gd<RefCounted>>");
+    assert_eq!(refc_array_back, refc_array);
+}
+
+#[itest]
+fn untyped_out_array_pass_to_godot_func() {
     let mut node = Node::new_alloc();
     node.queue_free(); // Do not leak even if the test fails.
 
+    let args: VarArray = varray!["tree_entered"];
     assert_eq!(
-        node.callv("has_signal", &varray!["tree_entered"]),
+        node.callv(&StringName::from("has_signal"), &args),
+        true.to_variant()
+    );
+}
+
+#[itest]
+fn typed_out_array_pass_to_godot_func() {
+    let mut node = Node::new_alloc();
+    node.queue_free(); // Do not leak even if the test fails.
+
+    let args: Array<GString> = array!["tree_entered"];
+    assert_eq!(
+        node.callv(&StringName::from("has_signal"), &args),
         true.to_variant()
     );
 }
@@ -396,14 +539,17 @@ fn untyped_array_return_from_godot_func() {
     node.queue_free(); // Do not leak even if the test fails.
     let result = node.get_node_and_resource("child_node");
 
-    assert_eq!(result, varray![child, Variant::nil(), NodePath::default()]);
+    assert_eq!(
+        result,
+        varray![&child, &Variant::nil(), &NodePath::default()]
+    );
 }
 
 // Conditional, so we don't need Texture2DArray > ImageTextureLayered > TextureLayered > Texture in minimal codegen.
 // Potential alternatives (search for "typedarray::" in extension_api.json):
-// - ClassDB::class_get_signal_list() -> Array<Dictionary>
+// - ClassDB::class_get_signal_list() -> Array<VarDictionary>
 // - Compositor::set_compositor_effects( Array<Gd<Compositor>> )
-#[cfg(feature = "codegen-full-experimental")]
+#[cfg(feature = "codegen-full")]
 #[itest]
 fn typed_array_pass_to_godot_func() {
     use godot::classes::image::Format;
@@ -441,7 +587,7 @@ fn typed_array_return_from_godot_func() {
 #[itest]
 fn typed_array_try_from_untyped() {
     let node = Node::new_alloc();
-    let array = VariantArray::from(&[node.clone().to_variant()]);
+    let array = VarArray::from(&[node.clone().to_variant()]);
 
     array
         .to_variant()
@@ -458,15 +604,17 @@ fn untyped_array_try_from_typed() {
 
     array
         .to_variant()
-        .try_to::<VariantArray>()
+        .try_to::<VarArray>()
         .expect_err("typed array should not coerce to untyped array");
 
     node.free();
 }
 
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
 #[itest]
 fn array_should_format_with_display() {
-    let a = array![1, 2, 3, 4];
+    let a = iarray![1, 2, 3, 4];
     assert_eq!(format!("{a}"), "[1, 2, 3, 4]");
 
     let a = Array::<real>::new();
@@ -475,13 +623,12 @@ fn array_should_format_with_display() {
 
 #[itest]
 fn array_sort_unstable() {
-    let mut array = array![2, 1];
+    let mut array = iarray![2, 1];
     array.sort_unstable();
     assert_eq!(array, array![1, 2]);
 }
 
 #[itest]
-#[cfg(since_api = "4.2")]
 fn array_sort_unstable_by() {
     let mut array: Array<i32> = array![2, 1, 4, 3];
     array.sort_unstable_by(|a, b| a.cmp(b));
@@ -489,9 +636,8 @@ fn array_sort_unstable_by() {
 }
 
 #[itest]
-#[cfg(since_api = "4.2")]
 fn array_sort_unstable_custom() {
-    let mut a = array![1, 2, 3, 4];
+    let mut a = iarray![1, 2, 3, 4];
     let func = backwards_sort_callable();
     a.sort_unstable_custom(&func);
     assert_eq!(a, array![4, 3, 2, 1]);
@@ -499,7 +645,7 @@ fn array_sort_unstable_custom() {
 
 #[itest]
 fn array_bsearch() {
-    let array = array![1, 3];
+    let array = iarray![1, 3];
 
     assert_eq!(array.bsearch(0), 0);
     assert_eq!(array.bsearch(1), 0);
@@ -509,7 +655,6 @@ fn array_bsearch() {
 }
 
 #[itest]
-#[cfg(since_api = "4.2")]
 fn array_bsearch_by() {
     let a: Array<i32> = array![1, 2, 4, 5];
 
@@ -522,25 +667,16 @@ fn array_bsearch_by() {
 }
 
 #[itest]
-#[cfg(since_api = "4.2")]
-fn array_bsearch_custom() {
-    let a = array![5, 4, 2, 1];
+fn array_fops_bsearch_custom() {
+    let a = iarray![5, 4, 2, 1];
     let func = backwards_sort_callable();
-    assert_eq!(a.bsearch_custom(1, &func), 3);
-    assert_eq!(a.bsearch_custom(3, &func), 2);
-}
-
-#[cfg(since_api = "4.2")]
-fn backwards_sort_callable() -> Callable {
-    Callable::from_local_fn("sort backwards", |args: &[&Variant]| {
-        let res = args[0].to::<i32>() > args[1].to::<i32>();
-        Ok(res.to_variant())
-    })
+    assert_eq!(a.functional_ops().bsearch_custom(1, &func), 3);
+    assert_eq!(a.functional_ops().bsearch_custom(3, &func), 2);
 }
 
 #[itest]
 fn array_shrink() {
-    let mut a = array![1, 5, 4, 3, 8];
+    let mut a = iarray![1, 5, 4, 3, 8];
 
     assert!(!a.shrink(10));
     assert_eq!(a.len(), 5);
@@ -552,7 +688,7 @@ fn array_shrink() {
 
 #[itest]
 fn array_resize() {
-    let mut a = array!["hello", "bar", "mixed", "baz", "meow"];
+    let mut a = iarray!["hello", "bar", "mixed", "baz", "meow"];
 
     let new = GString::from("new!");
 
@@ -560,7 +696,9 @@ fn array_resize() {
     assert_eq!(a.len(), 10);
     assert_eq!(
         a,
-        array!["hello", "bar", "mixed", "baz", "meow", &new, &new, &new, &new, &new]
+        array![
+            "hello", "bar", "mixed", "baz", "meow", &new, &new, &new, &new, &new
+        ]
     );
 
     a.resize(2, &new);
@@ -570,17 +708,198 @@ fn array_resize() {
     assert_eq!(a, Array::new());
 }
 
-// Tests that arrays of objects can be declared without explicit type annotations. A similar test exists for DynGd in dyn_gd_test.rs.
-// This has deliberately been added to guard against regressions in case `AsArg` is extended (T: Inherits<Base> support broke this).
 fn __array_type_inference() {
     let a = Node::new_alloc();
-    let b = Node::new_alloc();
-    let _array = array![&a, &b];
+    let b = Node2D::new_alloc(); // will be implicitly upcast.
+    let _array: Array<Gd<Node>> = array![&a, &b];
 
     let c = ArrayTest::new_gd();
     let d = ArrayTest::new_gd();
-    let _array = array![&c, &d];
+    let _array: Array<Gd<ArrayTest>> = array![&c, &d];
+    // Earlier versions supported `let _array = array[&a, &b]`. This is nice, but allows no upcasting support -- it's a trade-off.
 }
+
+#[itest]
+fn array_element_type() {
+    // Untyped array.
+    let untyped = VarArray::new();
+    assert!(
+        matches!(untyped.element_type(), ElementType::Untyped),
+        "expected untyped array for VarArray"
+    );
+
+    let builtin_int = Array::<i64>::new();
+    assert_match!(
+        builtin_int.element_type(),
+        ElementType::Builtin(VariantType::INT),
+    );
+
+    let builtin_string = Array::<GString>::new();
+    assert_match!(
+        builtin_string.element_type(),
+        ElementType::Builtin(VariantType::STRING),
+    );
+
+    let class_array = Array::<Gd<Node>>::new();
+    assert_match!(class_array.element_type(), ElementType::Class(class_name));
+    assert_eq!(class_name.to_string(), "Node");
+
+    let extension_class_array = Array::<Gd<ArrayTest>>::new();
+    assert_match!(
+        extension_class_array.element_type(),
+        ElementType::Class(class_name),
+    );
+    assert_eq!(class_name, ArrayTest::class_id());
+}
+
+#[itest]
+fn array_element_type_custom_script() {
+    let gdscript = create_gdscript(
+        r#"
+extends RefCounted
+class_name CustomScriptForArrays
+
+func make_array() -> Array[CustomScriptForArrays]:
+    return [self]
+"#,
+    );
+
+    let mut object = RefCounted::new_gd();
+    object.set_script(&gdscript);
+
+    // Invoke script to return an array of itself.
+    let result = object.call("make_array", &[]);
+    let array = result.to::<Array<Gd<RefCounted>>>();
+    let element_type = array.element_type();
+
+    let ElementType::ScriptClass(script) = element_type else {
+        panic!("expected CustomScript for array");
+    };
+
+    let script = script.script().expect("script object should be alive");
+    assert_eq!(script, gdscript.upcast());
+    assert_eq!(script.get_name(), GString::new()); // Resource name.
+    assert_eq!(script.get_instance_base_type(), "RefCounted");
+
+    #[cfg(since_api = "4.3")]
+    assert_eq!(script.get_global_name(), "CustomScriptForArrays");
+}
+
+// Test that proper type has been set&cached while creating new Array.
+// https://github.com/godot-rust/gdext/pull/1357
+#[itest]
+fn array_inner_type() {
+    let primary = Array::<VarDictionary>::new();
+
+    let secondary = primary.duplicate_shallow();
+    assert_eq!(secondary.element_type(), primary.element_type());
+
+    let secondary = primary.duplicate_deep();
+    assert_eq!(secondary.element_type(), primary.element_type());
+
+    let subarray = primary.subarray_deep(.., None);
+    assert_eq!(subarray.element_type(), primary.element_type());
+
+    let subarray = primary.subarray_shallow(.., None);
+    assert_eq!(subarray.element_type(), primary.element_type());
+}
+
+#[itest]
+fn array_fops_filter() {
+    let is_even = is_even_callable();
+
+    let array = iarray![1, 2, 3, 4, 5, 6];
+    assert_eq!(array.functional_ops().filter(&is_even), array![2, 4, 6]);
+}
+
+#[itest]
+fn array_fops_map() {
+    let f = Callable::from_fn("round", |args| args[0].to::<f64>().round() as i64);
+
+    let array = iarray![0.7, 1.0, 1.3, 1.6];
+    let result = array.functional_ops().map(&f);
+
+    assert_eq!(result, varray![1, 1, 1, 2]);
+}
+
+#[itest]
+fn array_fops_reduce() {
+    let f = Callable::from_fn("sum", |args| args[0].to::<i64>() + args[1].to::<i64>());
+
+    let array = iarray![1, 2, 3, 4];
+    let result = array.functional_ops().reduce(&f, &0.to_variant());
+
+    assert_eq!(result.to::<i64>(), 10);
+}
+
+#[itest]
+fn array_fops_any() {
+    let is_even = is_even_callable();
+
+    assert!(iarray![1, 2, 3].functional_ops().any(&is_even));
+    assert!(!iarray![1, 3, 5].functional_ops().any(&is_even));
+}
+
+#[itest]
+fn array_fops_all() {
+    let is_even = is_even_callable();
+
+    assert!(!iarray![1, 2, 3].functional_ops().all(&is_even));
+    assert!(iarray![2, 4, 6].functional_ops().all(&is_even));
+}
+
+#[itest]
+#[cfg(since_api = "4.4")]
+fn array_fops_find_custom() {
+    let is_even = is_even_callable();
+
+    let array = iarray![1, 2, 3, 4, 5];
+    assert_eq!(array.functional_ops().find_custom(&is_even, None), Some(1));
+
+    let array = iarray![1, 3, 5];
+    assert_eq!(array.functional_ops().find_custom(&is_even, None), None);
+}
+
+#[itest]
+#[cfg(since_api = "4.4")]
+fn array_fops_rfind_custom() {
+    let is_even = is_even_callable();
+
+    let array = iarray![1, 2, 3, 4, 5];
+    assert_eq!(array.functional_ops().rfind_custom(&is_even, None), Some(3));
+
+    let array = iarray![1, 3, 5];
+    assert_eq!(array.functional_ops().rfind_custom(&is_even, None), None);
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Helper functions for creating callables.
+
+fn backwards_sort_callable() -> Callable {
+    // No &[&Variant] explicit type in arguments.
+    Callable::from_fn("sort backwards", |args| {
+        args[0].to::<i32>() > args[1].to::<i32>()
+    })
+}
+
+fn is_even_callable() -> Callable {
+    Callable::from_fn("is even", |args| args[0].to::<i64>() % 2 == 0)
+}
+
+#[itest]
+fn array_deref_to_out_array() {
+    let typed: Array<i64> = array![10, 20, 30];
+    let untyped: VarArray = varray![1, "hello", true];
+
+    let typed: &AnyArray = &typed;
+    assert_eq!(typed.at(1), 20.to_variant());
+
+    let untyped: &AnyArray = &untyped;
+    assert_eq!(untyped.at(1), "hello".to_variant());
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Class definitions
 
 #[derive(GodotClass, Debug)]
 #[class(init, base=RefCounted)]

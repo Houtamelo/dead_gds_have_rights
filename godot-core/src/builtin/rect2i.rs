@@ -7,10 +7,10 @@
 
 use std::cmp;
 
-use crate::builtin::{Rect2, Side, Vector2i};
-
 use godot_ffi as sys;
-use sys::{ffi_methods, ExtVariantType, GodotFfi};
+use sys::{ExtVariantType, GodotFfi, ffi_methods};
+
+use crate::builtin::{Rect2, Side, Vector2i};
 
 /// 2D axis-aligned integer bounding box.
 ///
@@ -28,8 +28,11 @@ use sys::{ffi_methods, ExtVariantType, GodotFfi};
 ///
 /// [`Aabb`]: crate::builtin::Aabb
 ///
-/// # Godot docs
+/// # Soft invariants
+/// `Rect2i` requires non-negative size for certain operations, which is validated only on a best-effort basis. Violations may
+/// cause panics in Debug mode. See also [_Builtin API design_](../__docs/index.html#6-public-fields-and-soft-invariants).
 ///
+/// # Godot docs
 /// [`Rect2i` (stable)](https://docs.godotengine.org/en/stable/classes/class_rect2i.html)
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -64,11 +67,17 @@ impl Rect2i {
 
     /// Create a new `Rect2i` with the first corner at `position` and the opposite corner at `end`.
     #[inline]
-    pub fn from_corners(position: Vector2i, end: Vector2i) -> Self {
+    pub fn from_position_end(position: Vector2i, end: Vector2i) -> Self {
         Self {
             position,
             size: end - position,
         }
+    }
+
+    #[inline]
+    #[deprecated = "Renamed to `from_position_end`."]
+    pub fn from_corners(position: Vector2i, end: Vector2i) -> Self {
+        Self::from_position_end(position, end)
     }
 
     /// Create a new `Rect2` from a `Rect2i`, using `as` for `i32` to `real` conversions.
@@ -83,17 +92,12 @@ impl Rect2i {
     }
 
     /// The end of the `Rect2i` calculated as `position + size`.
-    ///
-    /// _Godot equivalent: `Rect2i.size` property_
-    #[doc(alias = "size")]
     #[inline]
     pub const fn end(self) -> Vector2i {
         Vector2i::new(self.position.x + self.size.x, self.position.y + self.size.y)
     }
 
-    /// Set size based on desired end-point.
-    ///
-    /// _Godot equivalent: `Rect2i.size` property_
+    /// Set end of the `Rect2i`, updating `size = end - position`.
     #[inline]
     pub fn set_end(&mut self, end: Vector2i) {
         self.size = end - self.position
@@ -110,8 +114,7 @@ impl Rect2i {
 
     /// Returns `true` if this `Rect2i` completely encloses another one.
     ///
-    /// Any `Rect2i` encloses itself, i.e. an enclosed `Rect2i` does is not required to be a
-    /// proper sub-rect.
+    /// Any `Rect2i` encloses itself, i.e. an enclosed `Rect2i` does is not required to be a proper sub-rect.
     #[inline]
     pub const fn encloses(self, other: Self) -> bool {
         self.assert_nonnegative();
@@ -132,7 +135,7 @@ impl Rect2i {
 
         let begin = self.position;
         let end = self.end();
-        Self::from_corners(begin.coord_min(to), end.coord_max(to))
+        Self::from_position_end(begin.coord_min(to), end.coord_max(to))
     }
 
     /// Returns the area of the `Rect2i`.
@@ -160,7 +163,7 @@ impl Rect2i {
     #[inline]
     pub fn grow(self, amount: i32) -> Self {
         let amount_2d = Vector2i::new(amount, amount);
-        Self::from_corners(self.position - amount_2d, self.end() + amount_2d)
+        Self::from_position_end(self.position - amount_2d, self.end() + amount_2d)
     }
 
     /// Returns a copy of the `Rect2i` grown by the specified amount on each side individually.
@@ -171,7 +174,7 @@ impl Rect2i {
     pub fn grow_individual(self, left: i32, top: i32, right: i32, bottom: i32) -> Self {
         let top_left = Vector2i::new(left, top);
         let bottom_right = Vector2i::new(right, bottom);
-        Self::from_corners(self.position - top_left, self.end() + bottom_right)
+        Self::from_position_end(self.position - top_left, self.end() + bottom_right)
     }
 
     /// Returns a copy of the `Rect2i` grown by the specified `amount` on the specified `RectSide`.
@@ -234,7 +237,7 @@ impl Rect2i {
         let new_pos = b.position.coord_max(self.position);
         let new_end = b_end.coord_min(own_end);
 
-        Some(Self::from_corners(new_pos, new_end))
+        Some(Self::from_position_end(new_pos, new_end))
     }
 
     /// Returns `true` if the `Rect2i` overlaps with `b` (i.e. they have at least one
@@ -253,7 +256,7 @@ impl Rect2i {
         let new_pos = b.position.coord_min(self.position);
         let new_end = b.end().coord_max(self.end());
 
-        Self::from_corners(new_pos, new_end)
+        Self::from_position_end(new_pos, new_end)
     }
 
     /// Returns `true` if either of the coordinates of this `Rect2i`s `size` vector is negative.
@@ -287,7 +290,7 @@ unsafe impl GodotFfi for Rect2i {
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }
 
-crate::meta::impl_godot_as_self!(Rect2i);
+crate::meta::impl_godot_as_self!(Rect2i: ByValue);
 
 impl std::fmt::Display for Rect2i {
     /// Formats `Rect2i` to match Godot's string representation.
@@ -313,7 +316,8 @@ mod test {
         let new = Rect2i::new(Vector2i::new(0, 100), Vector2i::new(1280, 720));
         let from_components = Rect2i::from_components(0, 100, 1280, 720);
         let from_rect2 = Rect2::from_components(0.1, 100.3, 1280.1, 720.42).cast_int();
-        let from_corners = Rect2i::from_corners(Vector2i::new(0, 100), Vector2i::new(1280, 820));
+        let from_position_end =
+            Rect2i::from_position_end(Vector2i::new(0, 100), Vector2i::new(1280, 820));
 
         assert_eq!(zero.position.x, 0);
         assert_eq!(zero.position.y, 0);
@@ -322,12 +326,12 @@ mod test {
 
         assert_eq!(new, from_components);
         assert_eq!(new, from_rect2);
-        assert_eq!(new, from_corners);
+        assert_eq!(new, from_position_end);
 
         assert_eq!(from_components, from_rect2);
-        assert_eq!(from_components, from_corners);
+        assert_eq!(from_components, from_position_end);
 
-        assert_eq!(from_rect2, from_corners);
+        assert_eq!(from_rect2, from_position_end);
     }
 
     #[test]

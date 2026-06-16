@@ -13,19 +13,11 @@ mod ref_arg;
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Public APIs
 
-pub use as_arg::{val_into_arg, ArgPassing, AsArg, ByRef, ByValue, ParamType};
-pub use cow_arg::CowArg;
-pub use object_arg::AsObjectArg;
+pub(crate) use as_arg::NullArg;
+pub use as_arg::{
+    ArgPassing, AsArg, AsDirectElement, ByObject, ByOption, ByRef, ByValue, ByVariant, ToArg,
+    owned_into_arg, ref_to_arg,
+};
+pub use cow_arg::{CowArg, FfiArg};
+pub use object_arg::ObjectArg;
 pub use ref_arg::RefArg;
-
-// ----------------------------------------------------------------------------------------------------------------------------------------------
-// Internal APIs
-
-#[allow(unused_imports)] // ObjectCow is used in generated code.
-pub(crate) use object_arg::{ObjectArg, ObjectCow, ObjectNullArg};
-
-// #[doc(hidden)]
-// pub use cow_arg::*;
-//
-// #[doc(hidden)]
-// pub use ref_arg::*;

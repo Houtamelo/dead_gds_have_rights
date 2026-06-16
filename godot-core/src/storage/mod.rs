@@ -11,8 +11,9 @@ mod multi_threaded;
 #[cfg_attr(feature = "experimental-threads", allow(dead_code))]
 mod single_threaded;
 
-pub use instance_storage::*;
 use std::any::type_name;
+
+pub use instance_storage::*;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Shared code for submodules
@@ -54,26 +55,25 @@ fn bug_inaccessible<T>(err: Box<dyn std::error::Error>) -> ! {
 
 #[cfg(feature = "debug-log")]
 use log_active::*;
-
 #[cfg(not(feature = "debug-log"))]
 use log_inactive::*;
 
 #[cfg(feature = "debug-log")]
 mod log_active {
-    use super::*;
     use godot_ffi::out;
+
+    use super::*;
 
     pub fn log_construct<T: GodotClass>(base: &Base<T::Base>) {
         out!(
-            "    Storage::construct:             {base:?}  (T={ty})",
+            "    Storage::construct:   {base:?}  (T={ty})",
             ty = type_name::<T>()
         );
     }
 
     pub fn log_inc_ref<T: StorageRefCounted>(storage: &T) {
         out!(
-            "    Storage::on_inc_ref (rc={rc}):  {base:?}  (T={ty})",
-            rc = T::godot_ref_count(storage),
+            "    Storage::on_inc_ref:  {base:?}  (T={ty})",
             base = storage.base(),
             ty = type_name::<T>(),
         );
@@ -81,8 +81,7 @@ mod log_active {
 
     pub fn log_dec_ref<T: StorageRefCounted>(storage: &T) {
         out!(
-            "  | Storage::on_dec_ref (rc={rc}):  {base:?}  (T={ty})",
-            rc = T::godot_ref_count(storage),
+            "  | Storage::on_dec_ref:  {base:?}  (T={ty})",
             base = storage.base(),
             ty = type_name::<T>(),
         );
@@ -103,8 +102,7 @@ mod log_active {
         // Do not Debug-fmt `self.base()` object here, see above.
 
         out!(
-            "    Storage::drop (rc={rc}):        {base_id}",
-            rc = storage.godot_ref_count(),
+            "    Storage::drop:        {base_id}",
             base_id = storage.base().debug_instance_id(),
         );
     }
@@ -125,14 +123,14 @@ mod log_inactive {
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Tracking borrows in Debug mode
 
-#[cfg(debug_assertions)]
+#[cfg(safeguards_strict)]
 use borrow_info::DebugBorrowTracker;
-
-use crate::obj::{Base, GodotClass};
-#[cfg(not(debug_assertions))]
+#[cfg(not(safeguards_strict))]
 use borrow_info_noop::DebugBorrowTracker;
 
-#[cfg(debug_assertions)]
+use crate::obj::{Base, GodotClass};
+
+#[cfg(safeguards_strict)]
 mod borrow_info {
     use std::backtrace::Backtrace;
     use std::fmt;
@@ -197,7 +195,7 @@ mod borrow_info {
     }
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(safeguards_strict))]
 mod borrow_info_noop {
     use std::fmt;
 

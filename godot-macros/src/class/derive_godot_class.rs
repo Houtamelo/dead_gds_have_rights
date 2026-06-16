@@ -5,19 +5,21 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::class::data_models::fields::{named_fields, Fields};
-use crate::class::data_models::group_export::FieldGroup;
-use crate::class::{
-    make_property_impl, make_virtual_callback, BeforeKind, Field, FieldCond, FieldDefault,
-    FieldExport, FieldVar, SignatureInfo,
-};
-use crate::util::{
-    bail, error, format_funcs_collection_struct, ident, path_ends_with_complex,
-    require_api_version, KvParser,
-};
-use crate::{handle_mutually_exclusive_keys, util, ParseResult};
 use proc_macro2::{Ident, Punct, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
+use venial::Error;
+
+use crate::class::data_models::fields::{Fields, named_fields};
+use crate::class::data_models::group_export::FieldGroup;
+use crate::class::{
+    BeforeKind, Field, FieldCond, FieldDefault, FieldExport, FieldVar, GetterSetter, SignatureInfo,
+    make_property_impl, make_virtual_callback,
+};
+use crate::util::{
+    KvParser, bail, error, format_funcs_collection_struct, ident, ident_respan,
+    path_ends_with_complex, require_api_version,
+};
+use crate::{ParseResult, handle_mutually_exclusive_keys, util};
 
 pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
     let class = item.as_struct().ok_or_else(|| {
@@ -39,6 +41,21 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
     let mut struct_cfg = parse_struct_attributes(class)?;
     let mut fields = parse_fields(named_fields, struct_cfg.init_strategy)?;
 
+    if fields.has_tool_button {
+        if !struct_cfg.is_tool {
+            return bail!(
+                &class.name,
+                "`#[export_tool_button]` requires `#[class(tool)]`.",
+            );
+        }
+        if fields.base_field.is_none() {
+            return bail!(
+                &class.name,
+                "`#[export_tool_button]` requires the `Base<T>` field.",
+            );
+        }
+    }
+
     if struct_cfg.is_editor_plugin() {
         modifiers.push(quote! { with_editor_plugin })
     }
@@ -51,16 +68,10 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
     let class_name = &class.name;
     let class_name_str: String = struct_cfg
         .rename
-        .map_or_else(|| class.name.clone(), |rename| rename)
+        .unwrap_or_else(|| class.name.clone())
         .to_string();
 
-    // Determine if we can use ASCII for the class name (in most cases).
-    let class_name_allocation = if class_name_str.is_ascii() {
-        let c_str = util::c_str(&class_name_str);
-        quote! { ClassName::alloc_next_ascii(#c_str) }
-    } else {
-        quote! { ClassName::alloc_next_unicode(#class_name_str) }
-    };
+    let class_name_allocation = quote! { ClassId::__alloc_next_unicode(#class_name_str) };
 
     if struct_cfg.is_internal {
         modifiers.push(quote! { with_internal })
@@ -79,46 +90,28 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
 
     // Use this name because when typing a non-existent class, users will be met with the following error:
     //    could not find `inherit_from_OS__ensure_class_exists` in `class_macros`.
-    let inherits_macro_ident = format_ident!("inherit_from_{}__ensure_class_exists", base_ty);
+    let inherits_macro_ident = format_ident!(
+        "inherit_from_{base_ty}__ensure_class_exists",
+        span = base_ty.span()
+    );
 
     let godot_exports_impl = make_property_impl(class_name, &fields);
 
-    let godot_withbase_impl = if let Some(Field { name, ty, .. }) = &fields.base_field {
-        // Apply the span of the field's type so that errors show up on the field's type.
-        quote_spanned! { ty.span()=>
-            impl ::godot::obj::WithBaseField for #class_name {
-                fn to_gd(&self) -> ::godot::obj::Gd<#class_name> {
-                    // By not referencing the base field directly here we ensure that the user only gets one error when the base
-                    // field's type is wrong.
-                    let base = <#class_name as ::godot::obj::WithBaseField>::base_field(self);
-                    base.to_gd().cast()
-                }
+    let godot_withbase_impl = make_with_base_impl(&fields.base_field, class_name);
 
-                fn base_field(&self) -> &::godot::obj::Base<<#class_name as ::godot::obj::GodotClass>::Base> {
-                    &self.#name
-                }
-            }
-
-            impl ::std::ops::Deref for #class_name {
-                type Target = #base_class;
-
-                fn deref(&self) -> &Self::Target {
-                    &self.#name
-                }
-            }
-
-            impl ::std::ops::DerefMut for #class_name {
-                fn deref_mut(&mut self) -> &mut Self::Target {
-                    &mut self.#name
-                }
-            }
-        }
+    let (user_singleton_impl, singleton_init_level_const) = if struct_cfg.is_singleton {
+        modifiers.push(quote! { with_singleton::<#class_name> });
+        make_singleton_impl(class_name)
     } else {
-        TokenStream::new()
+        (TokenStream::new(), TokenStream::new())
     };
 
-    let (user_class_impl, has_default_virtual) =
-        make_user_class_impl(class_name, struct_cfg.is_tool, &fields.all_fields);
+    let (user_class_impl, has_default_virtual) = make_user_class_impl(
+        class_name,
+        &struct_cfg.base_ty,
+        struct_cfg.is_tool,
+        &fields.all_fields,
+    );
 
     let mut init_expecter = TokenStream::new();
     let mut godot_init_impl = TokenStream::new();
@@ -130,7 +123,10 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
             modifiers.push(quote! { with_generated::<#class_name> });
         }
         InitStrategy::UserDefined => {
-            let fn_name = format_ident!("class_{}_must_have_an_init_method", class_name);
+            let fn_name = format_ident!(
+                "class_{class_name}_must_have_an_init_method",
+                span = class_name.span()
+            );
             init_expecter = quote! {
                 #[allow(non_snake_case)]
                 fn #fn_name() {
@@ -160,13 +156,15 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         modifiers.push(quote! { with_tool })
     }
 
-    // Declares a "funcs collection" struct that, for holds a constant for each #[func].
+    // Declares a "funcs collection" struct that holds a constant for each #[func].
     // That constant maps the Rust name (constant ident) to the Godot registered name (string value).
+    // Adopt visibility of class (could be relevant if ever #[godot_api(secondary)] support is added).
     let funcs_collection_struct_name = format_funcs_collection_struct(class_name);
+    let class_vis = class.vis_marker.as_ref();
     let funcs_collection_struct = quote! {
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
-        pub struct #funcs_collection_struct_name {}
+        #class_vis struct #funcs_collection_struct_name {}
     };
 
     // Note: one limitation is that macros don't work for `impl nested::MyClass` blocks.
@@ -178,15 +176,17 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         impl ::godot::obj::GodotClass for #class_name {
             type Base = #base_class;
 
+            #singleton_init_level_const
+
             // Code duplicated in godot-codegen.
-            fn class_name() -> ::godot::meta::ClassName {
-                use ::godot::meta::ClassName;
+            fn class_id() -> ::godot::meta::ClassId {
+                use ::godot::meta::ClassId;
 
                 // Optimization note: instead of lazy init, could use separate static which is manually initialized during registration.
-                static CLASS_NAME: std::sync::OnceLock<ClassName> = std::sync::OnceLock::new();
+                static CLASS_ID: std::sync::OnceLock<ClassId> = std::sync::OnceLock::new();
 
-                let name: &'static ClassName = CLASS_NAME.get_or_init(|| #class_name_allocation);
-                *name
+                let id: &'static ClassId = CLASS_ID.get_or_init(|| #class_name_allocation);
+                *id
             }
         }
 
@@ -208,6 +208,7 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         #deny_manual_init_macro
         #( #deprecations )*
         #( #errors )*
+        #user_singleton_impl
 
         #struct_docs_registration
         ::godot::sys::plugin_add!(#prv::__GODOT_PLUGIN_REGISTRY; #prv::ClassPlugin::new::<#class_name>(
@@ -218,6 +219,57 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
 
         #prv::class_macros::#inherits_macro_ident!(#class_name);
     })
+}
+
+fn make_with_base_impl(base_field: &Option<Field>, class_name: &Ident) -> TokenStream {
+    let Some(Field { name, ty, .. }) = base_field else {
+        return TokenStream::new();
+    };
+
+    // Apply the span of the field's type so that errors show up on the field.
+    quote_spanned! { ty.span()=>
+        impl ::godot::obj::WithBaseField for #class_name {
+            fn to_gd(&self) -> ::godot::obj::Gd<#class_name> {
+                // By not referencing the base field directly here we ensure that the user only gets one error when the base
+                // field's type is wrong.
+                let base = <#class_name as ::godot::obj::WithBaseField>::base_field(self);
+
+                base.__constructed_gd().cast()
+            }
+
+            fn base_field(&self) -> &::godot::obj::Base<<#class_name as ::godot::obj::GodotClass>::Base> {
+                &self.#name
+            }
+        }
+
+        impl ::std::ops::Deref for #class_name {
+            type Target = #ty;
+
+            fn deref(&self) -> &Self::Target {
+                &self.#name
+            }
+        }
+
+        impl ::std::ops::DerefMut for #class_name {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.#name
+            }
+        }
+    }
+}
+
+/// Generates registration for user singleton and proper INIT_LEVEL declaration.
+///
+/// Before Godot4.4, built-in engine singleton -- required for registration -- wasn't available before `InitLevel::Scene`.
+fn make_singleton_impl(class_name: &Ident) -> (TokenStream, TokenStream) {
+    (
+        quote! {
+            impl ::godot::obj::UserSingleton for #class_name {}
+        },
+        quote! {
+            const INIT_LEVEL: ::godot::init::InitLevel = ::godot::init::InitLevel::Scene;
+        },
+    )
 }
 
 /// Generates code for a decl-macro, which takes any item and prepends it with the visibility marker of the class.
@@ -292,19 +344,45 @@ fn make_deny_manual_init_macro(class_name: &Ident, init_strategy: InitStrategy) 
     }
 }
 
-/// Checks at compile time that a function with the given name exists on `Self`.
-#[must_use]
-pub fn make_existence_check(ident: &Ident) -> TokenStream {
-    quote! {
-        #[allow(path_statements)]
-        Self::#ident;
+/// Checks at compile time that a custom (user-defined) getter or setter has the correct signature.
+///
+/// The following signature is expected, with `T = Var::PubType`.
+/// - Getter: `fn(&self) -> T`
+/// - Setter: `fn(&mut self, T)`
+pub fn make_accessor_type_check(
+    class_name: &Ident,
+    accessor_name: &Ident,
+    field_type: &venial::TypeExpr,
+    kind: crate::class::GetSet,
+) -> TokenStream {
+    use crate::class::GetSet;
+
+    // Makes sure the span points to the ident in the macro:
+    //
+    // 76 |     #[var(pub, get = my_custom_get)]
+    //    |                      ^^^^^^^^^^^^^ expected fn pointer, found fn item
+    let accessor_span = accessor_name.span();
+    let class_name = ident_respan(class_name, accessor_span);
+
+    match kind {
+        GetSet::Get => quote_spanned! { accessor_span=>
+            ::godot::private::typecheck_getter::<#class_name, #field_type>(
+                #class_name::#accessor_name
+            )
+        },
+        GetSet::Set => quote_spanned! { accessor_span=>
+            ::godot::private::typecheck_setter::<#class_name, #field_type>(
+                #[allow(clippy::redundant_closure)] // Passing fn ref instead of closure deteriorates error message.
+                |this, val| #class_name::#accessor_name(this, val)
+            )
+        },
     }
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Implementation
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum InitStrategy {
     Generated,
     UserDefined,
@@ -315,6 +393,7 @@ struct ClassAttributes {
     base_ty: Ident,
     init_strategy: InitStrategy,
     is_tool: bool,
+    is_singleton: bool,
     is_internal: bool,
     rename: Option<Ident>,
     deprecations: Vec<TokenStream>,
@@ -383,7 +462,7 @@ fn make_onready_init(all_fields: &[Field]) -> TokenStream {
 
 fn make_oneditor_panic_inits(class_name: &Ident, all_fields: &[Field]) -> TokenStream {
     // Despite its name OnEditor shouldn't panic in the editor for tool classes.
-    let is_in_editor = quote! { ::godot::classes::Engine::singleton().is_editor_hint() };
+    let is_in_editor = quote! { <::godot::classes::Engine as ::godot::obj::Singleton>::singleton().is_editor_hint() };
 
     let are_all_oneditor_fields_valid = quote! { are_all_oneditor_fields_valid };
 
@@ -407,6 +486,8 @@ fn make_oneditor_panic_inits(class_name: &Ident, all_fields: &[Field]) -> TokenS
 
     if !on_editor_fields_checks.is_empty() {
         quote! {
+            // Triggers `clippy::useless_let_if_seq` lint if only one `#on_editor_fields_checks` is present.
+            #[allow(clippy::useless_let_if_seq)]
             fn __are_oneditor_fields_initalized(this: &#class_name) -> bool {
                 // Early return for `#[class(tool)]`.
                 if #is_in_editor {
@@ -431,6 +512,7 @@ fn make_oneditor_panic_inits(class_name: &Ident, all_fields: &[Field]) -> TokenS
 
 fn make_user_class_impl(
     class_name: &Ident,
+    trait_base_class: &Ident,
     is_tool: bool,
     all_fields: &[Field],
 ) -> (TokenStream, bool) {
@@ -441,7 +523,6 @@ fn make_user_class_impl(
     let rpc_registrations = TokenStream::new();
 
     let onready_inits = make_onready_init(all_fields);
-
     let oneditor_panic_inits = make_oneditor_panic_inits(class_name, all_fields);
 
     let run_before_ready = !onready_inits.is_empty() || !oneditor_panic_inits.is_empty();
@@ -450,8 +531,13 @@ fn make_user_class_impl(
         let tool_check = util::make_virtual_tool_check();
         let signature_info = SignatureInfo::fn_ready();
 
-        let callback =
-            make_virtual_callback(class_name, &signature_info, BeforeKind::OnlyBefore, None);
+        let callback = make_virtual_callback(
+            class_name,
+            trait_base_class,
+            &signature_info,
+            BeforeKind::OnlyBefore,
+            None,
+        );
 
         // See also __virtual_call() codegen.
         // This doesn't explicitly check if the base class inherits from Node (and thus has `_ready`), but the derive-macro already does
@@ -460,7 +546,7 @@ fn make_user_class_impl(
         if cfg!(since_api = "4.4") {
             hash_param = quote! { hash: u32, };
             matches_ready_hash = quote! {
-                (name, hash) == ::godot::sys::godot_virtual_consts::Node::ready
+                (name, hash) == ::godot::private::virtuals::Node::ready
             };
         } else {
             hash_param = TokenStream::new();
@@ -512,18 +598,20 @@ fn make_user_class_impl(
 
 /// Returns the name of the base and the default mode
 fn parse_struct_attributes(class: &venial::Struct) -> ParseResult<ClassAttributes> {
-    let mut base_ty = ident("RefCounted");
+    let mut base_ty = None;
     let mut init_strategy = InitStrategy::UserDefined;
     let mut is_tool = false;
+    let mut is_singleton = false;
     let mut is_internal = false;
     let mut rename: Option<Ident> = None;
+    #[allow(unused_mut)] // Avoid churn when having 0 deprecations.
     let mut deprecations = vec![];
 
     // #[class] attribute on struct
     if let Some(mut parser) = KvParser::parse(&class.attributes, "class")? {
         // #[class(base = Base)]
         if let Some(base) = parser.handle_ident("base")? {
-            base_ty = base;
+            base_ty = Some(base);
         }
 
         // #[class(init)], #[class(no_init)]
@@ -538,11 +626,18 @@ fn parse_struct_attributes(class: &venial::Struct) -> ParseResult<ClassAttribute
             is_tool = true;
         }
 
-        // Deprecated #[class(editor_plugin)]
-        if let Some(_attr_key) = parser.handle_alone_with_span("editor_plugin")? {
-            deprecations.push(quote_spanned! { _attr_key.span()=>
-                ::godot::__deprecated::emit_deprecated_warning!(class_editor_plugin);
-            });
+        // #[class(singleton)]
+        if parser.handle_alone("singleton")? {
+            is_singleton = true;
+            is_tool = true;
+        }
+
+        // Removed #[class(editor_plugin)]
+        if let Some(key) = parser.handle_alone_with_span("editor_plugin")? {
+            return bail!(
+                key,
+                "#[class(editor_plugin)] has been removed in favor of #[class(tool, base=EditorPlugin)]",
+            );
         }
 
         // #[class(rename = NewName)]
@@ -550,22 +645,47 @@ fn parse_struct_attributes(class: &venial::Struct) -> ParseResult<ClassAttribute
 
         // #[class(internal)]
         // Named "internal" following Godot terminology: https://github.com/godotengine/godot-cpp/blob/master/include/godot_cpp/core/class_db.hpp#L327
-        if let Some(span) = parser.handle_alone_with_span("internal")? {
-            require_api_version!("4.2", span, "#[class(internal)]")?;
+        if parser.handle_alone("internal")? {
             is_internal = true;
+        } else {
+            // Godot has an edge case where classes starting with "Editor" are implicitly hidden:
+            // https://github.com/godotengine/godot/blob/ca452113d430cb96de409a297ff5b52389f1c9d9/editor/gui/create_dialog.cpp#L171-L173
+            if class.name.to_string().starts_with("Editor") {
+                return bail!(
+                    class.name.span(),
+                    "Classes starting with `Editor` are implicitly hidden by Godot; use #[class(internal)] to make this explicit",
+                );
+            }
         }
 
-        // Deprecated #[class(hidden)]
-        if let Some(ident) = parser.handle_alone_with_span("hidden")? {
-            require_api_version!("4.2", &ident, "#[class(hidden)]")?;
-            is_internal = true;
-
-            deprecations.push(quote_spanned! { ident.span()=>
-                ::godot::__deprecated::emit_deprecated_warning!(class_hidden);
-            });
+        // Removed #[class(hidden)]
+        if let Some(key) = parser.handle_alone_with_span("hidden")? {
+            return bail!(
+                key,
+                "#[class(hidden)] has been renamed to #[class(internal)]",
+            );
         }
 
         parser.finish()?;
+    }
+
+    let base_ty = base_field_or_default(base_ty, is_singleton);
+
+    // Deprecated: #[class(no_init)] with base=EditorPlugin
+    if init_strategy == InitStrategy::Absent && base_ty == ident("EditorPlugin") {
+        return bail!(
+            class,
+            "\n#[class(no_init, base=EditorPlugin)] will crash when opened in the editor.\n\
+            EditorPlugin classes are automatically instantiated by Godot and require a default constructor.\n\
+            Use #[class(init)] instead, or provide a custom init() function in the IEditorPlugin impl."
+        );
+    }
+
+    if init_strategy == InitStrategy::Absent && is_singleton {
+        return bail!(
+            class,
+            "#[class(singleton)] can't be used with #[class(no_init)]",
+        );
     }
 
     post_validate(&base_ty, is_tool)?;
@@ -574,6 +694,7 @@ fn parse_struct_attributes(class: &venial::Struct) -> ParseResult<ClassAttribute
         base_ty,
         init_strategy,
         is_tool,
+        is_singleton,
         is_internal,
         rename,
         deprecations,
@@ -587,8 +708,10 @@ fn parse_fields(
 ) -> ParseResult<Fields> {
     let mut all_fields = vec![];
     let mut base_field = Option::<Field>::None;
+    #[allow(unused_mut)] // Less chore when adding/removing deprecations.
     let mut deprecations = vec![];
     let mut errors = vec![];
+    let mut has_tool_button = false;
 
     // Attributes on struct fields
     for (named_field, _punct) in named_fields {
@@ -610,6 +733,11 @@ fn parse_fields(
             field.is_oneditor = true;
         }
 
+        // PhantomVar<T> type inference
+        if path_ends_with_complex(&field.ty, "PhantomVar") {
+            field.is_phantomvar = true;
+        }
+
         // #[init]
         if let Some(mut parser) = KvParser::parse(&named_field.attributes, "init")? {
             // #[init] on fields is useless if there is no generated constructor.
@@ -628,21 +756,12 @@ fn parse_fields(
                 });
             }
 
-            // Deprecated #[init(default = expr)]
-            if let Some((key, default)) = parser.handle_expr_with_key("default")? {
-                if field.default_val.is_some() {
-                    return bail!(
-                        key,
-                        "Cannot use both `val` and `default` keys in #[init]; prefer using `val`"
-                    );
-                }
-                field.default_val = Some(FieldDefault {
-                    default_val: default,
-                    span: parser.span(),
-                });
-                deprecations.push(quote_spanned! { parser.span()=>
-                    ::godot::__deprecated::emit_deprecated_warning!(init_default);
-                })
+            // Removed #[init(default = ...)]
+            if let Some((key, _default)) = parser.handle_expr_with_key("default")? {
+                return bail!(
+                    key,
+                    "#[init(default = ...)] has been renamed to #[init(val = ...)]",
+                );
             }
 
             // #[init(node = "PATH")]
@@ -702,7 +821,46 @@ fn parse_fields(
         // #[var]
         if let Some(mut parser) = KvParser::parse(&named_field.attributes, "var")? {
             let var = FieldVar::new_from_kv(&mut parser)?;
+
+            // Specifying both no_get + no_set is likely a mistake rooted in misunderstanding.
+            if var.getter == GetterSetter::Disabled && var.setter == GetterSetter::Disabled {
+                return bail!(
+                    var.span,
+                    "#[var(no_get, no_set)] is not allowed; if you don't want a property, omit #[var] entirely"
+                );
+            }
+
+            // #[export] with #[var(no_get)] is not supported: Godot editor needs to read exported properties.
+            if var.getter == GetterSetter::Disabled && field.export.is_some() {
+                return bail!(
+                    var.span,
+                    "#[export] with #[var(no_get)] is not supported; the editor requires a getter for serialization and inspector display"
+                );
+            }
+
             field.var = Some(var);
+            parser.finish()?;
+        }
+
+        // #[export_tool_button(fn = ..., icon = "..", name = "..")]
+        if let Some(mut parser) = KvParser::parse(&named_field.attributes, "export_tool_button")? {
+            require_api_version!("4.4", parser.span(), "#[export_tool_button]")?;
+
+            if field.export.is_some() || field.var.is_some() {
+                return bail!(
+                    parser.span(),
+                    "`#[export_tool_button]` is mutually exclusive with `#[export]` and `#[var]`."
+                );
+            }
+
+            let var = FieldVar::new_tool_button_from_kv(&mut parser, &field.name)?;
+
+            field.var = Some(var);
+            field.default_val = Some(FieldDefault {
+                default_val: quote! { ::godot::register::property::PhantomVar::default() },
+                span: parser.span(),
+            });
+            has_tool_button = true;
             parser.finish()?;
         }
 
@@ -723,33 +881,7 @@ fn parse_fields(
 
         // Extra validation; eventually assign to base_fields or all_fields.
         if is_base {
-            if field.is_onready {
-                errors.push(error!(
-                    field.ty.clone(),
-                    "base field cannot have type `OnReady<T>`"
-                ));
-            }
-
-            if let Some(var) = field.var.as_ref() {
-                errors.push(error!(
-                    var.span,
-                    "base field cannot have the attribute #[var]"
-                ));
-            }
-
-            if let Some(export) = field.export.as_ref() {
-                errors.push(error!(
-                    export.span,
-                    "base field cannot have the attribute #[export]"
-                ));
-            }
-
-            if let Some(default_val) = field.default_val.as_ref() {
-                errors.push(error!(
-                    default_val.span,
-                    "base field cannot have the attribute #[init]"
-                ));
-            }
+            validate_base_field(&field, &mut errors);
 
             if let Some(prev_base) = base_field.replace(field) {
                 // Ensure at most one Base<T>.
@@ -760,6 +892,10 @@ fn parse_fields(
                 ));
             }
         } else {
+            if field.is_phantomvar {
+                validate_phantomvar_field(&field, &mut errors);
+            }
+
             all_fields.push(field);
         }
     }
@@ -769,7 +905,96 @@ fn parse_fields(
         base_field,
         deprecations,
         errors,
+        has_tool_button,
     })
+}
+
+fn validate_base_field(field: &Field, errors: &mut Vec<Error>) {
+    if field.is_onready {
+        errors.push(error!(
+            field.ty.clone(),
+            "base field cannot have type `OnReady<T>`"
+        ));
+    }
+
+    if let Some(var) = field.var.as_ref() {
+        errors.push(error!(
+            var.span,
+            "base field cannot have the attribute #[var]"
+        ));
+    }
+
+    if let Some(export) = field.export.as_ref() {
+        errors.push(error!(
+            export.span,
+            "base field cannot have the attribute #[export]"
+        ));
+    }
+
+    if let Some(default_val) = field.default_val.as_ref() {
+        errors.push(error!(
+            default_val.span,
+            "base field cannot have the attribute #[init]"
+        ));
+    }
+}
+
+/// Returns `Base<T>` set by the user or default.
+///
+/// Default base is `Object` for `#[class(singleton)]`, `RefCounted` otherwise.
+fn base_field_or_default(mut base: Option<Ident>, is_singleton: bool) -> Ident {
+    if let Some(base) = base.take() {
+        base
+    } else if is_singleton {
+        ident("Object")
+    } else {
+        ident("RefCounted")
+    }
+}
+
+fn validate_phantomvar_field(field: &Field, errors: &mut Vec<Error>) {
+    let Some(field_var) = &field.var else {
+        errors.push(error!(
+            field.span,
+            "PhantomVar<T> field is useless without attribute #[var]"
+        ));
+        return;
+    };
+
+    // For now, we do not support write-only properties. Godot does not fully support them either; it silently returns null
+    // when the property is being read. This is probably because the editor needs to be able to read exported properties,
+    // to show them in the inspector and serialize them to disk.
+    // See also this discussion:
+    // https://github.com/godot-rust/gdext/pull/1261#discussion_r2255335223
+    match field_var.getter {
+        GetterSetter::Generated => {
+            errors.push(error!(
+                field_var.span,
+                "PhantomVar<T> stores no data, so it cannot use an autogenerated getter.\n\
+                use #[var(get, ...)] and provide get_fieldname() fn."
+            ));
+        }
+        GetterSetter::ToolButton(_) | GetterSetter::Custom | GetterSetter::CustomRenamed(_) => {}
+        GetterSetter::Disabled => {
+            errors.push(error!(
+                field_var.span,
+                "PhantomVar<T> requires a custom getter"
+            ));
+        }
+    }
+
+    // The setter may either be custom or omitted.
+    match field_var.setter {
+        GetterSetter::Generated => {
+            errors.push(error!(
+                field_var.span,
+                "PhantomVar<T> stores no data, so it cannot use an autogenerated setter.\n\
+                use #[var(set, ...)] and provide set_fieldname() fn; or disable with #[var(no_set, ...)]."
+            ));
+        }
+        GetterSetter::ToolButton(_) | GetterSetter::Custom | GetterSetter::CustomRenamed(_) => {}
+        GetterSetter::Disabled => {}
+    }
 }
 
 fn handle_opposite_keys(

@@ -5,18 +5,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use proc_macro2::{Ident, TokenStream};
+use quote::{ToTokens, format_ident, quote};
+
 use crate::context::Context;
 use crate::conv;
 use crate::generator::{enums, gdext_build_struct};
-use crate::models::domain::ExtensionApi;
+use crate::models::domain::{ExtensionApi, FlowDirection};
 use crate::util::ident;
-use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote, ToTokens};
 
 pub fn make_sys_central_code(api: &ExtensionApi) -> TokenStream {
     let build_config_struct = gdext_build_struct::make_gdext_build_struct(&api.godot_version);
     let variant_type_enum = make_variant_type_enum(api, true);
     let [opaque_32bit, opaque_64bit] = make_opaque_types(api);
+    let godot_type_name_method = make_godot_type_name_method(api);
 
     quote! {
         #[cfg(target_pointer_width = "32")]
@@ -37,6 +39,7 @@ pub fn make_sys_central_code(api: &ExtensionApi) -> TokenStream {
             // This will need refactoring if VariantType is changed to a real enum.
             #[doc(hidden)]
             pub fn from_sys(enumerator: crate::GDExtensionVariantType) -> Self {
+                #[allow(clippy::unnecessary_cast)] // on Windows already i32.
                 Self { ord: enumerator as i32 }
             }
 
@@ -44,6 +47,8 @@ pub fn make_sys_central_code(api: &ExtensionApi) -> TokenStream {
             pub fn sys(self) -> crate::GDExtensionVariantType {
                 self.ord as _
             }
+
+            #godot_type_name_method
         }
     }
 }
@@ -115,7 +120,7 @@ pub fn make_core_central_code(api: &ExtensionApi, ctx: &mut Context) -> TokenStr
             #( #global_enum_defs )*
         }
 
-       pub mod global_reexported_enums {
+        pub mod global_reexported_enums {
             use crate::sys;
             #( #global_reexported_enum_defs )*
         }
@@ -166,11 +171,14 @@ fn make_variant_enums(api: &ExtensionApi, ctx: &mut Context) -> VariantEnums {
         variant_ty_enumerators_rust: Vec::with_capacity(len),
     };
 
+    // When extracting variant, data moves Godot->Rust. Means `VariantArray` for `Array`.
+    let flow = FlowDirection::GodotToRust;
+
     // Note: NIL is not part of this iteration, it will be added manually.
     for builtin in api.builtins.iter() {
         let original_name = builtin.godot_original_name();
         let shout_case = builtin.godot_shout_name();
-        let rust_ty = conv::to_rust_type(original_name, None, ctx);
+        let rust_ty = conv::to_rust_type(original_name, None, Some(flow), ctx);
         let pascal_case = conv::to_pascal_case(original_name);
 
         result
@@ -218,4 +226,28 @@ fn make_variant_type_enum(api: &ExtensionApi, is_definition: bool) -> TokenStrea
     let define_traits = !is_definition;
 
     enums::make_enum_definition_with(variant_type_enum, define_enum, define_traits)
+}
+
+/// Generates the `VariantType::godot_type_name()` method from the builtins list.
+fn make_godot_type_name_method(api: &ExtensionApi) -> TokenStream {
+    // NIL is not in api.builtins; handle it manually.
+    let mut ordinals = vec![0i32];
+    let mut names: Vec<&str> = vec!["Variant"];
+
+    for builtin in api.builtins.iter() {
+        ordinals.push(builtin.variant_type_ord);
+        names.push(builtin.godot_original_name());
+    }
+
+    quote! {
+        /// Returns the canonical Godot type name for this variant type.
+        ///
+        /// Examples: `INT` -> `"int"`, `STRING` -> `"String"`, `VECTOR3` -> `"Vector3"`.
+        pub fn godot_type_name(&self) -> &'static str {
+            match self.ord {
+                #( #ordinals => #names, )*
+                _ => "Unknown",
+            }
+        }
+    }
 }

@@ -5,10 +5,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
 use std::io::Write;
 use std::path::Path;
+
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
 
 type IoResult = std::io::Result<()>;
 
@@ -28,13 +29,13 @@ struct Input {
 macro_rules! pushs {
     (
         $inputs:ident;
-        $GDScriptTy:expr,
+        $GDScriptTy:expr_2021,
         $RustTy:ty,
-        $gdscript_val:expr,
-        $rust_val:expr,
-        $property:expr,
-        $export:expr,
-        $initializer:expr
+        $gdscript_val:expr_2021,
+        $rust_val:expr_2021,
+        $property:expr_2021,
+        $export:expr_2021,
+        $initializer:expr_2021
         $(; $($extra:tt)* )?
     ) => {
         $inputs.push(Input {
@@ -56,25 +57,25 @@ macro_rules! pushs {
 
 /// Push simple GDScript expression, outside string
 macro_rules! push {
-    ($inputs:ident; $GDScriptTy:expr, $RustTy:ty, $val:expr) => {
+    ($inputs:ident; $GDScriptTy:expr_2021, $RustTy:ty, $val:expr_2021) => {
         push!($inputs; $GDScriptTy, $RustTy, $val, $val);
     };
 
-    ($inputs:ident; $GDScriptTy:expr, $RustTy:ty, $gdscript_val:expr, $rust_val:expr) => {
+    ($inputs:ident; $GDScriptTy:expr_2021, $RustTy:ty, $gdscript_val:expr_2021, $rust_val:expr_2021) => {
         pushs!($inputs; $GDScriptTy, $RustTy, stringify!($gdscript_val), $rust_val, true, true, None);
     };
 }
 
 macro_rules! push_newtype {
-    ($inputs:ident; $GDScriptTy:expr, $name:ident($T:ty), $val:expr) => {
+    ($inputs:ident; $GDScriptTy:expr_2021, $name:ident($T:ty), $val:expr_2021) => {
         push_newtype!($inputs; $GDScriptTy, $name($T), $val, $name($val));
     };
 
-    ($inputs:ident; $GDScriptTy:expr, $name:ident($T:ty), $gdscript_val:expr, $rust_val:expr) => {
+    ($inputs:ident; $GDScriptTy:expr_2021, $name:ident($T:ty), $gdscript_val:expr_2021, $rust_val:expr_2021) => {
         push_newtype!(@s $inputs; $GDScriptTy, $name($T), stringify!($gdscript_val), $rust_val);
     };
 
-    (@s $inputs:ident; $GDScriptTy:expr, $name:ident($T:ty), $gdscript_val:expr, $rust_val:expr) => {
+    (@s $inputs:ident; $GDScriptTy:expr_2021, $name:ident($T:ty), $gdscript_val:expr_2021, $rust_val:expr_2021) => {
         pushs!(
             $inputs; $GDScriptTy, $name, $gdscript_val, $rust_val, false, false, None;
 
@@ -83,13 +84,17 @@ macro_rules! push_newtype {
 
             impl godot::meta::GodotConvert for $name {
                 type Via = $T;
+
+                fn godot_shape() -> godot::meta::shape::GodotShape {
+                    <$T as godot::meta::GodotConvert>::godot_shape()
+                }
             }
 
             impl godot::meta::ToGodot for $name {
-                type ToVia<'v> = $T;
+                type Pass = godot::meta::conv::ByValue;
 
                 #[allow(clippy::clone_on_copy)]
-                fn to_godot(&self) -> Self::ToVia<'_> {
+                fn to_godot(&self) -> Self::Via {
                     self.0.clone()
                 }
             }
@@ -119,9 +124,9 @@ fn collect_inputs() -> Vec<Input> {
     push!(inputs; float, f64, 127.83156478);
     push!(inputs; bool, bool, true);
     push!(inputs; Color, Color, Color(0.7, 0.5, 0.3, 0.2), Color::from_rgba(0.7, 0.5, 0.3, 0.2));
-    push!(inputs; String, GString, "hello", "hello".into());
-    push!(inputs; StringName, StringName, &"hello", "hello".into());
-    pushs!(inputs; NodePath, NodePath, r#"^"hello""#, "hello".into(), true, true, None);
+    push!(inputs; String, GString, "hello", GString::from("hello"));
+    push!(inputs; StringName, StringName, &"hello", StringName::from("hello"));
+    pushs!(inputs; NodePath, NodePath, r#"^"hello""#, NodePath::from("hello"), true, true, None);
     push!(inputs; Vector2, Vector2, Vector2(12.5, -3.5), Vector2::new(12.5, -3.5));
     push!(inputs; Vector3, Vector3, Vector3(117.5, 100.0, -323.25), Vector3::new(117.5, 100.0, -323.25));
     push!(inputs; Vector4, Vector4, Vector4(-18.5, 24.75, -1.25, 777.875), Vector4::new(-18.5, 24.75, -1.25, 777.875));
@@ -169,9 +174,9 @@ fn collect_inputs() -> Vec<Input> {
     push_newtype!(inputs; float, NewF64(f64), 127.83156478);
     push_newtype!(inputs; bool, NewBool(bool), true);
     push_newtype!(inputs; Color, NewColor(Color), Color(0.7, 0.5, 0.3, 0.2), NewColor(Color::from_rgba(0.7, 0.5, 0.3, 0.2)));
-    push_newtype!(inputs; String, NewString(GString), "hello", NewString("hello".into()));
-    push_newtype!(inputs; StringName, NewStringName(StringName), &"hello", NewStringName("hello".into()));
-    push_newtype!(@s inputs; NodePath, NewNodePath(NodePath), r#"^"hello""#, NewNodePath("hello".into()));
+    push_newtype!(inputs; String, NewString(GString), "hello", NewString(GString::from("hello")));
+    push_newtype!(inputs; StringName, NewStringName(StringName), &"hello", NewStringName(StringName::from("hello")));
+    push_newtype!(@s inputs; NodePath, NewNodePath(NodePath), r#"^"hello""#, NewNodePath(NodePath::from("hello")));
     push_newtype!(inputs; Vector2, NewVector2(Vector2), Vector2(12.5, -3.5), NewVector2(Vector2::new(12.5, -3.5)));
     push_newtype!(inputs; Vector3, NewVector3(Vector3), Vector3(117.5, 100.0, -323.25), NewVector3(Vector3::new(117.5, 100.0, -323.25)));
     push_newtype!(inputs; Vector4, NewVector4(Vector4), Vector4(-18.5, 24.75, -1.25, 777.875), NewVector4(Vector4::new(-18.5, 24.75, -1.25, 777.875)));
@@ -187,13 +192,13 @@ fn collect_inputs() -> Vec<Input> {
         array![-7, 12, 40]
     );*/
 
-    push!(inputs; Array, VariantArray,
+    push!(inputs; Array, VarArray,
         [-7, "godot", false, Vector2i(-77, 88)],
         varray![-7, "godot", false, Vector2i::new(-77, 88)]);
 
-    pushs!(inputs; Dictionary, Dictionary,
+    pushs!(inputs; Dictionary, VarDictionary,
         r#"{"key": 83, -3: Vector2(1, 2), 0.03: true}"#,
-        vdict! { "key": 83, (-3): Vector2::new(1.0, 2.0), 0.03: true },
+        vdict! { "key" => 83, -3 => Vector2::new(1.0, 2.0), 0.03 => true },
         true, true, None
     );
 
@@ -271,6 +276,7 @@ fn main() {
     rustfmt_if_needed(vec![rust_file]);
 
     godot_bindings::emit_godot_version_cfg();
+    godot_bindings::emit_safeguard_levels();
 
     // The godot crate has a __codegen-full default feature that enables the godot-codegen/codegen-full feature. When compiling the entire
     // workspace itest also gets compiled with full codegen due to feature unification. This causes compiler errors since the
@@ -291,7 +297,7 @@ fn rustfmt_if_needed(out_files: Vec<std::path::PathBuf>) {
         .arg("run")
         .arg("stable")
         .arg("rustfmt")
-        .arg("--edition=2021");
+        .arg("--edition=2024");
 
     for file in out_files {
         //println!("Format {file:?}");
@@ -318,12 +324,14 @@ fn generate_rust_methods(inputs: &[Input]) -> Vec<TokenStream> {
                 ..
             } = input;
 
-            let return_method = format_ident!("return_{}", ident);
-            let accept_method = format_ident!("accept_{}", ident);
-            let mirror_method = format_ident!("mirror_{}", ident);
-            let return_static_method = format_ident!("return_static_{}", ident);
-            let accept_static_method = format_ident!("accept_static_{}", ident);
-            let mirror_static_method = format_ident!("mirror_static_{}", ident);
+            let return_method = format_ident!("return_{ident}");
+            let accept_method = format_ident!("accept_{ident}");
+            let mirror_method = format_ident!("mirror_{ident}");
+            let panic_method = format_ident!("panic_{ident}");
+
+            let return_static_method = format_ident!("return_static_{ident}");
+            let accept_static_method = format_ident!("accept_static_{ident}");
+            let mirror_static_method = format_ident!("mirror_static_{ident}");
 
             quote! {
                 #[func]
@@ -339,6 +347,11 @@ fn generate_rust_methods(inputs: &[Input]) -> Vec<TokenStream> {
                 #[func]
                 fn #mirror_method(&self, i: #rust_ty) -> #rust_ty {
                     i
+                }
+
+                #[func]
+                fn #panic_method(&self) -> #rust_ty {
+                    panic!("intentional panic in `{}`", stringify!(#panic_method));
                 }
 
                 #[func]
@@ -360,6 +373,7 @@ fn generate_rust_methods(inputs: &[Input]) -> Vec<TokenStream> {
         .collect::<Vec<_>>();
 
     let manual_methods = quote! {
+        #[allow(clippy::suspicious_else_formatting)] // `quote!` might output whole file as one big line.
         #[func]
         fn check_last_notrace(last_method_name: String, expected_callconv: String) -> bool {
             let last = godot::private::trace::pop();
@@ -507,12 +521,81 @@ fn generate_property_template(inputs: &[Input]) -> PropertyTests {
         }
     };
 
+    // Only available in Godot 4.4+.
+    let rust_extra_types_4_4 = if godot_bindings::before_api("4.4") {
+        TokenStream::new()
+    } else {
+        quote! {
+            #[derive(GodotConvert, Var, Export, Clone, PartialEq, Debug)]
+            #[godot(via = i64)]
+            pub enum Tile { Grass, Rock, Water }
+        }
+    };
+
+    let rust_exports_4_4 = if godot_bindings::before_api("4.4") {
+        TokenStream::new()
+    } else {
+        quote! {
+            #[var]
+            var_array_tile: Array<Tile>,
+
+            #[export]
+            export_array_tile: Array<Tile>,
+
+            #[var]
+            var_dict_string_int: Dictionary<GString, i32>,
+
+            #[export]
+            export_dict_string_int: Dictionary<GString, i32>,
+
+            #[var]
+            var_dict_vector2i_tile: Dictionary<Vector2i, Tile>,
+
+            #[export]
+            export_dict_vector2i_tile: Dictionary<Vector2i, Tile>,
+
+            #[var]
+            #[init(val = godot::global::Orientation::HORIZONTAL)]
+            var_global_enum: godot::global::Orientation,
+
+            #[export]
+            #[init(val = godot::global::Orientation::HORIZONTAL)]
+            export_global_enum: godot::global::Orientation,
+
+            #[var]
+            #[init(val = godot::classes::node::ProcessMode::WHEN_PAUSED)]
+            var_class_enum: godot::classes::node::ProcessMode,
+
+            #[export]
+            #[init(val = godot::classes::node::ProcessMode::WHEN_PAUSED)]
+            export_class_enum: godot::classes::node::ProcessMode,
+
+            #[var]
+            var_class_enum_array: Array<godot::classes::node::ProcessMode>,
+
+            #[export]
+            export_class_enum_array: Array<godot::classes::node::ProcessMode>,
+
+            // Bitfield (tests CLASS_IS_BITFIELD usage flag).
+            #[var]
+            #[init(val = godot::global::MouseButtonMask::LEFT)]
+            var_bitfield: godot::global::MouseButtonMask,
+
+            #[export]
+            #[init(val = godot::global::MouseButtonMask::LEFT)]
+            export_bitfield: godot::global::MouseButtonMask,
+        }
+    };
+
     let rust = quote! {
+        #rust_extra_types_4_4
+
         #[derive(GodotClass)]
         #[class(base = Node, init)]
         pub struct PropertyTestsRust {
             #(#rust,)*
             #rust_exports_4_3
+            #rust_exports_4_4
 
             // All the @export_file/dir variants, with GString, Array<GString> and PackedStringArray.
             #[export(file)]
@@ -615,10 +698,31 @@ fn generate_property_template(inputs: &[Input]) -> PropertyTests {
 @export_global_dir var export_global_dir_parray: PackedStringArray
     "#;
 
+    // Only available in Godot 4.4+.
+    let advanced_exports_4_4 = r#"
+enum Tile { Grass, Rock, Water }
+var var_array_tile: Array[Tile]
+@export var export_array_tile: Array[Tile]
+var var_dict_string_int: Dictionary[String, int]
+@export var export_dict_string_int: Dictionary[String, int]
+var var_dict_vector2i_tile: Dictionary[Vector2i, Tile]
+@export var export_dict_vector2i_tile: Dictionary[Vector2i, Tile]
+var var_global_enum: Orientation
+@export var export_global_enum: Orientation
+var var_class_enum: Node.ProcessMode
+@export var export_class_enum: Node.ProcessMode
+var var_class_enum_array: Array[Node.ProcessMode]
+@export var export_class_enum_array: Array[Node.ProcessMode]
+    "#;
+
     let mut gdscript = format!("{basic_exports}\n{advanced_exports}");
     if godot_bindings::since_api("4.3") {
         gdscript.push('\n');
         gdscript.push_str(advanced_exports_4_3);
+    }
+    if godot_bindings::since_api("4.4") {
+        gdscript.push('\n');
+        gdscript.push_str(advanced_exports_4_4);
     }
 
     PropertyTests { rust, gdscript }

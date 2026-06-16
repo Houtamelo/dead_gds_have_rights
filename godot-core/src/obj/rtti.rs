@@ -15,18 +15,18 @@ use crate::obj::{GodotClass, InstanceId};
 /// This is persisted independently of the static type system (e.g. `T` in `Gd<T>`) and can be used to perform sanity checks at runtime.
 ///
 /// See also <https://github.com/godot-rust/gdext/issues/23>.
-#[derive(Debug, Copy, Clone)] // Clone is needed to make RawGd::clone() more efficient.
+#[derive(Clone, Copy, Debug)] // Clone is needed to make RawGd::clone() more efficient.
 pub struct ObjectRtti {
     /// Cached instance ID. May point to dead objects.
     instance_id: InstanceId,
 
     /// Only in Debug mode: dynamic class.
-    #[cfg(debug_assertions)]
-    class_name: crate::meta::ClassName,
+    #[cfg(safeguards_strict)]
+    class_name: crate::meta::ClassId,
     //
-    // TODO(bromeon): class_name is not always most-derived class; ObjectRtti is sometimes constructed from a base class, via RawGd::from_obj_sys_weak().
+    // TODO(bromeon): class_id is not always most-derived class; ObjectRtti is sometimes constructed from a base class, via RawGd::from_obj_sys_weak().
     // Examples: after upcast, when receiving Gd<Base> from Godot, etc.
-    // Thus, dynamic lookup via Godot get_class() is needed. However, this returns a String, and ClassName is 'static + Copy right now.
+    // Thus, dynamic lookup via Godot get_class() is needed. However, this returns a String, and ClassId is 'static + Copy right now.
 }
 
 impl ObjectRtti {
@@ -36,25 +36,29 @@ impl ObjectRtti {
         Self {
             instance_id,
 
-            #[cfg(debug_assertions)]
-            class_name: T::class_name(),
+            #[cfg(safeguards_strict)]
+            class_name: T::class_id(),
         }
     }
 
-    /// Checks that the object is of type `T` or derived. Returns instance ID.
+    /// Validates that the object's stored type matches or inherits from `T`.
     ///
-    /// # Panics
-    /// In Debug mode, if the object is not of type `T` or derived.
+    /// Used internally by `RawGd::check_rtti()` for type validation in strict mode.
+    ///
+    /// Only checks the cached type from RTTI construction time.
+    /// This may not reflect runtime type changes (which shouldn't happen).
+    ///
+    /// # Panics (strict safeguards)
+    /// If the stored type does not inherit from `T`.
+    #[cfg(safeguards_strict)]
     #[inline]
-    pub fn check_type<T: GodotClass>(&self) -> InstanceId {
-        #[cfg(debug_assertions)]
-        crate::classes::ensure_object_inherits(self.class_name, T::class_name(), self.instance_id);
-
-        self.instance_id
+    pub fn check_type<T: GodotClass>(&self) {
+        crate::classes::ensure_object_inherits(self.class_name, T::class_id(), self.instance_id);
     }
 
     #[inline]
     pub fn instance_id(&self) -> InstanceId {
+        // Do not add logic or validations here, this is passed in every FFI call.
         self.instance_id
     }
 }

@@ -9,11 +9,14 @@
 //!
 //! See also models/domain/enums.rs for other enum-related methods.
 
+use std::collections::HashSet;
+
+use heck::ToTitleCase;
+use proc_macro2::TokenStream;
+use quote::{ToTokens, quote};
+
 use crate::models::domain::{Enum, Enumerator, EnumeratorValue, RustTy};
 use crate::special_cases;
-use proc_macro2::TokenStream;
-use quote::{quote, ToTokens};
-use std::collections::HashSet;
 
 pub fn make_enums(enums: &[Enum], cfg_attributes: &TokenStream) -> TokenStream {
     let definitions = enums.iter().map(make_enum_definition);
@@ -44,6 +47,12 @@ pub fn make_enum_definition_with(
     let derives = enum_.derives();
     let enum_doc = make_enum_doc(enum_);
     let name = &enum_.name;
+
+    // Engine enums use a qualified name in property hints, e.g. "Orientation" or "Node.ProcessMode".
+    let enum_qualified_name = match &enum_.surrounding_class {
+        Some(class) => format!("{}.{}", class.godot_ty, enum_.godot_name),
+        None => enum_.godot_name.clone(),
+    };
 
     // Values
     let enumerators = enum_.enumerators.iter().map(|enumerator| {
@@ -106,6 +115,31 @@ pub fn make_enum_definition_with(
         let index_enum_impl = make_enum_index_impl(enum_);
         let bitwise_impls = make_enum_bitwise_operators(enum_, enum_bitmask.as_ref());
 
+        let var_trait_set = if enum_.is_exhaustive {
+            quote! {
+                fn var_set(field: &mut Self, value: Self::Via) {
+                    *field = <Self as #engine_trait>::from_ord(value);
+                }
+            }
+        } else {
+            quote! {
+                fn var_set(field: &mut Self, value: Self::Via) {
+                    field.ord = value;
+                }
+            }
+        };
+
+        // Build GodotShape::Enum enumerator list.
+        let enumerator_defs = enum_.enumerators.iter().map(|enumerator| {
+            let display_name = enumerator.godot_name.to_title_case(); // Inspector UI Name: "KEY_ESCAPE" -> "Key Escape".
+            let value = enumerator.value.to_i64();
+            quote! {
+                EnumeratorShape::new_int(#display_name, #value)
+            }
+        });
+
+        let is_bitfield = enum_.is_bitfield;
+
         quote! {
             #engine_trait_impl
             #index_enum_impl
@@ -113,22 +147,60 @@ pub fn make_enum_definition_with(
 
             impl crate::meta::GodotConvert for #name {
                 type Via = #ord_type;
+
+                fn godot_shape() -> crate::meta::shape::GodotShape {
+                    use crate::meta::shape::{EnumeratorShape, GodotShape};
+                    const ENUMERATORS: &[EnumeratorShape] = const {
+                        &[
+                            #( #enumerator_defs ),*
+                        ]
+                    };
+                    GodotShape::Enum {
+                        variant_type: crate::meta::element_variant_type::<Self>(),
+                        enumerators: std::borrow::Cow::Borrowed(ENUMERATORS),
+                        godot_name: Some(std::borrow::Cow::Borrowed(#enum_qualified_name)),
+                        is_bitfield: #is_bitfield,
+                    }
+                }
             }
 
             impl crate::meta::ToGodot for #name {
-                type ToVia<'v> = #ord_type;
+                type Pass = crate::meta::ByValue;
 
-                fn to_godot(&self) -> Self::ToVia<'_> {
+                fn to_godot(&self) -> Self::Via {
                     <Self as #engine_trait>::ord(*self)
                 }
             }
 
             impl crate::meta::FromGodot for #name {
                 fn try_from_godot(via: Self::Via) -> std::result::Result<Self, crate::meta::error::ConvertError> {
+                    // Pass i32/u64 enum/bitfield as i64 on the FFI layer. Only necessary for bitfields (u64).
+                    // Bitfields are cast to i64 for FFI, then reinterpreted in C++ as uint64_t.
                     <Self as #engine_trait>::try_from_ord(via)
-                        .ok_or_else(|| crate::meta::error::FromGodotError::InvalidEnum.into_error(via))
+                        .ok_or_else(|| crate::meta::error::FromGodotError::InvalidEnum.into_error(via as i64))
                 }
             }
+
+            impl crate::registry::property::Var for #name {
+                type PubType = Self;
+
+                fn var_get(field: &Self) -> Self::Via {
+                    <Self as #engine_trait>::ord(*field)
+                }
+
+                #var_trait_set
+
+                fn var_pub_get(field: &Self) -> Self::PubType {
+                    *field
+                }
+
+                fn var_pub_set(field: &mut Self, value: Self::PubType) {
+                    *field = value;
+                }
+            }
+
+            impl crate::registry::property::Export for #name {}
+            impl crate::meta::Element for #name {}
         }
     });
 
@@ -190,6 +262,11 @@ fn make_enum_debug_impl(enum_: &Enum, use_as_str: bool) -> TokenStream {
             if enumerator.is_empty() {
                 #enumerator_not_found
             }
+            f.write_str(enumerator)
+        }
+    } else if enum_.is_bitfield {
+        quote! {
+            crate::classes::debug_bitfield(*self, f)
         }
     } else {
         let enumerators = make_enum_to_str_cases(enum_);
@@ -204,6 +281,7 @@ fn make_enum_debug_impl(enum_: &Enum, use_as_str: bool) -> TokenStream {
                     #enumerator_not_found
                 }
             };
+            f.write_str(enumerator)
         }
     };
 
@@ -211,7 +289,6 @@ fn make_enum_debug_impl(enum_: &Enum, use_as_str: bool) -> TokenStream {
         impl std::fmt::Debug for #enum_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 #function_body
-                f.write_str(enumerator)
             }
         }
     }
@@ -266,7 +343,7 @@ fn make_enum_engine_trait_impl(enum_: &Enum, enum_bitmask: Option<&RustTy>) -> T
             }
         });
 
-        let str_functions = make_enum_str_functions(enum_);
+        let str_functions = make_enum_as_str(enum_);
         let values_and_constants_functions = make_enum_values_and_constants_functions(enum_);
 
         quote! {
@@ -294,7 +371,7 @@ fn make_enum_engine_trait_impl(enum_: &Enum, enum_bitmask: Option<&RustTy>) -> T
         // However, those with masks don't have strict validation when marshalling from integers, and a Debug repr which includes the mask.
 
         let unique_ords = enum_.unique_ords().expect("self is an enum");
-        let str_functions = make_enum_str_functions(enum_);
+        let str_functions = make_enum_as_str(enum_);
         let values_and_constants_functions = make_enum_values_and_constants_functions(enum_);
 
         // We can technically check against all possible mask values, remove each mask, and then verify it's a valid base-enum value.
@@ -389,48 +466,9 @@ fn make_all_constants_function(enum_: &Enum) -> TokenStream {
     }
 }
 
-/// Creates the `as_str` and `godot_name` implementations for the enum.
-fn make_enum_str_functions(enum_: &Enum) -> TokenStream {
+/// Creates the `as_str()` implementation for the enum.
+fn make_enum_as_str(enum_: &Enum) -> TokenStream {
     let as_str_enumerators = make_enum_to_str_cases(enum_);
-
-    // Only enumerations with different godot names are specified.
-    // `as_str` is called for the rest of them.
-    let godot_different_cases = {
-        let enumerators = enum_
-            .enumerators
-            .iter()
-            .filter(|enumerator| enumerator.name != enumerator.godot_name)
-            .map(|enumerator| {
-                let Enumerator {
-                    name, godot_name, ..
-                } = enumerator;
-                let godot_name_str = godot_name.to_string();
-                quote! {
-                    Self::#name => #godot_name_str,
-                }
-            });
-
-        quote! {
-            #( #enumerators )*
-        }
-    };
-
-    let godot_name_match = if godot_different_cases.is_empty() {
-        // If empty, all the Rust names match the Godot ones.
-        // Remove match statement to avoid `clippy::match_single_binding`.
-        quote! {
-            self.as_str()
-        }
-    } else {
-        quote! {
-            // Many enums have duplicates, thus allow unreachable.
-            #[allow(unreachable_patterns)]
-            match *self {
-                #godot_different_cases
-                _ => self.as_str(),
-            }
-        }
-    };
 
     quote! {
         #[inline]
@@ -441,10 +479,6 @@ fn make_enum_str_functions(enum_: &Enum) -> TokenStream {
                 #as_str_enumerators
                 _ => "",
             }
-        }
-
-        fn godot_name(&self) -> &'static str {
-            #godot_name_match
         }
     }
 }
@@ -510,6 +544,7 @@ fn make_enum_bitwise_operators(enum_: &Enum, enum_bitmask: Option<&RustTy>) -> T
         TokenStream::new()
     }
 }
+
 /// Returns the documentation for the given enum.
 ///
 /// Each string is one line of documentation, usually this needs to be wrapped in a `#[doc = ...]`.

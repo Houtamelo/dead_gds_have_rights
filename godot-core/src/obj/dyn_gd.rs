@@ -5,15 +5,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::builtin::Variant;
-use crate::meta::error::ConvertError;
-use crate::meta::{ClassName, FromGodot, GodotConvert, PropertyHintInfo, ToGodot};
-use crate::obj::guards::DynGdRef;
-use crate::obj::{bounds, AsDyn, Bounds, DynGdMut, Gd, GodotClass, Inherits, OnEditor};
-use crate::registry::class::{get_dyn_property_hint_string, try_dynify_object};
-use crate::registry::property::{object_export_element_type_string, Export, Var};
-use crate::{meta, sys};
 use std::{fmt, ops};
+
+use godot_ffi::is_main_thread;
+
+use crate::builtin::{Callable, Variant};
+use crate::meta::error::ConvertError;
+use crate::meta::shape::GodotShape;
+use crate::meta::{ClassId, FromGodot, GodotConvert, ToGodot};
+use crate::obj::guards::DynGdRef;
+use crate::obj::{AsDyn, Bounds, DynGdMut, Gd, GodotClass, Inherits, OnEditor, bounds};
+use crate::registry::class::{get_dyn_implementor_class_ids, try_dynify_object};
+use crate::registry::info::PropertyHintInfo;
+use crate::registry::property::{Export, Var};
+use crate::{meta, sys};
 
 /// Smart pointer integrating Rust traits via `dyn` dispatch.
 ///
@@ -129,6 +134,37 @@ use std::{fmt, ops};
 /// // We can still represent it as DynGd<RefCounted, dyn Health>.
 /// let dyn_gd: DynGd<RefCounted, dyn Health> = variant.to();
 /// // Now work with the abstract object as usual.
+/// ```
+///
+/// Any `Gd<T>` where `T` is an engine class can attempt conversion to `DynGd<T, D>` with [`Gd::try_dynify()`] as well.
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// # use godot::classes::Node2D;
+/// # // ShapeCast2D is marked as experimental and thus not included in the doctests.
+/// # // We use this mock to showcase some real-world usage.
+/// # struct FakeShapeCastCollider2D {}
+///
+/// # impl FakeShapeCastCollider2D {
+/// #     fn get_collider(&self, _idx: i32) -> Option<Gd<Node2D>> { Some(Node2D::new_alloc()) }
+/// # }
+///
+/// trait Pushable { /* ... */ }
+///
+/// # let my_shapecast = FakeShapeCastCollider2D {};
+/// # let idx = 1;
+/// // We can try to convert `Gd<T>` into `DynGd<T, D>`.
+/// let node: Option<DynGd<Node2D, dyn Pushable>> =
+///     my_shapecast.get_collider(idx).and_then(
+///         |obj| obj.try_dynify().ok()
+///     );
+///
+/// // An object is returned after failed conversion, similarly to `Gd::try_cast()`.
+/// # let some_node = Node::new_alloc();
+/// match some_node.try_dynify::<dyn Pushable>() {
+///     Ok(dyn_gd) => (),
+///     Err(some_node) => godot_warn!("Failed to convert {some_node} into dyn Pushable!"),
+/// }
 /// ```
 ///
 /// When converting from Godot back into `DynGd`, we say that the `dyn Health` trait object is _re-enriched_.
@@ -339,8 +375,8 @@ where
         self.try_cast().unwrap_or_else(|from_obj| {
             panic!(
                 "downcast from {from} to {to} failed; instance {from_obj:?}",
-                from = T::class_name(),
-                to = Derived::class_name(),
+                from = T::class_id(),
+                to = Derived::class_id(),
             )
         })
     }
@@ -350,7 +386,6 @@ where
     /// # Safety
     /// The caller must ensure that the dynamic type of the object is `Derived` or a subclass of `Derived`.
     // Not intended for public use. The lack of bounds simplifies godot-rust implementation, but adds another unsafety layer.
-    #[deny(unsafe_op_in_unsafe_fn)]
     pub(crate) unsafe fn cast_unchecked<Derived>(self) -> DynGd<Derived, D>
     where
         Derived: GodotClass,
@@ -370,6 +405,41 @@ where
     #[must_use]
     pub fn into_gd(self) -> Gd<T> {
         self.obj
+    }
+
+    /// Represents `null` when passing a dynamic object argument to Godot.
+    ///
+    /// See [`Gd::null_arg()`]
+    pub fn null_arg() -> impl meta::AsArg<Option<DynGd<T, D>>> {
+        meta::NullArg(std::marker::PhantomData)
+    }
+
+    /// Equivalent of [`Gd::run_deferred()`][crate::obj::Gd::run_deferred] for `DynGd`.
+    pub fn run_deferred<F>(&mut self, mut_self_method: F)
+    where
+        F: FnOnce(&mut D) + 'static,
+    {
+        self.run_deferred_gd(|mut gd| {
+            let mut guard = gd.dyn_bind_mut();
+            mut_self_method(&mut *guard);
+        });
+    }
+
+    /// Equivalent of [`Gd::run_deferred_gd()`][crate::obj::Gd::run_deferred_gd] for `DynGd`.
+    pub fn run_deferred_gd<F>(&mut self, gd_function: F)
+    where
+        F: FnOnce(DynGd<T, D>) + 'static,
+    {
+        let obj = self.clone();
+        assert!(
+            is_main_thread(),
+            "`run_deferred` must be called on the main thread"
+        );
+
+        let callable = Callable::from_once_fn("run_deferred", move |_| {
+            gd_function(obj);
+        });
+        callable.call_deferred(&[]);
     }
 }
 
@@ -512,22 +582,45 @@ where
 impl<T, D> GodotConvert for DynGd<T, D>
 where
     T: GodotClass,
-    D: ?Sized,
+    D: ?Sized + 'static,
 {
     type Via = Gd<T>;
+
+    fn godot_shape() -> GodotShape {
+        use crate::classes;
+        use crate::meta::shape::ClassHeritage;
+
+        // Note: `get_dyn_implementor_class_ids` reads from a global registry populated during class registration.
+        // If `godot_shape()` is ever called before registration completes, the implementor list may be incomplete.
+        // Currently this is not an issue because godot_shape() is only called during or after registration.
+        let heritage = if T::inherits::<classes::Resource>() {
+            ClassHeritage::DynResource {
+                implementors: get_dyn_implementor_class_ids::<T, D>(),
+            }
+        } else if T::inherits::<classes::Node>() {
+            ClassHeritage::Node
+        } else {
+            ClassHeritage::Other
+        };
+
+        let class_id = T::class_id();
+        GodotShape::Class {
+            class_id,
+            heritage,
+            is_nullable: false,
+        }
+    }
 }
 
 impl<T, D> ToGodot for DynGd<T, D>
 where
     T: GodotClass,
-    D: ?Sized,
+    D: ?Sized + 'static,
 {
-    type ToVia<'v>
-        = <Gd<T> as ToGodot>::ToVia<'v>
-    where
-        D: 'v;
+    // Delegate to Gd<T> passing strategy.
+    type Pass = <Gd<T> as ToGodot>::Pass;
 
-    fn to_godot(&self) -> Self::ToVia<'_> {
+    fn to_godot(&self) -> &Self::Via {
         self.obj.to_godot()
     }
 
@@ -542,7 +635,10 @@ where
     D: ?Sized + 'static,
 {
     fn try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
-        try_dynify_object(via)
+        match try_dynify_object(via) {
+            Ok(dyn_gd) => Ok(dyn_gd),
+            Err((from_godot_err, obj)) => Err(from_godot_err.into_error(obj)),
+        }
     }
 }
 
@@ -554,32 +650,27 @@ where
     TBase: GodotClass,
     D: ?Sized + 'static,
 {
-    fn into_arg<'cow>(self) -> meta::CowArg<'cow, DynGd<TBase, D>>
+    fn into_arg<'arg>(self) -> meta::CowArg<'arg, DynGd<TBase, D>>
     where
-        'r: 'cow,
+        'r: 'arg,
     {
         meta::CowArg::Owned(self.clone().upcast::<TBase>())
     }
 }
 */
 
-impl<T, D> meta::ParamType for DynGd<T, D>
+impl<T, D> meta::Element for DynGd<T, D>
 where
     T: GodotClass,
     D: ?Sized + 'static,
 {
-    type ArgPassing = meta::ByRef;
 }
 
-impl<T, D> meta::ArrayElement for DynGd<T, D>
+impl<T, D> meta::Element for Option<DynGd<T, D>>
 where
     T: GodotClass,
     D: ?Sized + 'static,
 {
-    fn element_type_string() -> String {
-        let hint_string = get_dyn_property_hint_string::<T, D>();
-        object_export_element_type_string::<T>(hint_string)
-    }
 }
 
 impl<T, D> Var for DynGd<T, D>
@@ -587,13 +678,23 @@ where
     T: GodotClass,
     D: ?Sized + 'static,
 {
-    fn get_property(&self) -> Self::Via {
-        self.obj.get_property()
+    type PubType = Self;
+
+    fn var_get(field: &Self) -> Self::Via {
+        <Gd<T> as Var>::var_get(&field.obj)
     }
 
-    fn set_property(&mut self, value: Self::Via) {
-        // `set_property` can't be delegated to Gd<T>, since we have to set `erased_obj` as well.
-        *self = <Self as FromGodot>::from_godot(value);
+    fn var_set(field: &mut Self, value: Self::Via) {
+        // `var_set` can't be delegated to Gd<T>, since we have to set `erased_obj` as well.
+        *field = <Self as FromGodot>::from_godot(value);
+    }
+
+    fn var_pub_get(field: &Self) -> Self::PubType {
+        field.clone()
+    }
+
+    fn var_pub_set(field: &mut Self, value: Self::PubType) {
+        *field = value;
     }
 }
 
@@ -603,12 +704,8 @@ where
     T: GodotClass + Bounds<Exportable = bounds::Yes>,
     D: ?Sized + 'static,
 {
-    fn export_hint() -> PropertyHintInfo {
-        PropertyHintInfo::export_dyn_gd::<T, D>()
-    }
-
     #[doc(hidden)]
-    fn as_node_class() -> Option<ClassName> {
+    fn as_node_class() -> Option<ClassId> {
         PropertyHintInfo::object_as_node_class::<T>()
     }
 }
@@ -629,6 +726,10 @@ where
     D: ?Sized + 'static,
 {
     type Via = Option<<DynGd<T, D> as GodotConvert>::Via>;
+
+    fn godot_shape() -> GodotShape {
+        DynGd::<T, D>::godot_shape()
+    }
 }
 
 impl<T, D> Var for OnEditor<DynGd<T, D>>
@@ -636,13 +737,25 @@ where
     T: GodotClass,
     D: ?Sized + 'static,
 {
-    fn get_property(&self) -> Self::Via {
-        Self::get_property_inner(self)
+    // Not Option<...> -- accessing from Rust through Var trait should not expose larger API than OnEditor itself.
+    type PubType = <DynGd<T, D> as GodotConvert>::Via;
+
+    fn var_get(field: &Self) -> Self::Via {
+        Self::get_property_inner(field)
     }
 
-    fn set_property(&mut self, value: Self::Via) {
-        // `set_property` can't be delegated to Gd<T>, since we have to set `erased_obj` as well.
-        Self::set_property_inner(self, value)
+    fn var_set(field: &mut Self, value: Self::Via) {
+        // `var_set` can't be delegated to Gd<T>, since we have to set `erased_obj` as well.
+        Self::set_property_inner(field, value);
+    }
+
+    fn var_pub_get(field: &Self) -> Self::PubType {
+        Self::var_get(field)
+            .expect("generated #[var(pub)] getter: uninitialized OnEditor<DynGd<T, D>>")
+    }
+
+    fn var_pub_set(field: &mut Self, value: Self::PubType) {
+        Self::var_set(field, Some(value))
     }
 }
 
@@ -653,12 +766,8 @@ where
     T: GodotClass + Bounds<Exportable = bounds::Yes>,
     D: ?Sized + 'static,
 {
-    fn export_hint() -> PropertyHintInfo {
-        PropertyHintInfo::export_dyn_gd::<T, D>()
-    }
-
     #[doc(hidden)]
-    fn as_node_class() -> Option<ClassName> {
+    fn as_node_class() -> Option<ClassId> {
         PropertyHintInfo::object_as_node_class::<T>()
     }
 }

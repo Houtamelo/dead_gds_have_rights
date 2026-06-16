@@ -7,12 +7,12 @@
 
 // Note: some code duplication with godot-macros crate.
 
+use proc_macro2::{Ident, Literal, Punct, Spacing, TokenStream, TokenTree};
+use quote::{format_ident, quote};
+
 use crate::models::domain::ClassCodegenLevel;
 use crate::models::json::JsonClass;
 use crate::special_cases;
-
-use proc_macro2::{Ident, Literal, Punct, Spacing, TokenStream, TokenTree};
-use quote::{format_ident, quote};
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -25,7 +25,7 @@ pub fn make_imports() -> TokenStream {
     quote! {
         use godot_ffi as sys;
         use crate::builtin::*;
-        use crate::meta::{AsArg, AsObjectArg, ClassName, CowArg, InParamTuple, ObjectArg, ObjectCow, OutParamTuple, ParamTuple, RefArg, Signature};
+        use crate::meta::{AsArg, ClassId, CowArg, InParamTuple, OutParamTuple, ParamTuple, RawPtr, RefArg, Signature};
         use crate::classes::native::*;
         use crate::classes::Object;
         use crate::obj::Gd;
@@ -38,19 +38,12 @@ pub fn c_str(string: &str) -> Literal {
     Literal::c_string(&c_string)
 }
 
-#[cfg(since_api = "4.2")]
 pub fn make_string_name(identifier: &str) -> TokenStream {
     let lit = c_str(identifier);
 
-    quote! { StringName::from(#lit) }
+    quote! { StringName::__cstr(#lit) }
 }
 
-#[cfg(before_api = "4.2")]
-pub fn make_string_name(identifier: &str) -> TokenStream {
-    quote! {
-        StringName::from(#identifier)
-    }
-}
 pub fn make_sname_ptr(identifier: &str) -> TokenStream {
     quote! {
         string_names.fetch(#identifier)
@@ -58,32 +51,26 @@ pub fn make_sname_ptr(identifier: &str) -> TokenStream {
 }
 
 pub fn get_api_level(class: &JsonClass) -> ClassCodegenLevel {
-    // Work around wrong classification in https://github.com/godotengine/godot/issues/86206.
-    fn override_editor(class_name: &str) -> bool {
-        match class_name {
-            // https://github.com/godotengine/godot/issues/103867
-            "OpenXRInteractionProfileEditorBase"
-            | "OpenXRInteractionProfileEditor"
-            | "OpenXRBindingModifierEditor" => cfg!(before_api = "4.5"),
-
-            // https://github.com/godotengine/godot/issues/86206
-            "ResourceImporterOggVorbis" | "ResourceImporterMP3" => cfg!(before_api = "4.3"),
-
-            _ => false,
-        }
+    // NOTE: We have to use a whitelist of known classes because Godot doesn't separate these out
+    // beyond "editor" and "core" and some classes are also  mis-classified in the JSON depending on the Godot version.
+    if let Some(forced_classification) = special_cases::classify_codegen_level(&class.name) {
+        return forced_classification;
     }
 
-    if special_cases::is_class_level_server(&class.name) {
-        ClassCodegenLevel::Servers
-    } else if class.api_type == "editor" || override_editor(&class.name) {
-        ClassCodegenLevel::Editor
-    } else if class.api_type == "core" {
-        ClassCodegenLevel::Scene
-    } else {
-        panic!(
-            "class {} has unknown API type {}",
-            class.name, class.api_type
-        )
+    // NOTE: Right now, Godot reports everything that's not "editor" as "core" in `extension_api.json`.
+    // If it wasn't picked up by classify_codegen_level, and Godot reports it as "core" we will treat it as a scene class.
+    match class.api_type.as_str() {
+        "editor" => ClassCodegenLevel::Editor,
+        "core" => ClassCodegenLevel::Scene,
+        "extension" => ClassCodegenLevel::Scene,
+        "editor_extension" => ClassCodegenLevel::Editor,
+        _ => {
+            // we don't know this classification
+            panic!(
+                "class {} has unknown API type {}",
+                class.name, class.api_type
+            );
+        }
     }
 }
 
@@ -96,6 +83,14 @@ pub fn lifetime(s: &str) -> TokenStream {
     let tk_lifetime = TokenTree::Ident(ident(s));
 
     TokenStream::from_iter([tk_apostrophe, tk_lifetime])
+}
+
+pub fn make_load_safety_doc() -> TokenStream {
+    quote! {
+        /// # Safety
+        /// - Must be called exactly once during library initialization.
+        /// - All parameters (dependencies) must have been initialized and valid.
+    }
 }
 
 // This function is duplicated in godot-macros\src\util\mod.rs
@@ -116,6 +111,9 @@ pub fn safe_ident(s: &str) -> Ident {
 
         // Reserved 2018+
         | "try"
+
+        // Reserved 2024+
+        | "gen"
            => format_ident!("{}_", s),
 
          _ => ident(s)

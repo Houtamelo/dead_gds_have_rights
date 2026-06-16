@@ -12,27 +12,30 @@
 //! * [`Gd`], a smart pointer that manages instances of Godot classes.
 
 mod base;
-mod call_deferred;
 mod casts;
 mod dyn_gd;
 mod gd;
+mod gd_duplicate;
 mod guards;
 mod instance_id;
 mod on_editor;
 mod on_ready;
+mod passive_gd;
 mod raw_gd;
 mod traits;
 
 pub(crate) mod rtti;
+pub mod signal;
 
 pub use base::*;
-pub use call_deferred::WithDeferredCall;
 pub use dyn_gd::DynGd;
 pub use gd::*;
+pub use gd_duplicate::{ExDuplicateNode, ExDuplicateResource};
 pub use guards::{BaseMut, BaseRef, DynGdMut, DynGdRef, GdMut, GdRef};
 pub use instance_id::*;
 pub use on_editor::*;
 pub use on_ready::*;
+pub(crate) use passive_gd::PassiveGd;
 pub use raw_gd::*;
 pub use traits::*;
 

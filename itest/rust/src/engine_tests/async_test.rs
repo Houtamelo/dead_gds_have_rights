@@ -7,13 +7,13 @@
 
 use std::ops::Deref;
 
-use godot::builtin::{array, vslice, Array, Callable, Signal, Variant};
+use godot::builtin::{Array, Callable, Signal, array, iarray, vslice};
 use godot::classes::{Object, RefCounted};
 use godot::obj::{Base, Gd, NewAlloc, NewGd};
-use godot::prelude::{godot_api, GodotClass};
-use godot::task::{self, create_test_signal_future_resolver, SignalFuture, TaskHandle};
+use godot::prelude::{GodotClass, godot_api};
+use godot::task::{self, SignalFuture, TaskHandle, create_test_signal_future_resolver};
 
-use crate::framework::{expect_async_panic, itest, TestContext};
+use crate::framework::{TestContext, expect_async_panic, itest};
 
 #[derive(GodotClass)]
 #[class(init)]
@@ -73,7 +73,7 @@ fn async_task_array() -> TaskHandle {
 
     object.emit_signal(
         "custom_signal_array",
-        vslice![array![1, 2, 3], ref_counted_arg],
+        vslice![iarray![1, 2, 3], ref_counted_arg],
     );
 
     task_handle
@@ -81,7 +81,7 @@ fn async_task_array() -> TaskHandle {
 
 #[itest]
 fn cancel_async_task(ctx: &TestContext) {
-    let tree = ctx.scene_tree.get_tree().unwrap();
+    let tree = ctx.scene_tree.get_tree();
     let signal = Signal::from_object_signal(&tree, "process_frame");
 
     let handle = task::spawn(async move {
@@ -131,6 +131,8 @@ fn async_task_signal_future_panic() -> TaskHandle {
 #[cfg(feature = "experimental-threads")]
 #[itest(async)]
 fn signal_future_non_send_arg_panic() -> TaskHandle {
+    use godot::sys;
+
     use crate::framework::ThreadCrosser;
 
     let mut object = RefCounted::new_gd();
@@ -145,13 +147,32 @@ fn signal_future_non_send_arg_panic() -> TaskHandle {
         },
     ));
 
+    // This test verifies that panics work if something is non-sendable. Since we can no longer safely invoke Drop in such a case,
+    // the object (here RefCounted) is leaked. However, we don't want memory leaks in tests, so we do it differently:
+    // Leaking a RefCounted can be counteracted by creating another RefCounted *weakly* (so it doesn't increase the refcount).
+    // This is done at the end -- after moving the object out of the thread via escape pod.
+    static ESCAPE_POD: sys::Global<Option<ThreadCrosser<Gd<RefCounted>>>> = sys::Global::default();
+
     let object = ThreadCrosser::new(object);
 
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         let mut object = unsafe { object.extract() };
 
-        object.emit_signal("custom_signal", vslice![RefCounted::new_gd()])
+        let arg = RefCounted::new_gd();
+        // Eject the RefCounted before panic explodes the thread.
+        *ESCAPE_POD.lock() = Some(ThreadCrosser::new(arg.clone()));
+
+        // This will panic:
+        object.emit_signal("custom_signal", vslice![arg])
     });
+
+    // Wait until thread concludes, also to avoid race conditions.
+    thread.join().expect("failed to join thread");
+
+    let escape_pod = ESCAPE_POD.lock().take().unwrap();
+    let object = unsafe { escape_pod.extract() };
+    let balance_restorer: Gd<RefCounted> = unsafe { Gd::__from_obj_sys_weak(object.obj_sys()) };
+    drop(balance_restorer);
 
     handle
 }
@@ -191,7 +212,7 @@ fn resolver_callabable_equality() {
 
     let callable = Callable::from_custom(resolver.clone());
     let cloned_callable = Callable::from_custom(resolver.clone());
-    let unrelated_callable = Callable::from_local_fn("unrelated", |_| Ok(Variant::nil()));
+    let unrelated_callable = Callable::from_fn("unrelated", |_| {});
 
     assert_eq!(callable, cloned_callable);
     assert_ne!(callable, unrelated_callable);

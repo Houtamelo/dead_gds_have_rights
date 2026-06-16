@@ -5,14 +5,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use core::cmp::Ordering;
+use std::cmp::Ordering;
+use std::fmt;
+
 use godot_ffi as sys;
-use sys::{ffi_methods, ExtVariantType, GodotFfi};
+use sys::{ExtVariantType, GodotFfi, ffi_methods};
 
 use crate::builtin::math::{GlamConv, GlamType};
-use crate::builtin::{inner, real, RVec4, Vector4, Vector4Axis};
-
-use std::fmt;
+use crate::builtin::{RVec4, Vector4, Vector4Axis, inner, real};
 
 /// Vector used for 4D math using integer coordinates.
 ///
@@ -110,7 +110,7 @@ unsafe impl GodotFfi for Vector4i {
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }
 
-crate::meta::impl_godot_as_self!(Vector4i);
+crate::meta::impl_godot_as_self!(Vector4i: ByValue);
 
 impl GlamType for glam::IVec4 {
     type Mapped = Vector4i;

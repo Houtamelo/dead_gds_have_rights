@@ -5,17 +5,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! # Modern 4.1+ API
+//! # Modern 4.2+ API
 //!
 //! The extension entry point is passed `get_proc_address` function pointer, which can be used to load all other
 //! GDExtension FFI functions dynamically. This is a departure from the previous struct-based approach.
 //!
-//! No longer supports Godot 4.0.x.
+//! No longer supports Godot 4.0.x or 4.1.x.
 //!
 //! Relevant upstream PR: <https://github.com/godotengine/godot/pull/76406>.
 
-use crate as sys;
+// TODO(v0.6): in this file, raw functions to the interface are fetched repeatedly in very verbose ways.
+// With the JSON interface, generating a nicer API should be possible. Could even be a separate API for (fallibly)
+// querying a handful of core functions, and then a non-null model for the full interface, once initialized.
 
+use crate as sys;
 #[cfg(not(target_family = "wasm"))]
 use crate::toolbox::read_version_string;
 
@@ -31,7 +34,7 @@ pub fn ensure_static_runtime_compatibility(
 pub fn ensure_static_runtime_compatibility(
     get_proc_address: sys::GDExtensionInterfaceGetProcAddress,
 ) {
-    let static_version_str = crate::GdextBuild::godot_static_version_string();
+    let api_version_str = crate::GdextBuild::godot_static_version_string();
 
     // In Godot 4.0.x, before the new GetProcAddress mechanism, the init function looked as follows.
     // In place of the `get_proc_address` function pointer, the `p_interface` data pointer was passed.
@@ -71,13 +74,17 @@ pub fn ensure_static_runtime_compatibility(
         // SAFETY: see above.
         let minor = unsafe { data_ptr.offset(1).read() };
         if minor == 0 {
+            let data_ptr = get_proc_address as *const sys::GDExtensionGodotVersion; // Always v1 of the struct.
+
             // SAFETY: at this point it's reasonably safe to say that we are indeed dealing with that version struct; read the whole.
-            let data_ptr = get_proc_address as *const sys::GDExtensionGodotVersion;
-            let runtime_version_str = unsafe { read_version_string(&data_ptr.read()) };
+            let runtime_version_str = unsafe {
+                let data_ref = &*data_ptr;
+                read_version_string(data_ref.string)
+            };
 
             panic!(
-                "gdext was compiled against a newer Godot version: {static_version_str}\n\
-                but loaded by legacy Godot binary, with version:  {runtime_version_str}\n\
+                "godot-rust compiled against a newer Godot version: {api_version_str}\n\
+                but loaded by legacy Godot binary, with version:   {runtime_version_str}\n\
                 \n\
                 Update your Godot engine version, or read https://godot-rust.github.io/book/toolchain/compatibility.html.\n\
                 \n"
@@ -85,12 +92,12 @@ pub fn ensure_static_runtime_compatibility(
         }
     }
 
-    // From here we can assume Godot 4.1+. We need to make sure that the runtime version is >= static version.
+    // From here we can assume Godot 4.2+. We need to make sure that the runtime version is >= static version.
     // Lexicographical tuple comparison does that.
     let static_version = crate::GdextBuild::godot_static_version_triple();
 
-    // SAFETY: We are now reasonably sure the runtime version is 4.1.
-    let runtime_version_raw = unsafe { runtime_version_inner(get_proc_address) };
+    // SAFETY: We are now reasonably sure the runtime version is 4.2+.
+    let (runtime_version_raw, _) = unsafe { runtime_version(get_proc_address) };
 
     // SAFETY: Godot provides this version struct.
     let runtime_version = (
@@ -100,52 +107,90 @@ pub fn ensure_static_runtime_compatibility(
     );
 
     if runtime_version < static_version {
-        let runtime_version_str = read_version_string(&runtime_version_raw);
+        // SAFETY: valid `runtime_version_raw`.
+        let runtime_version_str = unsafe { read_version_string(runtime_version_raw.string) };
+        let runtime_minor = runtime_version.1;
 
         panic!(
-            "gdext was compiled against newer Godot version: {static_version_str}\n\
-            but loaded by older Godot binary, with version: {runtime_version_str}\n\
+            "godot-rust compiled against newer Godot version: {api_version_str}\n\
+            but loaded by older Godot binary, with version:  {runtime_version_str}\n\
             \n\
-            Update your Godot engine version, or compile gdext against an older version.\n\
+            Compile godot-rust with feature `api-4-{runtime_minor}` or update Godot engine.\n\
             For more information, read https://godot-rust.github.io/book/toolchain/compatibility.html.\n\
             \n"
         );
     }
 }
 
-pub unsafe fn runtime_version(
-    get_proc_address: sys::GDExtensionInterfaceGetProcAddress,
-) -> sys::GDExtensionGodotVersion {
-    let get_proc_address = get_proc_address.expect("get_proc_address unexpectedly null");
+type GetProcAddress =
+    unsafe extern "C" fn(*const std::ffi::c_char) -> sys::GDExtensionInterfaceFunctionPtr;
 
-    runtime_version_inner(get_proc_address)
+/// Generic helper to fetch and call a version function.
+///
+/// # Safety
+/// - `get_proc_address` must be a valid function pointer from Godot.
+/// - The function pointer associated with `fn_name` must be valid, have signature `unsafe extern "C" fn(*mut V)` and initialize
+///   the version struct.
+unsafe fn fetch_version<V>(
+    get_proc_address: GetProcAddress,
+    fn_name: &std::ffi::CStr,
+) -> Option<V> {
+    // SAFETY: `get_proc_address` is a valid function pointer.
+    let fn_ptr = unsafe { get_proc_address(fn_name.as_ptr()) };
+    let fn_ptr = fn_ptr?;
+
+    // SAFETY: Caller guarantees correct signature (either GDExtensionInterfaceGetGodotVersion or GDExtensionInterfaceGetGodotVersion2).
+    let caller: unsafe extern "C" fn(*mut V) = unsafe {
+        std::mem::transmute::<unsafe extern "C" fn(), unsafe extern "C" fn(*mut V)>(fn_ptr)
+    };
+
+    let mut version = std::mem::MaybeUninit::<V>::zeroed();
+
+    // SAFETY: `caller` is a valid function pointer from Godot and must be callable.
+    unsafe { caller(version.as_mut_ptr()) };
+
+    // SAFETY: The version function initializes `version`.
+    Some(unsafe { version.assume_init() })
 }
 
-#[deny(unsafe_op_in_unsafe_fn)]
-unsafe fn runtime_version_inner(
-    get_proc_address: unsafe extern "C" fn(
-        *const std::ffi::c_char,
-    ) -> sys::GDExtensionInterfaceFunctionPtr,
-) -> sys::GDExtensionGodotVersion {
-    // SAFETY: `self.0` is a valid `get_proc_address` pointer.
-    let get_godot_version = unsafe { get_proc_address(sys::c_str(b"get_godot_version\0")) }; //.expect("get_godot_version unexpectedly null");
+/// Returns `(version, supports_deprecated_apis)`.
+pub(crate) unsafe fn runtime_version(
+    get_proc_address: GetProcAddress,
+) -> (sys::GDExtensionGodotVersion, bool) {
+    // Try get_godot_version first (available in all versions, unless Godot built with deprecated features).
 
-    // SAFETY: `sys::GDExtensionInterfaceGetGodotVersion` is an `Option` of an `unsafe extern "C"` function pointer.
-    let get_godot_version =
-        crate::unsafe_cast_fn_ptr!(get_godot_version as sys::GDExtensionInterfaceGetGodotVersion);
+    // SAFETY: `get_proc_address` is valid, function has signature fn(*mut GDExtensionGodotVersion).
+    let version1: Option<sys::GDExtensionGodotVersion> =
+        unsafe { fetch_version(get_proc_address, c"get_godot_version") };
 
-    let mut version = std::mem::MaybeUninit::<sys::GDExtensionGodotVersion>::zeroed();
+    if let Some(version1) = version1 {
+        return (version1, true);
+    }
 
-    // SAFETY: `get_proc_address` with "get_godot_version" does return a valid `sys::GDExtensionInterfaceGetGodotVersion` pointer, and since we have a valid
-    // `get_proc_address` pointer then it must be callable.
-    unsafe { get_godot_version(version.as_mut_ptr()) };
+    // Fall back to get_godot_version2 for 4.5+ builds that have removed the original function.
+    #[cfg(since_api = "4.5")]
+    {
+        // SAFETY: `get_proc_address` is valid, function has signature fn(*mut GDExtensionGodotVersion2).
+        let version2: Option<sys::GDExtensionGodotVersion2> =
+            unsafe { fetch_version(get_proc_address, c"get_godot_version2") };
 
-    // SAFETY: `get_godot_version` initializes `version`.
-    unsafe { version.assume_init() }
+        if let Some(version2) = version2 {
+            // Convert to old "common denominator" struct.
+            let version = sys::GDExtensionGodotVersion {
+                major: version2.major,
+                minor: version2.minor,
+                patch: version2.patch,
+                string: version2.string,
+            };
+            return (version, false);
+        }
+    }
+
+    panic!("None of `get_godot_version`, `get_godot_version2` function pointers available")
 }
 
 pub unsafe fn load_interface(
     get_proc_address: sys::GDExtensionInterfaceGetProcAddress,
 ) -> sys::GDExtensionInterface {
-    sys::GDExtensionInterface::load(get_proc_address)
+    unsafe { sys::GDExtensionInterface::load(get_proc_address) }
 }

@@ -4,10 +4,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-
-use crate::framework::{expect_panic, itest};
+use godot::global::godot_str;
 // Test that all important dyn-related symbols are in the prelude.
 use godot::prelude::*;
+
+use crate::framework::{expect_panic, itest};
 
 #[itest]
 fn dyn_gd_creation_bind() {
@@ -157,7 +158,9 @@ fn dyn_gd_debug() {
         .into_gd()
         .into_dyn::<dyn InstanceIdProvider<Id = InstanceId>>();
     let actual = format!(".:{node:?}:.");
-    let expected = format!(".:DynGd {{ id: {id}, class: NodeHealth, trait: dyn InstanceIdProvider<Id = InstanceId> }}:.");
+    let expected = format!(
+        ".:DynGd {{ id: {id}, class: NodeHealth, trait: dyn InstanceIdProvider<Id = InstanceId> }}:."
+    );
 
     assert_eq!(actual, expected);
 
@@ -281,7 +284,7 @@ fn dyn_gd_call_godot_method() {
     let mut node = foreign::NodeHealth::new_alloc().into_dyn::<dyn Health>();
 
     node.set_name("dyn-name!");
-    assert_eq!(node.get_name(), "dyn-name!".into());
+    assert_eq!(node.get_name(), "dyn-name!");
 
     node.free();
 }
@@ -343,21 +346,138 @@ fn dyn_gd_variant_conversions() {
 }
 
 #[itest]
+fn dyn_gd_object_conversions() {
+    let node = foreign::NodeHealth::new_alloc().upcast::<Node>();
+    let original_id = node.instance_id();
+
+    // Convert to different levels of DynGd:
+    let back: DynGd<Node, dyn Health> = node
+        .try_dynify()
+        .expect("Gd::try_dynify() should succeed.")
+        .cast();
+    assert_eq!(back.dyn_bind().get_hitpoints(), 100);
+    assert_eq!(back.instance_id(), original_id);
+
+    let obj = back.into_gd().upcast::<Object>();
+    let back: DynGd<Object, dyn Health> =
+        obj.try_dynify().expect("Gd::try_dynify() should succeed.");
+    assert_eq!(back.dyn_bind().get_hitpoints(), 100);
+    assert_eq!(back.instance_id(), original_id);
+
+    // Back to NodeHealth.
+    let node = back.cast::<foreign::NodeHealth>();
+    assert_eq!(node.bind().get_hitpoints(), 100);
+    assert_eq!(node.instance_id(), original_id);
+
+    // Convert to different DynGd.
+    let obj = node.into_gd().upcast::<Node>();
+    let back: DynGd<Node, dyn InstanceIdProvider<Id = InstanceId>> =
+        obj.try_dynify().expect("Gd::try_dynify() should succeed.");
+    assert_eq!(back.dyn_bind().get_id_dynamic(), original_id);
+
+    let obj = back.into_gd().upcast::<Object>();
+    let back: DynGd<Object, dyn InstanceIdProvider<Id = InstanceId>> =
+        obj.try_dynify().expect("Gd::try_dynify() should succeed.");
+    assert_eq!(back.dyn_bind().get_id_dynamic(), original_id);
+
+    back.free()
+}
+
+#[itest]
+fn dyn_gd_object_conversion_failures() {
+    // Unregistered trait conversion failure.
+    trait UnrelatedTrait {}
+
+    let node = foreign::NodeHealth::new_alloc().upcast::<Node>();
+    let original_id = node.instance_id();
+    let back = node.try_dynify::<dyn UnrelatedTrait>();
+    let node = back.expect_err("Gd::try_dynify() should have failed");
+
+    // `Gd::try_dynify()` should return the original instance on failure, similarly to `Gd::try_cast()`.
+    assert_eq!(original_id, node.instance_id());
+
+    // Unimplemented trait conversion failures.
+    let back = node.try_dynify::<dyn InstanceIdProvider<Id = i32>>();
+    let node = back.expect_err("Gd::try_dynify() should have failed");
+    assert_eq!(original_id, node.instance_id());
+
+    let obj = RefCounted::new_gd();
+    let original_id = obj.instance_id();
+    let back = obj.try_dynify::<dyn Health>();
+    let obj = back.expect_err("Gd::try_dynify() should have failed");
+    assert_eq!(original_id, obj.instance_id());
+
+    node.free();
+}
+
+#[itest]
 fn dyn_gd_store_in_godot_array() {
     let a = Gd::from_object(RefcHealth { hp: 33 }).into_dyn();
     let b = foreign::NodeHealth::new_alloc().into_dyn();
 
-    let array: Array<DynGd<Object, _>> = array![&a.upcast(), &b.upcast()];
+    // Also tests AsArg impl for DynGd, which previously suffered from UB.
+    let array: Array<DynGd<Object, _>> = array![&a, &b];
 
     assert_eq!(array.at(0).dyn_bind().get_hitpoints(), 33);
     assert_eq!(array.at(1).dyn_bind().get_hitpoints(), 100);
 
     array.at(1).free();
 
-    // Tests also type inference of array![]. Independent variable c.
-    let c = Gd::from_object(RefcHealth { hp: 33 }).into_dyn();
-    let array_inferred = array![&c];
+    // Used to support type inference of array![]. Not anymore with unified AsArg<..> + upcast support.
+    /*
+    let c: DynGd<RefcHealth, dyn Health> = Gd::from_object(RefcHealth { hp: 33 }).into_dyn();
+    let c = c.upcast::<RefCounted>();
+    let array_inferred /*: Array<DynGd<RefCounted, _>>*/ = array![&c];
     assert_eq!(array_inferred.at(0).dyn_bind().get_hitpoints(), 33);
+    */
+}
+
+#[itest]
+fn dyn_gd_as_arg_inherited_base() {
+    let refc_health = Gd::from_object(RefcHealth { hp: 42 }).into_dyn();
+    let node_health = foreign::NodeHealth::new_alloc().into_dyn();
+    let typed_none = None::<&DynGd<RefcHealth, dyn Health>>;
+
+    // Array<DynGd<Base, D>>.
+    // See: https://github.com/godot-rust/gdext/pull/1345.
+    let array: Array<DynGd<RefcHealth, dyn Health>> = array![&refc_health];
+    assert_eq!(array.len(), 1);
+    let first = array.at(0);
+    assert_eq!(first.dyn_bind().get_hitpoints(), 42);
+
+    // Array<DynGd>.
+    let array: Array<DynGd<Object, dyn Health>> = array![&refc_health, &node_health];
+    assert_eq!(array.len(), 2);
+
+    let first = array.at(0);
+    assert_eq!(first.dyn_bind().get_hitpoints(), 42);
+
+    let second = array.at(1);
+    assert_eq!(second.dyn_bind().get_hitpoints(), 100);
+
+    // Array<Option<DynGd>>.
+    let opt_array: Array<Option<DynGd<Object, dyn Health>>> = array![
+        Some(&refc_health),
+        Some(&node_health),
+        typed_none,
+        DynGd::null_arg(),
+    ];
+    assert_eq!(opt_array.len(), 4);
+
+    let first = opt_array.at(0).expect("element 0 is Some");
+    assert_eq!(first.dyn_bind().get_hitpoints(), 42);
+
+    let second = opt_array.at(1).expect("element 1 is Some");
+    assert_eq!(second.dyn_bind().get_hitpoints(), 100);
+
+    let third = opt_array.at(2);
+    assert!(third.is_none(), "element 2 is None");
+
+    let fourth = opt_array.at(3);
+    assert!(fourth.is_none(), "element 3 is None (null_arg)");
+
+    // Clean up manually managed objects.
+    opt_array.at(1).unwrap().free();
 }
 
 #[itest]
@@ -382,7 +502,9 @@ fn dyn_gd_error_unregistered_trait() {
 
     // Variant Debug uses "VariantGd" prefix.
     let err = back.expect_err("DynGd::try_to() should have failed");
-    let expected_err = format!("trait `dyn InstanceIdProvider<Id = i32>` has not been registered with #[godot_dyn]: Variant{node:?}");
+    let expected_err = format!(
+        "trait `dyn InstanceIdProvider<Id = i32>` has not been registered with #[godot_dyn]: Variant{node:?}"
+    );
 
     assert_eq!(err.to_string(), expected_err);
 
@@ -484,7 +606,7 @@ struct RefcHealth {
 #[godot_api]
 impl IRefCounted for RefcHealth {
     fn to_string(&self) -> GString {
-        format!("RefcHealth(hp={})", self.hp).into()
+        godot_str!("RefcHealth(hp={})", self.hp)
     }
 }
 

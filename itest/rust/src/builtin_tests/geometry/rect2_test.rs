@@ -5,11 +5,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::itest;
-
 use godot::builtin::inner::InnerRect2;
 use godot::builtin::math::assert_eq_approx;
-use godot::builtin::{real, reals, RealConv, Rect2, Side, Vector2};
+use godot::builtin::{RealConv, Rect2, Side, Vector2, real, reals};
+
+use crate::framework::itest;
 
 #[itest]
 fn rect2_inner_equivalence() {
@@ -41,7 +41,7 @@ fn rect2_inner_equivalence() {
 
         for other in rects {
             assert_eq!(rect.encloses(other), inner_rect.encloses(other));
-            assert_eq!(rect.intersects(other), inner_rect.intersects(other, true),);
+            assert_eq!(rect.intersects(other), inner_rect.intersects(other, true));
             // Check intersection without considering borders
             assert_eq!(
                 rect.intersects_exclude_borders(other),

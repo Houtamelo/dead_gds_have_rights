@@ -5,18 +5,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::itest;
+use std::hash::Hasher;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use godot::builtin::{
-    array, varray, vdict, vslice, Array, Callable, Color, GString, NodePath, StringName, Variant,
-    VariantArray, Vector2,
+    Array, Callable, Color, GString, NodePath, StringName, VarArray, Variant, Vector2, array,
+    iarray, varray, vdict, vslice,
 };
 use godot::classes::{Node2D, Object, RefCounted};
 use godot::init::GdextBuild;
 use godot::meta::ToGodot;
 use godot::obj::{Gd, NewAlloc, NewGd};
-use godot::register::{godot_api, GodotClass};
-use std::hash::Hasher;
-use std::sync::atomic::{AtomicU32, Ordering};
+use godot::register::{GodotClass, godot_api};
+
+use crate::framework::itest;
 
 #[derive(GodotClass)]
 #[class(init, base=RefCounted)]
@@ -37,8 +39,8 @@ impl CallableTestObj {
     }
 
     #[func] // static
-    fn concat_array(a: i32, b: GString, c: Array<NodePath>, d: Gd<RefCounted>) -> VariantArray {
-        varray![a, b, c, d]
+    fn concat_array(a: i32, b: GString, c: Array<NodePath>, d: Gd<RefCounted>) -> VarArray {
+        varray![a, &b, &c, &d]
     }
 }
 
@@ -71,14 +73,14 @@ fn callable_validity() {
 fn callable_hash() {
     let obj = CallableTestObj::new_gd();
     assert_eq!(
-        obj.callable("assign_int").hash(),
-        obj.callable("assign_int").hash()
+        obj.callable("assign_int").hash_u32(),
+        obj.callable("assign_int").hash_u32()
     );
 
     // Not guaranteed, but unlikely.
     assert_ne!(
-        obj.callable("assign_int").hash(),
-        obj.callable("stringify_int").hash()
+        obj.callable("assign_int").hash_u32(),
+        obj.callable("stringify_int").hash_u32()
     );
 }
 
@@ -101,8 +103,8 @@ fn callable_object_method() {
 #[itest]
 #[cfg(since_api = "4.3")]
 fn callable_variant_method() {
-    // Dictionary
-    let dict = vdict! { "one": 1, "value": 2 };
+    // VarDictionary
+    let dict = vdict! { "one" => 1, "value" => 2 };
     let dict_get = Callable::from_variant_method(&dict.to_variant(), "get");
     assert_eq!(dict_get.call(vslice!["one"]), 1.to_variant());
 
@@ -138,7 +140,7 @@ fn callable_variant_method() {
 #[itest]
 #[cfg(since_api = "4.4")]
 fn callable_static() {
-    let callable = Callable::from_local_static("CallableTestObj", "concat_array");
+    let callable = Callable::from_class_static("CallableTestObj", "concat_array");
 
     assert_eq!(callable.object(), None);
     assert_eq!(callable.object_id(), None);
@@ -152,11 +154,11 @@ fn callable_static() {
     let result = callable.callv(&varray![
         10,
         "hello",
-        &array![&NodePath::from("my/node/path")],
-        RefCounted::new_gd()
+        &iarray![&NodePath::from("my/node/path")],
+        &RefCounted::new_gd()
     ]);
 
-    let result = result.to::<VariantArray>();
+    let result = result.to::<VarArray>();
     assert_eq!(result.len(), 4);
     assert_eq!(result.at(0), 10.to_variant());
 
@@ -168,14 +170,14 @@ fn callable_static() {
 #[itest]
 #[cfg(since_api = "4.4")]
 fn callable_static_bind() {
-    let callable = Callable::from_local_static("CallableTestObj", "concat_array");
+    let callable = Callable::from_class_static("CallableTestObj", "concat_array");
     assert!(callable.is_valid());
 
     // Test varying binds to static callables.
     // Last 3 of 4 arguments. Within Godot, bound arguments are used in-order AFTER call arguments.
     let bindv = callable.bindv(&varray![
         "two",
-        array![&NodePath::from("three/four")],
+        &iarray![&NodePath::from("three/four")],
         &RefCounted::new_gd(),
     ]);
     assert!(bindv.is_valid());
@@ -186,7 +188,7 @@ fn callable_static_bind() {
 
     assert!(!bindv_result.is_nil());
 
-    let bind_result_data: VariantArray = bindv_result.to();
+    let bind_result_data: VarArray = bindv_result.to();
     assert_eq!(4, bind_result_data.len());
 }
 
@@ -211,7 +213,6 @@ fn callable_callv() {
     assert_eq!(Callable::invalid().callv(&varray![1, 2, 3]), Variant::nil());
 }
 
-#[cfg(since_api = "4.2")]
 #[itest]
 fn callable_call() {
     // See callable_callv() for future improvements.
@@ -245,7 +246,6 @@ fn callable_call_return() {
     assert_eq!(callable.callv(&varray!["string"]), Variant::nil());
 }
 
-#[cfg(since_api = "4.2")]
 #[itest]
 fn callable_call_engine() {
     let obj = Node2D::new_alloc();
@@ -279,7 +279,6 @@ fn callable_bindv() {
     );
 }
 
-#[cfg(since_api = "4.2")]
 #[itest]
 fn callable_bind() {
     let obj = CallableTestObj::new_gd();
@@ -292,7 +291,6 @@ fn callable_bind() {
     );
 }
 
-#[cfg(since_api = "4.2")]
 #[itest]
 fn callable_unbind() {
     let obj = CallableTestObj::new_gd();
@@ -350,9 +348,9 @@ fn callable_get_bound_arguments() {
     let d: Gd<RefCounted> = RefCounted::new_gd();
 
     let callable = obj.callable("baz");
-    let callable_bound = callable.bindv(&varray![a, b, c, d]);
+    let callable_bound = callable.bindv(&varray![a, b, &c, &d]);
 
-    assert_eq!(callable_bound.get_bound_arguments(), varray![a, b, c, d]);
+    assert_eq!(callable_bound.get_bound_arguments(), varray![a, b, &c, &d]);
 }
 
 // Regression test for https://github.com/godot-rust/gdext/issues/410.
@@ -369,21 +367,23 @@ impl CallableRefcountTest {
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Tests and infrastructure for custom callables
 
-#[cfg(since_api = "4.2")]
+// Used to be #[cfg(since_api = "4.2")], could maybe be moved to own file.
 pub mod custom_callable {
-    use super::*;
-    use crate::framework::{assert_eq_self, quick_thread, suppress_panic_log, ThreadCrosser};
-    use godot::builtin::{Dictionary, RustCallable};
-    use godot::prelude::Signal;
-    use godot::sys;
-    use godot::sys::GdextBuild;
     use std::fmt;
     use std::hash::Hash;
     use std::sync::{Arc, Mutex};
 
+    use godot::builtin::{RustCallable, VarDictionary};
+    use godot::prelude::Signal;
+    use godot::sys;
+    use godot::sys::GdextBuild;
+
+    use super::*;
+    use crate::framework::{ThreadCrosser, assert_eq_self, quick_thread, suppress_panic_log};
+
     #[itest]
-    fn callable_from_local_fn() {
-        let callable = Callable::from_local_fn("sum", sum);
+    fn callable_from_fn() {
+        let callable = Callable::from_fn("sum", sum);
 
         assert!(callable.is_valid());
         assert!(!callable.is_null());
@@ -398,16 +398,15 @@ pub mod custom_callable {
         assert_eq!(sum2, 0.to_variant());
     }
 
-    // Without this feature, any access to the global binding from another thread fails; so the from_local_fn() cannot be tested in isolation.
+    // Without this feature, any access to the global binding from another thread fails; so the from_fn() cannot be tested in isolation.
     #[itest]
-    fn callable_from_local_fn_crossthread() {
+    fn callable_from_fn_crossthread() {
         // This static is a workaround for not being able to propagate failed `Callable` invocations as panics.
         // See note in itest callable_call() for further info.
         static GLOBAL: sys::Global<i32> = sys::Global::default();
 
-        let callable = Callable::from_local_fn("change_global", |_args| {
+        let callable = Callable::from_fn("change_global", |_args| {
             *GLOBAL.lock() = 777;
-            Ok(Variant::nil())
         });
 
         // Note that Callable itself isn't Sync/Send, so we have to transfer it unsafely.
@@ -415,16 +414,14 @@ pub mod custom_callable {
         let crosser = ThreadCrosser::new(callable);
 
         // Create separate thread and ensure calling fails.
-        // Why expect_panic for (single-threaded && Debug) but not (multi-threaded || Release) mode:
-        // - Check is only enabled in Debug, not Release.
-        // - We currently can't catch panics from Callable invocations, see above. True for both single/multi-threaded.
-        // - In single-threaded mode, there's an FFI access check which panics as soon as another thread is invoked. *This* panics.
-        // - In multi-threaded, we need to observe the effect instead (see below).
-
-        if !cfg!(feature = "experimental-threads") && cfg!(debug_assertions) {
-            // Single-threaded and Debug.
+        // Why expect_panic for (safeguards_balanced && single-threaded) but not otherwise:
+        // - In single-threaded mode with balanced safeguards, there's an FFI access check which panics when another thread is invoked.
+        // - In multi-threaded mode OR with safeguards disengaged, the callable may or may not execute, but won't panic at the FFI level.
+        // - We can't catch panics from Callable invocations yet (see above), only the FFI access panics.
+        if cfg!(safeguards_balanced) && !cfg!(feature = "experimental-threads") {
+            // Single-threaded with balanced safeguards: FFI access check will panic.
             crate::framework::expect_panic(
-                "Callable created with from_local_fn() must panic when invoked on other thread",
+                "Callable created with from_fn() must panic when invoked on other thread",
                 || {
                     quick_thread(|| {
                         let callable = unsafe { crosser.extract() };
@@ -433,18 +430,17 @@ pub mod custom_callable {
                 },
             );
         } else {
-            // Multi-threaded OR Release.
+            // Multi-threaded OR safeguards disengaged: No FFI panic, but callable may or may not execute.
             quick_thread(|| {
                 let callable = unsafe { crosser.extract() };
                 callable.callv(&varray![5]);
             });
         }
 
-        assert_eq!(
-            *GLOBAL.lock(),
-            0,
-            "Callable created with from_local_fn() must not run when invoked on other thread"
-        );
+        // Expected value depends on whether thread checks are enforced.
+        // 777: callable *is* executed on other thread.
+        let expected = if cfg!(safeguards_balanced) { 0 } else { 777 };
+        assert_eq!(*GLOBAL.lock(), expected);
     }
 
     #[itest]
@@ -469,27 +465,25 @@ pub mod custom_callable {
     }
 
     #[itest]
-    fn callable_custom_with_err() {
-        let callable_with_err =
-            Callable::from_local_fn("on_error_doesnt_crash", |_args: &[&Variant]| Err(()));
+    fn callable_from_fn_nil() {
+        let callable_with_err = Callable::from_fn("returns_nil", |_args: &[&Variant]| {});
 
-        // Causes error in Godot, but should not crash.
         assert_eq!(callable_with_err.callv(&varray![]), Variant::nil());
     }
 
     #[itest]
     fn callable_from_fn_eq() {
-        let a = Callable::from_local_fn("sum", sum);
+        let a = Callable::from_fn("sum", sum);
         let b = a.clone();
-        let c = Callable::from_local_fn("sum", sum);
+        let c = Callable::from_fn("sum", sum);
 
         assert_eq!(a, b, "same function, same instance -> equal");
         assert_ne!(a, c, "same function, different instance -> not equal");
     }
 
-    fn sum(args: &[&Variant]) -> Result<Variant, ()> {
-        let sum: i32 = args.iter().map(|arg| arg.to::<i32>()).sum();
-        Ok(sum.to_variant())
+    // Now non-Variant return type.
+    fn sum(args: &[&Variant]) -> i32 {
+        args.iter().map(|arg| arg.to::<i32>()).sum()
     }
 
     #[itest]
@@ -515,7 +509,7 @@ pub mod custom_callable {
         let callable = Callable::from_custom(my_rust_callable);
 
         let variant = callable.to_variant();
-        assert_eq!(variant.stringify(), GString::from("Adder(sum=-2)"));
+        assert_eq!(variant.stringify(), "Adder(sum=-2, arc=1)");
     }
 
     #[itest]
@@ -564,13 +558,13 @@ pub mod custom_callable {
         let a = Callable::from_custom(Adder::new_tracked(3, at.clone()));
         let b = Callable::from_custom(Adder::new_tracked(3, bt.clone()));
 
-        let mut dict = Dictionary::new();
+        let mut dict = VarDictionary::new();
 
-        dict.set(a, "hello");
+        dict.set(&a, "hello");
         assert_eq!(hash_count(&at), 1, "hash needed for a dict key");
         assert_eq!(eq_count(&at), 0, "eq not needed if dict bucket is empty");
 
-        dict.set(b, "hi");
+        dict.set(&b, "hi");
         assert_eq!(hash_count(&at), 1, "hash for a untouched if b is inserted");
         assert_eq!(hash_count(&bt), 1, "hash needed for b dict key");
 
@@ -588,10 +582,10 @@ pub mod custom_callable {
     fn callable_callv_panic_from_fn() {
         let received = Arc::new(AtomicU32::new(0));
         let received_callable = received.clone();
-        let callable = Callable::from_local_fn("test", move |_args| {
+        let callable = Callable::from_fn("test", move |_args| {
             suppress_panic_log(|| {
                 panic!("TEST: {}", received_callable.fetch_add(1, Ordering::SeqCst))
-            })
+            });
         });
 
         assert_eq!(Variant::nil(), callable.callv(&varray![]));
@@ -620,7 +614,7 @@ pub mod custom_callable {
 
         let obj = RefCounted::new_gd();
         let signal = Signal::from_object_signal(&obj, "script_changed");
-        signal.connect(&some_callable, 0);
+        signal.connect(&some_callable);
 
         // Given Custom Callable is connected to signal
         // if callable with the very same hash is already connected.
@@ -642,6 +636,19 @@ pub mod custom_callable {
         // The hashes are, once again, identical.
         assert!(signal.is_connected(&some_callable));
         assert!(signal.is_connected(&identical_callable));
+    }
+
+    #[itest]
+    fn callable_from_once_fn() {
+        let callable = Callable::__once_fn("once_test", move |_| 42.to_variant());
+
+        // First call should succeed.
+        let result = callable.call(&[]);
+        assert_eq!(result.to::<i32>(), 42);
+
+        // Second call should fail (panic currently isn't propagated, see other tests).
+        let result = callable.call(&[]);
+        assert!(result.is_nil());
     }
 
     // ------------------------------------------------------------------------------------------------------------------------------------------
@@ -690,17 +697,18 @@ pub mod custom_callable {
 
     impl fmt::Display for Adder {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "Adder(sum={})", self.sum)
+            let arc = Arc::strong_count(&self.tracker);
+            write!(f, "Adder(sum={sum}, arc={arc})", sum = self.sum)
         }
     }
 
     impl RustCallable for Adder {
-        fn invoke(&mut self, args: &[&Variant]) -> Result<Variant, ()> {
+        fn invoke(&mut self, args: &[&Variant]) -> Variant {
             for arg in args {
                 self.sum += arg.to::<i32>();
             }
 
-            Ok(self.sum.to_variant())
+            self.sum.to_variant()
         }
     }
 
@@ -748,8 +756,33 @@ pub mod custom_callable {
     }
 
     impl RustCallable for PanicCallable {
-        fn invoke(&mut self, _args: &[&Variant]) -> Result<Variant, ()> {
+        fn invoke(&mut self, _args: &[&Variant]) -> Variant {
             panic!("TEST: {}", self.0.fetch_add(1, Ordering::SeqCst))
         }
+    }
+
+    #[itest]
+    fn callable_from_fn_name_cached() {
+        let callable = Callable::from_fn("test_callable", |_args: &[&Variant]| 42);
+
+        // Convert to variant string twice -- should use cached GString.
+        let str1 = callable.to_variant().stringify();
+        let str2 = callable.to_variant().stringify();
+
+        assert_eq!(str1, str2);
+        assert_eq!(str1, "test_callable");
+    }
+
+    #[itest]
+    fn callable_rust_callable_name_no_cache() {
+        let tracker = Tracker::new();
+
+        let adder = Adder::new_tracked(5, Arc::clone(&tracker));
+        let callable = Callable::from_custom(adder);
+
+        // RustCallable always calls Display -- no caching.
+        assert_eq!(callable.to_string(), "Adder(sum=5, arc=2)");
+        let _inc_ref = Arc::clone(&tracker);
+        assert_eq!(callable.to_string(), "Adder(sum=5, arc=3)");
     }
 }

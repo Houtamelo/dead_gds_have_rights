@@ -5,12 +5,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::itest;
+use godot::builtin::math::{ApproxEq, assert_eq_approx};
+use godot::builtin::{Vector4, Vector4Axis, real};
 
-use godot::builtin::{
-    math::{assert_eq_approx, ApproxEq},
-    real, Vector4, Vector4Axis,
-};
+use crate::framework::itest;
 
 #[itest]
 fn abs() {

@@ -47,6 +47,7 @@ jobs:
       - name: "Install Rust"
         uses: ./.github/composite/rust
         with:
+          rust: nightly
           components: rustfmt
 
       - name: "Check rustfmt"
@@ -77,7 +78,7 @@ jobs:
       - name: "Check rustdoc"
         env:
           RUSTDOCFLAGS: >
-            -D rustdoc::broken-intra-doc-links -D rustdoc::private-intra-doc-links -D rustdoc::invalid-codeblock-attributes 
+            -D rustdoc::broken-intra-doc-links -D rustdoc::private-intra-doc-links -D rustdoc::invalid-codeblock-attributes
             -D rustdoc::invalid-rust-codeblocks -D rustdoc::invalid-html-tags -D rustdoc::bare-urls -D rustdoc::unescaped-backticks
         run: cargo doc -p godot --ignore-rust-version
 
@@ -106,7 +107,7 @@ jobs:
           -D clippy::todo \
           -D clippy::unimplemented \
           -D warnings
-          
+
 
   unit-test:
     name: unit-test
@@ -125,6 +126,48 @@ jobs:
 
       - name: "Test"
         run: cargo test $TEST_FEATURES
+
+      - name: "Run doctest in minimal feature set"
+        run: cargo test --doc --no-default-features
+
+
+  unit-test-web:
+    name: unit-test-web (${{ matrix.name }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Threads
+            command: test-web-t
+          - name: No threads
+            command: test-web-nt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Patch Cargo.toml to use nightly extension API"
+        run: .github/other/patch-prebuilt.sh nightly
+
+      - name: "Install Rust"
+        uses: ./.github/composite/rust
+        with:
+          rust: nightly
+          components: rust-src
+
+      - name: "Install emscripten"
+        env:
+          EMSCRIPTEN_SRC_REF: 4.0.13
+          EMSCRIPTEN_VERSION: 3.1.74
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git --depth 1 --branch "$EMSCRIPTEN_SRC_REF" --single-branch
+          ./emsdk/emsdk install "$EMSCRIPTEN_VERSION"
+          ./emsdk/emsdk activate "$EMSCRIPTEN_VERSION"
+          source ./emsdk/emsdk_env.sh
+          echo "$PATH" >> "$GITHUB_PATH"
+
+      - name: "Test (Wasm)"
+        run: ./check.sh ${{ matrix.command }}
 
 
   # For complex matrix workflow, see https://stackoverflow.com/a/65434401
@@ -158,7 +201,8 @@ jobs:
             os: ubuntu-22.04
             artifact-name: linux-nightly
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            rust-extra-args: --features itest/codegen-full
+            rust-extra-args: --features itest/codegen-full,itest/test-gdextension-dependency
+            rust-extra-env: GDRUST_MAIN_EXTENSION=IntegrationTests
             hot-reload: stable
 
           - name: linux-custom-api-json
@@ -186,6 +230,18 @@ jobs:
 
           # Linux compat
 
+          - name: linux-4.6
+            os: ubuntu-22.04
+            artifact-name: linux-4.6
+            godot-binary: godot.linuxbsd.editor.dev.x86_64
+            #godot-prebuilt-patch: '4.6'
+
+          - name: linux-4.5
+            os: ubuntu-22.04
+            artifact-name: linux-4.5
+            godot-binary: godot.linuxbsd.editor.dev.x86_64
+            godot-prebuilt-patch: '4.5'
+
           - name: linux-4.4
             os: ubuntu-22.04
             artifact-name: linux-4.4
@@ -202,17 +258,11 @@ jobs:
             os: ubuntu-22.04
             artifact-name: linux-4.2
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            godot-prebuilt-patch: '4.2.2'
+            godot-prebuilt-patch: '4.2'
 
-          - name: linux-4.1
-            os: ubuntu-22.04
-            artifact-name: linux-4.1
-            godot-binary: godot.linuxbsd.editor.dev.x86_64
-            godot-prebuilt-patch: '4.1.4'
+          # Memory checkers (always Linux).
 
-          # Memory checkers
-
-          - name: linux-memcheck
+          - name: memcheck
             os: ubuntu-22.04
             artifact-name: linux-memcheck-nightly
             godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
@@ -220,6 +270,27 @@ jobs:
             rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
             rust-extra-args: --features godot/api-custom
             # Sanitizers can't build proc-macros and build scripts; with --target, cargo ignores RUSTFLAGS for those two.
+            rust-target: x86_64-unknown-linux-gnu
+
+          - name: memcheck-release-disengaged
+            os: ubuntu-22.04
+            artifact-name: linux-memcheck-nightly
+            godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
+            rust-toolchain: nightly
+            rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
+            # Currently without itest/codegen-full-experimental.
+            rust-extra-args: --release --features godot/safeguards-release-disengaged
+            rust-target: x86_64-unknown-linux-gnu
+            rust-target-dir: release # We're running Godot debug build with Rust release dylib.
+
+          - name: memcheck-dev-balanced
+            os: ubuntu-22.04
+            artifact-name: linux-memcheck-nightly
+            godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
+            rust-toolchain: nightly
+            rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
+            # Currently without itest/codegen-full-experimental.
+            rust-extra-args: --features godot/safeguards-dev-balanced
             rust-target: x86_64-unknown-linux-gnu
 
     steps:
@@ -235,7 +306,9 @@ jobs:
           rust-extra-args: ${{ matrix.rust-extra-args }}
           rust-toolchain: ${{ matrix.rust-toolchain || 'stable' }}
           rust-env-rustflags: ${{ matrix.rust-env-rustflags }}
+          rust-extra-env: ${{ matrix.rust-extra-env }}
           rust-target: ${{ matrix.rust-target }}
+          rust-target-dir: ${{ matrix.rust-target-dir }}
           with-llvm: ${{ contains(matrix.name, 'macos') && contains(matrix.rust-extra-args, 'api-custom') }}
           godot-check-header: ${{ matrix.godot-check-header }}
           godot-indirect-json: ${{ matrix.godot-indirect-json }}
@@ -283,7 +356,7 @@ jobs:
       - name: "Determine success or failure"
         run: |
           DEPENDENCIES='${{ toJson(needs) }}'
-          
+
           echo "Dependency jobs:"
           all_success=true
           for job in $(echo "$DEPENDENCIES" | jq -r 'keys[]'); do
@@ -293,7 +366,7 @@ jobs:
                   all_success=false
               fi
           done
-          
+
           if [[ "$all_success" == "false" ]]; then
               echo "One or more dependency jobs failed or were cancelled."
               exit 1

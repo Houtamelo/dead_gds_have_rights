@@ -8,62 +8,37 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::derive::data_models::GodotConvert;
 use crate::ParseResult;
+use crate::derive::data_models::GodotConvert;
 
 /// Derives `Var` for the given declaration.
 ///
-/// This uses `ToGodot` and `FromGodot` for the `get_property` and `set_property` implementations.
+/// This uses `ToGodot` and `FromGodot` for the `var_get` and `var_set` implementations.
+/// Property hints are derived from `GodotConvert::shape()`.
 pub fn derive_var(item: venial::Item) -> ParseResult<TokenStream> {
     let convert = GodotConvert::parse_declaration(item)?;
-
-    let property_hint_impl = create_property_hint_impl(&convert);
 
     let name = convert.ty_name;
 
     Ok(quote! {
         impl ::godot::register::property::Var for #name {
-            fn get_property(&self) -> <Self as ::godot::meta::GodotConvert>::Via {
-                ::godot::meta::ToGodot::to_godot(self)
+            type PubType = Self;
+
+            fn var_get(field: &Self) -> <Self as ::godot::meta::GodotConvert>::Via {
+                ::godot::meta::ToGodot::to_godot(field)
             }
 
-            fn set_property(&mut self, value: <Self as ::godot::meta::GodotConvert>::Via) {
-                *self = ::godot::meta::FromGodot::from_godot(value);
+            fn var_set(field: &mut Self, value: <Self as ::godot::meta::GodotConvert>::Via) {
+                *field = ::godot::meta::FromGodot::from_godot(value);
             }
 
-            fn var_hint() -> ::godot::meta::PropertyHintInfo {
-                #property_hint_impl
+            fn var_pub_get(field: &Self) -> Self::PubType {
+                field.clone()
+            }
+
+            fn var_pub_set(field: &mut Self, value: Self::PubType) {
+                *field = value;
             }
         }
     })
-}
-
-/// Make an appropriate property hint implementation.
-///
-/// For newtype structs we just defer to the wrapped type. For enums we use `PropertyHint::ENUM` with an appropriate hint string.
-fn create_property_hint_impl(convert: &GodotConvert) -> TokenStream {
-    use super::data_models::ConvertType as Data;
-    use super::data_models::ViaType;
-
-    match &convert.convert_type {
-        Data::NewType { field } => {
-            let ty = &field.ty;
-            quote! {
-                <#ty as ::godot::register::property::Var>::var_hint()
-            }
-        }
-        Data::Enum { variants, via } => {
-            let hint_string = match via {
-                ViaType::GString { .. } => variants.to_string_hint(),
-                ViaType::Int { .. } => variants.to_int_hint(),
-            };
-
-            quote! {
-                ::godot::meta::PropertyHintInfo {
-                    hint: ::godot::global::PropertyHint::ENUM,
-                    hint_string: ::godot::builtin::GString::from(#hint_string),
-                }
-            }
-        }
-    }
 }

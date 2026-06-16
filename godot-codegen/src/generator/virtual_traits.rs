@@ -5,6 +5,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::fmt::Write;
+
+use proc_macro2::{Ident, TokenStream};
+use quote::quote;
+
 use crate::context::Context;
 use crate::generator::functions_common::FnCode;
 use crate::generator::{docs, functions_common};
@@ -13,9 +18,6 @@ use crate::models::domain::{
 };
 use crate::special_cases;
 use crate::util::ident;
-use proc_macro2::{Ident, TokenStream};
-use quote::quote;
-use std::fmt::Write;
 
 pub fn make_virtual_methods_trait(
     class: &Class,
@@ -114,7 +116,7 @@ fn make_special_virtual_methods(notification_enum_name: &Ident) -> TokenStream {
         ///
         /// See also in Godot docs:
         /// * [`Object::_get`](https://docs.godotengine.org/en/stable/classes/class_object.html#class-object-private-method-get).
-        fn get_property(&self, property: StringName) -> Option<Variant> {
+        fn on_get(&self, property: StringName) -> Option<Variant> {
             unimplemented!()
         }
 
@@ -125,7 +127,7 @@ fn make_special_virtual_methods(notification_enum_name: &Ident) -> TokenStream {
         ///
         /// See also in Godot docs:
         /// * [`Object::_set`](https://docs.godotengine.org/en/stable/classes/class_object.html#class-object-private-method-set).
-        fn set_property(&mut self, property: StringName, value: Variant) -> bool {
+        fn on_set(&mut self, property: StringName, value: Variant) -> bool {
             unimplemented!()
         }
 
@@ -137,19 +139,18 @@ fn make_special_virtual_methods(notification_enum_name: &Ident) -> TokenStream {
         /// See also in Godot docs:
         /// * [`Object::_get_property_list`](https://docs.godotengine.org/en/latest/classes/class_object.html#class-object-private-method-get-property-list)
         #[cfg(since_api = "4.3")]
-        fn get_property_list(&mut self) -> Vec<crate::meta::PropertyInfo> {
+        fn on_get_property_list(&mut self) -> Vec<crate::registry::info::PropertyInfo> {
             unimplemented!()
         }
 
         /// Called whenever Godot retrieves value of property. Allows to customize existing properties.
-        /// Every property info goes through this method, except properties **added** with `get_property_list()`.
+        /// Every property info goes through this method, except properties **added** with `on_get_property_list()`.
         ///
         /// Exposed `property` here is a shared mutable reference obtained (and returned to) from Godot.
         ///
         /// See also in the Godot docs:
         /// * [`Object::_validate_property`](https://docs.godotengine.org/en/stable/classes/class_object.html#class-object-private-method-validate-property)
-        #[cfg(since_api = "4.2")]
-        fn validate_property(&self, property: &mut crate::meta::PropertyInfo) {
+        fn on_validate_property(&self, property: &mut crate::registry::info::PropertyInfo) {
             unimplemented!()
         }
 
@@ -166,7 +167,7 @@ fn make_special_virtual_methods(notification_enum_name: &Ident) -> TokenStream {
         /// [`Object::_property_get_revert`]: https://docs.godotengine.org/en/latest/classes/class_object.html#class-object-private-method-property-get-revert
         /// [`Object::_property_can_revert`]: https://docs.godotengine.org/en/latest/classes/class_object.html#class-object-private-method-property-can-revert
         #[doc(alias = "property_can_revert")]
-        fn property_get_revert(&self, property: StringName) -> Option<Variant> {
+        fn on_property_get_revert(&self, property: StringName) -> Option<Variant> {
             unimplemented!()
         }
     }
@@ -183,6 +184,7 @@ fn make_virtual_method(
     // Possibly change behavior of required/optional-ness of the virtual method in derived classes.
     // It's also possible that it's removed, which would not declare it at all in the `I*` trait.
     let is_virtual_required = match presence {
+        // `Inherit` now takes JSON again as source-of-truth; might need to consider if any base virtual method has `Override` or `Remove`?
         VirtualMethodPresence::Inherit => method.is_virtual_required(),
         VirtualMethodPresence::Override { is_required } => is_required,
         VirtualMethodPresence::Remove => return None,
@@ -202,7 +204,6 @@ fn make_virtual_method(
             is_virtual_required,
             is_varcall_fallible: true,
         },
-        None,
         &TokenStream::new(),
     );
 
@@ -218,8 +219,12 @@ fn make_all_virtual_methods(
     let mut all_tokens = TokenStream::new();
 
     for method in class.methods.iter() {
-        // Assumes that inner function filters on is_virtual.
-        if let Some(tokens) = make_virtual_method(method, VirtualMethodPresence::Inherit) {
+        // Assumes that inner function filters on `is_virtual`.
+        // Also check for presence overrides on the class' own virtual methods (not just inherited ones).
+        let presence =
+            special_cases::get_derived_virtual_method_presence(class.name(), method.godot_name());
+
+        if let Some(tokens) = make_virtual_method(method, presence) {
             all_tokens.extend(tokens);
         }
     }
@@ -278,11 +283,7 @@ fn make_all_virtual_methods(
 }
 
 fn format_required(is_required: bool) -> &'static str {
-    if is_required {
-        "required"
-    } else {
-        "optional"
-    }
+    if is_required { "required" } else { "optional" }
 }
 
 fn format_method_name(method: &ClassMethod) -> &str {

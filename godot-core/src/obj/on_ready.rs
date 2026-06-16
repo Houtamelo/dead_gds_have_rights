@@ -5,13 +5,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::builtin::{GString, NodePath};
-use crate::classes::{Node, Resource};
-use crate::meta::{arg_into_owned, AsArg, GodotConvert};
-use crate::obj::{Gd, Inherits};
-use crate::registry::property::Var;
 use std::fmt::{self, Debug, Formatter};
 use std::mem;
+
+use crate::builtin::{GString, NodePath};
+use crate::classes::{Node, Resource};
+use crate::meta::shape::GodotShape;
+use crate::meta::{AsArg, FromGodot, GodotConvert, arg_into_owned};
+use crate::obj::{Gd, Inherits};
+use crate::registry::property::Var;
 
 /// Ergonomic late-initialization container with `ready()` support.
 ///
@@ -103,7 +105,7 @@ use std::mem;
 /// impl INode for MyClass {
 ///     fn ready(&mut self) {
 ///        // self.node is now ready with the node found at path `ChildPath`.
-///        assert_eq!(self.auto.get_name(), "ChildPath".into());
+///        assert_eq!(self.auto.get_name(), "ChildPath");
 ///
 ///        // self.manual needs to be initialized manually.
 ///        self.manual.init(22);
@@ -206,12 +208,8 @@ impl<T> OnReady<T> {
             InitState::ManualUninitialized => {
                 self.state = InitState::Initialized { value };
             }
-            InitState::AutoPrepared { .. } => {
+            InitState::AutoPrepared { .. } | InitState::AutoInitializationFailed => {
                 panic!("cannot call init() on auto-initialized OnReady objects")
-            }
-            InitState::AutoInitializing => {
-                // SAFETY: Loading is ephemeral state that is only set in init_auto() and immediately overwritten.
-                unsafe { std::hint::unreachable_unchecked() }
             }
             InitState::Initialized { .. } => {
                 panic!("already initialized; did you call init() more than once?")
@@ -222,22 +220,22 @@ impl<T> OnReady<T> {
     /// Runs initialization.
     ///
     /// # Panics
-    /// If the value is already initialized.
+    /// - If the value is already initialized.
+    /// - If previous auto initialization failed.
     pub(crate) fn init_auto(&mut self, base: &Gd<Node>) {
         // Two branches needed, because mem::replace() could accidentally overwrite an already initialized value.
         match &self.state {
             InitState::ManualUninitialized => return, // skipped
             InitState::AutoPrepared { .. } => {}      // handled below
-            InitState::AutoInitializing => {
-                // SAFETY: Loading is ephemeral state that is only set below and immediately overwritten.
-                unsafe { std::hint::unreachable_unchecked() }
+            InitState::AutoInitializationFailed => {
+                panic!("OnReady automatic value initialization has already failed")
             }
             InitState::Initialized { .. } => panic!("OnReady object already initialized"),
         };
 
-        // Temporarily replace with dummy state, as it's not possible to take ownership of the initializer closure otherwise.
+        // Temporarily replace with AutoInitializationFailed state which will be left in iff initialization fails.
         let InitState::AutoPrepared { initializer } =
-            mem::replace(&mut self.state, InitState::AutoInitializing)
+            mem::replace(&mut self.state, InitState::AutoInitializationFailed)
         else {
             // SAFETY: condition checked above.
             unsafe { std::hint::unreachable_unchecked() }
@@ -266,7 +264,9 @@ impl<T> std::ops::Deref for OnReady<T> {
             InitState::AutoPrepared { .. } => {
                 panic!("OnReady automatic value uninitialized, is only available in ready()")
             }
-            InitState::AutoInitializing => unreachable!(),
+            InitState::AutoInitializationFailed => {
+                panic!("OnReady automatic value initialization failed")
+            }
             InitState::Initialized { value } => value,
         }
     }
@@ -283,24 +283,47 @@ impl<T> std::ops::DerefMut for OnReady<T> {
             InitState::ManualUninitialized | InitState::AutoPrepared { .. } => {
                 panic!("value not yet initialized")
             }
-            InitState::AutoInitializing => unreachable!(),
+            InitState::AutoInitializationFailed => {
+                panic!("OnReady automatic value initialization failed")
+            }
         }
     }
 }
 
 impl<T: GodotConvert> GodotConvert for OnReady<T> {
     type Via = T::Via;
+
+    fn godot_shape() -> GodotShape {
+        T::godot_shape()
+    }
 }
 
-impl<T: Var> Var for OnReady<T> {
-    fn get_property(&self) -> Self::Via {
-        let deref: &T = self;
-        deref.get_property()
+impl<T> Var for OnReady<T>
+where
+    T: Var<PubType = T> + FromGodot,
+{
+    type PubType = T;
+
+    // All following functions: Deref/DerefMut panics if not initialized, preserving the "single init point" invariant.
+
+    fn var_get(field: &Self) -> Self::Via {
+        let deref: &T = field;
+        T::var_get(deref)
     }
 
-    fn set_property(&mut self, value: Self::Via) {
-        let deref: &mut T = self;
-        deref.set_property(value);
+    fn var_set(field: &mut Self, value: Self::Via) {
+        let deref: &mut T = field;
+        T::var_set(deref, value);
+    }
+
+    fn var_pub_get(field: &Self) -> Self::PubType {
+        let deref: &T = field;
+        T::var_pub_get(deref)
+    }
+
+    fn var_pub_set(field: &mut Self, value: Self::PubType) {
+        let deref: &mut T = field;
+        T::var_pub_set(deref, value);
     }
 }
 
@@ -312,7 +335,7 @@ type InitFn<T> = dyn FnOnce(&Gd<Node>) -> T;
 enum InitState<T> {
     ManualUninitialized,
     AutoPrepared { initializer: Box<InitFn<T>> },
-    AutoInitializing, // needed because state cannot be empty
+    AutoInitializationFailed,
     Initialized { value: T },
 }
 
@@ -323,7 +346,9 @@ impl<T: Debug> Debug for InitState<T> {
             InitState::AutoPrepared { .. } => {
                 fmt.debug_struct("AutoPrepared").finish_non_exhaustive()
             }
-            InitState::AutoInitializing => fmt.debug_struct("AutoInitializing").finish(),
+            InitState::AutoInitializationFailed => {
+                fmt.debug_struct("AutoInitializationFailed").finish()
+            }
             InitState::Initialized { value } => fmt
                 .debug_struct("Initialized")
                 .field("value", value)

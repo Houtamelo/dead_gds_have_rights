@@ -5,12 +5,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use proc_macro2::{Ident, TokenStream};
+use quote::quote;
+
 use crate::context::Context;
 use crate::models::domain::TyName;
 use crate::models::json::JsonClassConstant;
 use crate::util;
-use proc_macro2::{Ident, TokenStream};
-use quote::quote;
 
 pub fn make_notify_methods(class_name: &TyName, ctx: &mut Context) -> TokenStream {
     // Note: there are two more methods, but only from Node downwards, not from Object:
@@ -76,8 +77,6 @@ pub fn make_notification_enum(
             all_constants.extend(constants.iter().cloned());
         }
     }
-
-    workaround_constant_collision(&mut all_constants);
 
     let enum_name = ctx.notification_enum_name(class_name).name;
     let doc_str = format!(
@@ -146,19 +145,4 @@ pub fn make_notification_enum(
 /// Tries to interpret the constant as a notification one, and transforms it to a Rust identifier on success.
 pub fn try_to_notification(constant: &JsonClassConstant) -> Option<Ident> {
     constant.name.strip_prefix("NOTIFICATION_").map(util::ident) // used to be conv::shout_to_pascal(s)
-}
-
-// ----------------------------------------------------------------------------------------------------------------------------------------------
-// Implementation
-
-/// Workaround for Godot bug https://github.com/godotengine/godot/issues/75839, fixed in 4.2.
-///
-/// Godot has a collision for two notification constants (DRAW, NODE_CACHE_REQUESTED) in the same inheritance branch (as of 4.0.2).
-/// This cannot be represented in a Rust enum, so we merge the two constants into a single enumerator.
-fn workaround_constant_collision(all_constants: &mut Vec<(Ident, i32)>) {
-    // This constant has never been used by the engine.
-    #[cfg(before_api = "4.2")]
-    all_constants.retain(|(constant_name, _)| constant_name != "NODE_RECACHE_REQUESTED");
-
-    let _ = &all_constants; // unused warning
 }

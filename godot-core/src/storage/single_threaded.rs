@@ -7,11 +7,10 @@
 
 use std::cell;
 
-#[cfg(not(feature = "experimental-threads"))]
-use godot_cell::panicking::{GdCell, InaccessibleGuard, MutGuard, RefGuard};
-
 #[cfg(feature = "experimental-threads")]
 use godot_cell::blocking::{GdCell, InaccessibleGuard, MutGuard, RefGuard};
+#[cfg(not(feature = "experimental-threads"))]
+use godot_cell::panicking::{GdCell, InaccessibleGuard, MutGuard, RefGuard};
 
 use crate::obj::{Base, GodotClass};
 use crate::storage::{DebugBorrowTracker, Lifecycle, Storage, StorageRefCounted};
@@ -20,9 +19,8 @@ pub struct InstanceStorage<T: GodotClass> {
     user_instance: GdCell<T>,
     pub(super) base: Base<T::Base>,
 
-    // Declared after `user_instance`, is dropped last
+    // Declared after `user_instance`, is dropped last.
     pub(super) lifecycle: cell::Cell<Lifecycle>,
-    godot_ref_count: cell::Cell<u32>,
 
     // No-op in Release mode.
     borrow_tracker: DebugBorrowTracker,
@@ -49,7 +47,6 @@ unsafe impl<T: GodotClass> Storage for InstanceStorage<T> {
             user_instance: GdCell::new(user_instance),
             base,
             lifecycle: cell::Cell::new(Lifecycle::Alive),
-            godot_ref_count: cell::Cell::new(1),
             borrow_tracker: DebugBorrowTracker::new(),
         }
     }
@@ -101,20 +98,18 @@ unsafe impl<T: GodotClass> Storage for InstanceStorage<T> {
 }
 
 impl<T: GodotClass> StorageRefCounted for InstanceStorage<T> {
-    fn godot_ref_count(&self) -> u32 {
-        self.godot_ref_count.get()
-    }
-
     fn on_inc_ref(&self) {
-        let refc = self.godot_ref_count.get() + 1;
-        self.godot_ref_count.set(refc);
+        // Note: on_inc_ref() and on_dec_ref() do not track extra strong references from Base::to_init_gd().
+        // See https://github.com/godot-rust/gdext/pull/1273 for code that had it.
 
         super::log_inc_ref(self);
     }
 
     fn on_dec_ref(&self) {
-        let refc = self.godot_ref_count.get() - 1;
-        self.godot_ref_count.set(refc);
+        // IMPORTANT: it is too late here to perform dec-ref operations on the Base (for "surplus" strong references).
+        // This callback is only invoked in the C++ condition `if (rc_val <= 1 /* higher is not relevant */)` -- see Godot ref_counted.cpp.
+        // The T <-> RefCounted hierarchical relation is usually already broken up at this point, and further dec-ref may bring the count
+        // down to 0.
 
         super::log_dec_ref(self);
     }

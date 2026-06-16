@@ -5,16 +5,16 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::builtin::{real, GString, PackedByteArray, PackedStringArray, Variant};
-use crate::classes::file_access::{CompressionMode, ModeFlags};
-use crate::classes::FileAccess;
-use crate::global::Error;
-use crate::meta::error::IoError;
-use crate::meta::{arg_into_ref, AsArg};
-use crate::obj::Gd;
-
 use std::cmp;
 use std::io::{BufRead, ErrorKind, Read, Seek, SeekFrom, Write};
+
+use crate::builtin::{GString, PackedByteArray, PackedStringArray, Variant, real};
+use crate::classes::FileAccess;
+use crate::classes::file_access::{CompressionMode, ModeFlags};
+use crate::global::Error;
+use crate::meta::error::IoError;
+use crate::meta::{AsArg, arg_into_ref};
+use crate::obj::Gd;
 
 /// Open a file for reading or writing.
 ///
@@ -325,16 +325,16 @@ impl GFile {
 
     /// Reads the whole file as UTF-8 [`GString`].
     ///
-    /// If `skip_cr` is set to `true`, carriage return (`'\r'`) will be ignored, and only line feed (`'\n'`) indicates a new line.
-    ///
     /// To retrieve the file as [`String`] instead, use the [`Read`] trait method
     /// [`read_to_string()`](https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_string).
     ///
     /// Underlying Godot method:
     /// [`FileAccess::get_as_text`](https://docs.godotengine.org/en/stable/classes/class_fileaccess.html#class-fileaccess-method-get-as-text).
+    /// Note that Godot 4.6 removed `skip_cr` parameter in [PR #110867](https://github.com/godotengine/godot/pull/110867). This high-level
+    /// API does not provide it for any version, to avoid case differentiation.
     #[doc(alias = "get_as_text")]
-    pub fn read_as_gstring_entire(&mut self, skip_cr: bool) -> std::io::Result<GString> {
-        let val = self.fa.get_as_text_ex().skip_cr(skip_cr).done();
+    pub fn read_as_gstring_entire(&mut self) -> std::io::Result<GString> {
+        let val = self.fa.get_as_text();
         self.check_error()?;
         Ok(val)
     }
@@ -747,7 +747,7 @@ impl Write for GFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.pack_into_write_buffer(buf);
         self.fa
-            .store_buffer(&self.write_buffer.subarray(0, buf.len()));
+            .store_buffer(&self.write_buffer.subarray(0..buf.len()));
         self.clear_file_length();
         self.check_error()?;
 

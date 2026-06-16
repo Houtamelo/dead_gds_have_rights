@@ -5,18 +5,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use godot_ffi as sys;
 use std::cell::Cell;
+use std::ops::{Deref, DerefMut};
 use std::ptr;
-
-#[cfg(not(feature = "experimental-threads"))]
-use godot_cell::panicking::{InaccessibleGuard, MutGuard, RefGuard};
 
 #[cfg(feature = "experimental-threads")]
 use godot_cell::blocking::{InaccessibleGuard, MutGuard, RefGuard};
+#[cfg(not(feature = "experimental-threads"))]
+use godot_cell::panicking::{InaccessibleGuard, MutGuard, RefGuard};
+use godot_ffi as sys;
 
 use crate::godot_error;
-use crate::obj::{Base, Gd, GodotClass, Inherits};
+use crate::obj::{Base, Gd, GodotClass, Inherits, Singleton};
 use crate::storage::log_pre_drop;
 
 #[derive(Copy, Clone, Debug)]
@@ -120,7 +120,7 @@ pub unsafe trait Storage {
     where
         Self::Instance: Inherits<<Self::Instance as GodotClass>::Base>,
     {
-        self.base().to_gd().cast()
+        self.base().__constructed_gd().cast()
     }
 
     /// Puts self onto the heap and returns a pointer to this new heap-allocation.
@@ -154,9 +154,6 @@ pub unsafe trait Storage {
 
 /// An internal trait for keeping track of reference counts for a storage.
 pub(crate) trait StorageRefCounted: Storage {
-    #[allow(dead_code)] // used in `debug-log` feature. Don't micromanage.
-    fn godot_ref_count(&self) -> u32;
-
     fn on_inc_ref(&self);
 
     fn on_dec_ref(&self);
@@ -173,6 +170,89 @@ const fn _assert_implements_storage<T: Storage + StorageRefCounted>() {}
 const _INSTANCE_STORAGE_IMPLEMENTS_STORAGE: () =
     _assert_implements_storage::<InstanceStorage<crate::classes::Object>>();
 
+/// Wrapper to handle multiple receivers type, without exposing the Storage itself.
+#[doc(hidden)]
+pub struct VirtualMethodReceiver<'a, T: GodotClass> {
+    inner: VirtualMethodReceiverInner<'a, T>,
+}
+
+enum VirtualMethodReceiverInner<'a, T: GodotClass> {
+    /// &self.
+    Ref(RefGuard<'a, T>),
+    /// &mut self.
+    Mut(MutGuard<'a, T>),
+    /// this: Gd<Self>.
+    GdSelf(Gd<T>),
+    /// Implementation detail – required to swap the values.
+    Uninit,
+}
+
+impl<'a, T: GodotClass> VirtualMethodReceiver<'a, T> {
+    pub fn recv_gd(mut self) -> Gd<T> {
+        match std::mem::replace(&mut self.inner, VirtualMethodReceiverInner::Uninit) {
+            VirtualMethodReceiverInner::GdSelf(instance) => instance,
+            _ => panic!("Tried to use Gd<Self> receiver for method which doesn't accept it."),
+        }
+    }
+
+    pub fn recv_self(mut self) -> impl Deref<Target = T> + use<'a, T> {
+        match std::mem::replace(&mut self.inner, VirtualMethodReceiverInner::Uninit) {
+            VirtualMethodReceiverInner::Ref(instance) => instance,
+            _ => panic!("Tried to use &self receiver for method which doesn't accept it."),
+        }
+    }
+
+    pub fn recv_self_mut(mut self) -> impl DerefMut<Target = T> + use<'a, T> {
+        match std::mem::replace(&mut self.inner, VirtualMethodReceiverInner::Uninit) {
+            VirtualMethodReceiverInner::Mut(instance) => instance,
+            _ => panic!("Tried to use &mut self receiver for method which doesn't accept it."),
+        }
+    }
+}
+
+// Marker structs.
+// Used to extract proper type from storage and pass it to public API while defined as an associated item on the trait (`T::Recv::instance(storage)`).
+
+#[doc(hidden)]
+pub enum RecvRef {}
+#[doc(hidden)]
+pub enum RecvMut {}
+#[doc(hidden)]
+pub enum RecvGdSelf {}
+
+#[doc(hidden)]
+pub trait IntoVirtualMethodReceiver<T: GodotClass> {
+    #[doc(hidden)]
+    fn instance<'a, 'b: 'a>(storage: &'b InstanceStorage<T>) -> VirtualMethodReceiver<'a, T>;
+}
+
+impl<T: GodotClass> IntoVirtualMethodReceiver<T> for RecvRef {
+    fn instance<'a, 'b: 'a>(storage: &'b InstanceStorage<T>) -> VirtualMethodReceiver<'a, T> {
+        VirtualMethodReceiver {
+            inner: VirtualMethodReceiverInner::Ref(storage.get()),
+        }
+    }
+}
+
+impl<T: GodotClass> IntoVirtualMethodReceiver<T> for RecvMut {
+    fn instance<'a, 'b: 'a>(storage: &'b InstanceStorage<T>) -> VirtualMethodReceiver<'a, T> {
+        VirtualMethodReceiver {
+            inner: VirtualMethodReceiverInner::Mut(storage.get_mut()),
+        }
+    }
+}
+
+impl<T> IntoVirtualMethodReceiver<T> for RecvGdSelf
+where
+    T: Inherits<<T as GodotClass>::Base>,
+{
+    fn instance<'a, 'b: 'a>(storage: &'b InstanceStorage<T>) -> VirtualMethodReceiver<'a, T> {
+        VirtualMethodReceiver {
+            inner: VirtualMethodReceiverInner::GdSelf(storage.get_gd()),
+        }
+    }
+}
+
 /// Interprets the opaque pointer as pointing to `InstanceStorage<T>`.
 ///
 /// Note: returns reference with unbounded lifetime; intended for local usage
@@ -184,13 +264,15 @@ const _INSTANCE_STORAGE_IMPLEMENTS_STORAGE: () =
 pub unsafe fn as_storage<'u, T: GodotClass>(
     instance_ptr: sys::GDExtensionClassInstancePtr,
 ) -> &'u InstanceStorage<T> {
-    &*(instance_ptr as *mut InstanceStorage<T>)
+    unsafe { &*(instance_ptr as *mut InstanceStorage<T>) }
 }
 
 /// # Safety
 /// `instance_ptr` is assumed to point to a valid instance. This function must only be invoked once for a pointer.
 pub unsafe fn destroy_storage<T: GodotClass>(instance_ptr: sys::GDExtensionClassInstancePtr) {
     let raw = instance_ptr as *mut InstanceStorage<T>;
+    // SAFETY: valid pointer, only invoked by one caller at a time.
+    let storage = unsafe { &mut *raw };
 
     // We cannot panic here, since this code is invoked from a C callback. Panicking would mean unwinding into C code, which is UB.
     // We have the following options:
@@ -207,21 +289,21 @@ pub unsafe fn destroy_storage<T: GodotClass>(instance_ptr: sys::GDExtensionClass
     //    - Letting Gd<T> and InstanceStorage<T> know about this specific object state and panicking in the next Rust call might be an option,
     //      but we still can't control direct access to the T.
     //
-    // For now we choose option 2 in Debug mode, and 4 in Release.
+    // For now we choose option 2 in strict+balanced levels, and 4 in disengaged level.
     let mut leak_rust_object = false;
-    if (*raw).is_bound() {
+    if storage.is_bound() {
         let error = format!(
             "Destroyed an object from Godot side, while a bind() or bind_mut() call was active.\n  \
             This is a bug in your code that may cause UB and logic errors. Make sure that objects are not\n  \
             destroyed while you still hold a Rust reference to them, or use Gd::free() which is safe.\n  \
             object: {:?}",
-            (*raw).base()
+            storage.base()
         );
 
-        // In Debug mode, crash which may trigger breakpoint.
-        // In Release mode, leak player object (Godot philosophy: don't crash if somehow avoidable). Likely leads to follow-up issues.
-        if cfg!(debug_assertions) {
-            let error = crate::builtin::GString::from(error);
+        // In strict+balanced level, crash which may trigger breakpoint.
+        // In disengaged level, leak player object (Godot philosophy: don't crash if somehow avoidable). Likely leads to follow-up issues.
+        if cfg!(safeguards_balanced) {
+            let error = crate::builtin::GString::from(&error);
             crate::classes::Os::singleton().crash(&error);
         } else {
             leak_rust_object = true;
@@ -236,7 +318,7 @@ pub unsafe fn destroy_storage<T: GodotClass>(instance_ptr: sys::GDExtensionClass
         //
         // Therefore, we can safely drop this storage as per the safety contract of `Storage`. Which we know
         // `InstanceStorage<T>` implements because of `_INSTANCE_STORAGE_IMPLEMENTS_STORAGE`.
-        let _drop = unsafe { Box::from_raw(raw) };
+        let _drop = unsafe { Box::from_raw(storage) };
     }
 }
 

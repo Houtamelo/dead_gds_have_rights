@@ -27,13 +27,18 @@
 
 #![allow(clippy::match_like_matches_macro)] // if there is only one rule
 
+use std::borrow::Cow;
+
+use proc_macro2::Ident;
+
+use crate::Context;
 use crate::conv::to_enum_type_uncached;
-use crate::models::domain::{Enum, RustTy, TyName, VirtualMethodPresence};
+use crate::models::domain::{
+    ClassCodegenLevel, Enum, EnumReplacements, RustTy, TyName, VirtualMethodPresence,
+};
 use crate::models::json::{JsonBuiltinMethod, JsonClassMethod, JsonSignal, JsonUtilityFunction};
 use crate::special_cases::codegen_special_cases;
 use crate::util::option_as_slice;
-use crate::Context;
-use proc_macro2::Ident;
 
 #[rustfmt::skip]
 pub fn is_class_method_deleted(class_name: &TyName, method: &JsonClassMethod, ctx: &mut Context) -> bool {
@@ -82,6 +87,24 @@ pub fn is_class_method_deleted(class_name: &TyName, method: &JsonClassMethod, ct
     }
 }
 
+/// Returns `Some(message)` if a class method deprecated, `None` otherwise.
+#[rustfmt::skip]
+pub fn get_class_method_deprecation(class_name: &TyName, method: &JsonClassMethod) -> Option<&'static str> {
+    let deprecation_msg = match (class_name.godot_ty.as_str(), method.name.as_str()) {
+        | ("Node", "duplicate")
+        | ("Node", "duplicate_ex") => "Use `Gd::duplicate_node()` or `Gd::duplicate_node_ex()`.",
+
+        | ("Resource", "duplicate")
+        | ("Resource", "duplicate_ex")
+        | ("Resource", "duplicate_deep")
+        | ("Resource", "duplicate_deep_ex") => "Use `Gd::duplicate_resource()` or `Gd::duplicate_resource_ex()`.",
+
+        _ => return None,
+    };
+    
+    Some(deprecation_msg)
+}
+
 pub fn is_class_deleted(class_name: &TyName) -> bool {
     codegen_special_cases::is_class_excluded(&class_name.godot_ty)
         || is_godot_type_deleted(&class_name.godot_ty)
@@ -92,6 +115,23 @@ pub fn is_native_struct_excluded(ty: &str) -> bool {
     codegen_special_cases::is_native_struct_excluded(ty)
 }
 
+/// Overrides the definition string for native structures, if they have incorrect definitions in the JSON.
+#[rustfmt::skip]
+pub fn get_native_struct_definition(struct_name: &str) -> Option<&'static str> {
+    match struct_name {
+        // Glyph struct definition was corrected in Godot 4.6 to include missing `span_index` field.
+        // See https://github.com/godotengine/godot/pull/116751 (earlier https://github.com/godotengine/godot/pull/108369).
+        // #[cfg(before_api = "4.6")] // TODO(v0.6): enable this once upstream PR is merged.
+        "Glyph" => Some(
+            "int start = -1;int end = -1;uint8_t count = 0;uint8_t repeat = 1;uint16_t flags = 0;float x_off = 0.f;float y_off = 0.f;\
+            float advance = 0.f;RID font_rid;int font_size = 0;int32_t index = 0;int span_index = -1"
+        ),
+
+        _ => None,
+    }
+}
+
+#[rustfmt::skip]
 pub fn is_godot_type_deleted(godot_ty: &str) -> bool {
     // Note: parameter can be a class or builtin name, but also something like "enum::AESContext.Mode".
 
@@ -100,7 +140,7 @@ pub fn is_godot_type_deleted(godot_ty: &str) -> bool {
         return true;
     }
 
-    // OpenXR has not been available for macOS before 4.2.
+    // OpenXR has not been available for "macos" before 4.2 (now no longer supported by godot-rust).
     // See e.g. https://github.com/GodotVR/godot-xr-tools/issues/479.
     // OpenXR is also not available on iOS and Web: https://github.com/godotengine/godot/blob/13ba673c42951fd7cfa6fd8a7f25ede7e9ad92bb/modules/openxr/config.py#L2
     // Do not hardcode a list of OpenXR classes, as more may be added in future Godot versions; instead use prefix.
@@ -108,46 +148,30 @@ pub fn is_godot_type_deleted(godot_ty: &str) -> bool {
         let target_os = std::env::var("CARGO_CFG_TARGET_OS");
         match target_os.as_deref() {
             Ok("ios") | Ok("emscripten") => return true,
-            Ok("macos") => {
-                #[cfg(before_api = "4.2")]
-                return true;
-            }
             _ => {}
         }
     }
 
+    // cfg!(target_os = "...") are relatively new and need more testing. If causing problems, revert to `true` (deleted) for now.
+    // TODO(v0.6): for doc generation, consider moving the target-filters to the generated code, so that API docs still show the classes.
     match godot_ty {
-        // Hardcoded cases that are not accessible.
         // Only on Android.
-        | "JavaClassWrapper"
-        | "JNISingleton"
         | "JavaClass"
-        // Only on WASM.
+        | "JavaClassWrapper"
+        | "JavaObject"
+        | "JNISingleton"
+        => !cfg!(target_os = "android"),
+
+        // Only on Wasm.
         | "JavaScriptBridge"
         | "JavaScriptObject"
+        => !cfg!(target_os = "emscripten"),
 
         // Thread APIs.
         | "Thread"
         | "Mutex"
         | "Semaphore"
-
-        // Internal classes that were removed in https://github.com/godotengine/godot/pull/80852, but are still available for API < 4.2.
-        | "FramebufferCacheRD"
-        | "GDScriptEditorTranslationParserPlugin"
-        | "GDScriptNativeClass"
-        | "GLTFDocumentExtensionPhysics"
-        | "GLTFDocumentExtensionTextureWebP"
-        | "GodotPhysicsServer2D"
-        | "GodotPhysicsServer3D"
-        | "IPUnix"
-        | "MovieWriterMJPEG"
-        | "MovieWriterPNGWAV"
-        | "ResourceFormatImporterSaver"
         => true,
-
-        // Previously loaded lazily; in 4.2 it loads at the Scene level: https://github.com/godotengine/godot/pull/81305
-        | "ThemeDB"
-        => cfg!(before_api = "4.2"),
 
         // Reintroduced in 4.3: https://github.com/godotengine/godot/pull/80214
         | "UniformSetCacheRD"
@@ -155,6 +179,12 @@ pub fn is_godot_type_deleted(godot_ty: &str) -> bool {
 
         _ => false
     }
+
+    // Older special cases:
+    // * ThemeDB was loaded lazily; from 4.2 it loads at the Scene level: https://github.com/godotengine/godot/pull/81305
+    // * Internal classes were accidentally exposed < 4.2: https://github.com/godotengine/godot/pull/80852: FramebufferCacheRD,
+    //   GDScriptEditorTranslationParserPlugin, GDScriptNativeClass, GLTFDocumentExtensionPhysics, GLTFDocumentExtensionTextureWebP,
+    //   GodotPhysicsServer2D, GodotPhysicsServer3D, IPUnix, MovieWriterMJPEG, MovieWriterPNGWAV, ResourceFormatImporterSaver
 }
 
 #[rustfmt::skip]
@@ -384,174 +414,213 @@ pub fn is_named_accessor_in_table(class_or_builtin_ty: &TyName, godot_method_nam
 ///
 /// Builtin class methods are all private by default, due to being declared in an `Inner*` struct. A separate mechanism is used
 /// to make them public, see [`is_builtin_method_exposed`].
+///
+/// This does not rename the method. For methods that are replaced with type-safe equivalents, use
+/// [`is_class_method_replaced_with_type_safe()`] instead.
 #[rustfmt::skip]
 pub fn is_method_private(class_or_builtin_ty: &TyName, godot_method_name: &str) -> bool {
+    if is_class_method_replaced_with_type_safe(class_or_builtin_ty, godot_method_name) {
+        return true;
+    }
+
     match (class_or_builtin_ty.godot_ty.as_str(), godot_method_name) {
         // Already covered by manual APIs
         | ("Object", "to_string")
+        | ("Object", "notification")
         | ("RefCounted", "init_ref")
         | ("RefCounted", "reference")
         | ("RefCounted", "unreference")
-        | ("Object", "notification")
 
         => true, _ => false
     }
 }
 
+/// Lists methods that are replaced with manual, more type-safe equivalents. See `type_safe_replacements.rs`.
+///
+/// See also [`get_class_method_enum_param_replacement()`] for a more automated approach specifically for enum parameters.
+#[rustfmt::skip]
+fn is_class_method_replaced_with_type_safe(class_ty: &TyName, godot_method_name: &str) -> bool {
+    match (class_ty.godot_ty.as_str(), godot_method_name) {
+        // Variant -> Option<Gd<Script>>
+        | ("Object", "get_script")
+        | ("Object", "set_script")
+
+        // u32 -> ConnectFlags
+        | ("Object", "connect")
+
+        // godot-rust provides optional + required APIs.
+        | ("Node", "get_tree")
+
+        // i32 -> CallGroupFlags
+        // Some of those (not the notifications) could be handled by automated enum replacement, but keeping them together is simpler.
+        | ("SceneTree", "call_group_flags")
+        | ("SceneTree", "notify_group")
+        | ("SceneTree", "notify_group_flags")
+        | ("SceneTree", "set_group_flags")
+
+        => true, _ => false
+    }
+}
+
+/// For a given class method, returns all integer parameters and return types that have a type-safe enum/bitfield replacement.
+///
+/// Returns a list of tuples `(param_name, enum_type, is_bitfield)`, for example `[("mode_flags", "FileAccess.ModeFlags", true)]`.
+/// Use empty string `""` as `param_name` to denote return type replacements, for example `[("", "Tree.DropModeFlags", true)]`.
+///
+/// The caller should verify that the parameters exist and are in fact of integer type.
+/// Type-unsafety like this is quite common in Godot and can be easily patched at the codegen level.
+/// See also [`is_class_method_replaced_with_type_safe()`] for hand-picked overrides.
+// #[rustfmt::skip]
+pub fn get_class_method_param_enum_replacement(
+    class_ty: &TyName,
+    godot_method_name: &str,
+) -> EnumReplacements {
+    let godot_class_name = class_ty.godot_ty.as_str();
+
+    // Notes on replacement mechanism:
+    // 1. Design is deliberately (class, method) => [(param, enum)] instead of (class, method, param) => enum,
+    //    because this will catch typos/renames in parameter names -- the call site can verify parameter existence.
+    // 2. Bitfield is explicitly specified because Godot's API JSON also contains "enum::" or "bitfield::" prefixes as part of the type,
+    //    and it would be annoying to resolve that information at the stage of domain mapping (depends on mapping of all enums).
+    // 3. Empty string "" refers to the return type.
+    // 4. Several "mask" type properties are not bitfields but indeed numeric (e.g. collision masks, light masks, ...).
+
+    // IMPORTANT: double-check that enum/bitfield classification is correct, or override it with is_enum_bitfield() below.
+    // Lots of Godot `is_bitfield` values are wrong.
+
+    match (godot_class_name, godot_method_name) {
+        ("CharFXTransform", "get_glyph_flags") => &[("", "TextServer.GraphemeFlag", true)],
+        ("CharFXTransform", "set_glyph_flags") => {
+            &[("glyph_flags", "TextServer.GraphemeFlag", true)]
+        }
+        ("CodeEdit", "add_code_completion_option") => {
+            &[("location", "CodeEdit.CodeCompletionLocation", false)]
+        }
+        #[cfg(before_api = "4.6")] // https://github.com/godotengine/godot/pull/114053.
+        ("FileAccess", "create_temp") => &[("mode_flags", "FileAccess.ModeFlags", true)],
+        ("GPUParticles2D", "emit_particle") => &[("flags", "GPUParticles2D.EmitFlags", true)],
+        ("GPUParticles3D", "emit_particle") => &[("flags", "GPUParticles3D.EmitFlags", true)],
+        ("Node", "duplicate") => &[("flags", "Node.DuplicateFlags", true)],
+        ("ProgressBar", "get_fill_mode") => &[("", "ProgressBar.FillMode", false)],
+        ("ProgressBar", "set_fill_mode") => &[("mode", "ProgressBar.FillMode", false)],
+        ("TextEdit", "search") => &[("flags", "TextEdit.SearchFlags", true)],
+        ("TextEdit", "set_search_flags") => &[("flags", "TextEdit.SearchFlags", true)],
+        ("TextureProgressBar", "get_fill_mode") => &[("", "TextureProgressBar.FillMode", false)],
+        ("TextureProgressBar", "set_fill_mode") => {
+            &[("mode", "TextureProgressBar.FillMode", false)]
+        }
+        ("Tree", "get_drop_mode_flags") => &[("", "Tree.DropModeFlags", true)],
+        ("Tree", "set_drop_mode_flags") => &[("flags", "Tree.DropModeFlags", true)],
+
+        _ => &[],
+    }
+
+    // TODO(v0.7): some Godot classes have loose constants (not proper enums) that act as bitfield flags, passed as `int` parameters.
+    // In addition to the method-param mapping above, such "quasi-bitfields" could be created based on class, e.g.:
+    //   "ClassName" => &[("TheBitfield", "PREFIX_")]
+    //
+    // Known cases:
+    // - EditorSceneFormatImporter.IMPORT_* (7 constants, values 1..64)
+    //   Used by GLTFDocument + FBXDocument methods: append_from_buffer, append_from_file, append_from_scene (param `flags`).
+    //   Note: FBXDocument inherits GLTFDocument, but the methods are exposed twice.
+    //
+    // - ENetPacketPeer.FLAG_* (FLAG_RELIABLE, FLAG_UNSEQUENCED, FLAG_UNRELIABLE_FRAGMENT)
+    //   Used by ENetPacketPeer::send (param `flags`).
+    //
+    // - RenderingServer.PARTICLES_EMIT_FLAG_* (5 constants, values 1..16)
+    //   Used by RenderingServer::particles_emit (param `emit_flags`).
+    //
+    // TileSetAtlasSource has bitfield-like constants (TRANSFORM_FLIP_H/V, TRANSFORM_TRANSPOSE), but those are OR'd into
+    // alternative tile IDs by the user, not passed as method parameters -- so they don't qualify here.
+}
+
+/// Returns whether a builtin method appears directly in the outer, public API (as opposed to private in `Inner*` structs).
+///
+/// For methods with default parameters, this also changes the signature to have an `*_ex` overload + `Ex*` builder struct. This is not done for
+/// inner methods by default, to save on code generation.
 #[rustfmt::skip]
 pub fn is_builtin_method_exposed(builtin_ty: &TyName, godot_method_name: &str) -> bool {
     match (builtin_ty.godot_ty.as_str(), godot_method_name) {
+        // GString/StringName shared methods.
+        | ("String" | "StringName", "begins_with")
+        | ("String" | "StringName", "bigrams")
+        | ("String" | "StringName", "bin_to_int")
+        | ("String" | "StringName", "c_escape")
+        | ("String" | "StringName", "c_unescape")
+        | ("String" | "StringName", "capitalize")
+        | ("String" | "StringName", "contains")
+        | ("String" | "StringName", "containsn")
+        | ("String" | "StringName", "dedent")
+        | ("String" | "StringName", "ends_with")
+        | ("String" | "StringName", "get_base_dir")
+        | ("String" | "StringName", "get_basename")
+        | ("String" | "StringName", "get_extension")
+        | ("String" | "StringName", "get_file")
+        | ("String" | "StringName", "hex_decode")
+        | ("String" | "StringName", "hex_to_int")
+        | ("String" | "StringName", "indent")
+        | ("String" | "StringName", "is_absolute_path")
+        | ("String" | "StringName", "is_empty")
+        | ("String" | "StringName", "is_relative_path")
+        | ("String" | "StringName", "is_subsequence_of")
+        | ("String" | "StringName", "is_subsequence_ofn")
+        | ("String" | "StringName", "is_valid_filename")
+        | ("String" | "StringName", "is_valid_float")
+        | ("String" | "StringName", "is_valid_hex_number")
+        | ("String" | "StringName", "is_valid_html_color")
+        | ("String" | "StringName", "is_valid_identifier")
+        | ("String" | "StringName", "is_valid_int")
+        | ("String" | "StringName", "is_valid_ip_address")
+        | ("String" | "StringName", "join")
+        | ("String" | "StringName", "json_escape")
+        | ("String" | "StringName", "left")
+        | ("String" | "StringName", "lstrip")
+        | ("String" | "StringName", "md5_buffer")
+        | ("String" | "StringName", "md5_text")
+        | ("String" | "StringName", "path_join")
+        | ("String" | "StringName", "repeat")
+        | ("String" | "StringName", "replace")
+        | ("String" | "StringName", "replacen")
+        | ("String" | "StringName", "reverse")
+        | ("String" | "StringName", "right")
+        | ("String" | "StringName", "rstrip")
+        | ("String" | "StringName", "sha1_buffer")
+        | ("String" | "StringName", "sha1_text")
+        | ("String" | "StringName", "sha256_buffer")
+        | ("String" | "StringName", "sha256_text")
+        | ("String" | "StringName", "similarity")
+        | ("String" | "StringName", "simplify_path")
+        | ("String" | "StringName", "split_floats")
+        | ("String" | "StringName", "strip_edges")
+        | ("String" | "StringName", "strip_escapes")
+        | ("String" | "StringName", "to_ascii_buffer")
+        | ("String" | "StringName", "to_camel_case")
+        | ("String" | "StringName", "to_float")
+        | ("String" | "StringName", "to_int")
+        | ("String" | "StringName", "to_lower")
+        | ("String" | "StringName", "to_pascal_case")
+        | ("String" | "StringName", "to_snake_case")
+        | ("String" | "StringName", "to_upper")
+        | ("String" | "StringName", "to_utf16_buffer")
+        | ("String" | "StringName", "to_utf32_buffer")
+        | ("String" | "StringName", "to_utf8_buffer")
+        | ("String" | "StringName", "to_wchar_buffer")
+        | ("String" | "StringName", "trim_prefix")
+        | ("String" | "StringName", "trim_suffix")
+        | ("String" | "StringName", "uri_decode")
+        | ("String" | "StringName", "uri_encode")
+        | ("String" | "StringName", "validate_filename")
+        | ("String" | "StringName", "validate_node_name")
+        | ("String" | "StringName", "xml_escape")
+        | ("String" | "StringName", "xml_unescape")
+
         // GString
-        | ("String", "begins_with")
-        | ("String", "ends_with")
-        | ("String", "is_subsequence_of")
-        | ("String", "is_subsequence_ofn")
-        | ("String", "bigrams")
-        | ("String", "similarity")
-        | ("String", "replace")
-        | ("String", "replacen")
-        | ("String", "repeat")
-        | ("String", "reverse")
-        | ("String", "capitalize")
-        | ("String", "to_camel_case")
-        | ("String", "to_pascal_case")
-        | ("String", "to_snake_case")
-        | ("String", "split_floats")
-        | ("String", "join")
-        | ("String", "to_upper")
-        | ("String", "to_lower")
-        | ("String", "left")
-        | ("String", "right")
-        | ("String", "strip_edges")
-        | ("String", "strip_escapes")
-        | ("String", "lstrip")
-        | ("String", "rstrip")
-        | ("String", "get_extension")
-        | ("String", "get_basename")
-        | ("String", "path_join")
-        | ("String", "indent")
-        | ("String", "dedent")
-        | ("String", "md5_text")
-        | ("String", "sha1_text")
-        | ("String", "sha256_text")
-        | ("String", "md5_buffer")
-        | ("String", "sha1_buffer")
-        | ("String", "sha256_buffer")
-        | ("String", "is_empty")
-        | ("String", "contains")
-        | ("String", "containsn")
-        | ("String", "is_absolute_path")
-        | ("String", "is_relative_path")
-        | ("String", "simplify_path")
-        | ("String", "get_base_dir")
-        | ("String", "get_file")
-        | ("String", "xml_escape")
-        | ("String", "xml_unescape")
-        | ("String", "uri_encode")
-        | ("String", "uri_decode")
-        | ("String", "c_escape")
-        | ("String", "c_unescape")
-        | ("String", "json_escape")
-        | ("String", "validate_node_name")
-        | ("String", "validate_filename")
-        | ("String", "is_valid_identifier")
-        | ("String", "is_valid_int")
-        | ("String", "is_valid_float")
-        | ("String", "is_valid_hex_number")
-        | ("String", "is_valid_html_color")
-        | ("String", "is_valid_ip_address")
-        | ("String", "is_valid_filename")
-        | ("String", "to_int")
-        | ("String", "to_float")
-        | ("String", "hex_to_int")
-        | ("String", "bin_to_int")
-        | ("String", "trim_prefix")
-        | ("String", "trim_suffix")
-        | ("String", "to_ascii_buffer")
-        | ("String", "to_utf8_buffer")
-        | ("String", "to_utf16_buffer")
-        | ("String", "to_utf32_buffer")
-        | ("String", "hex_decode")
-        | ("String", "to_wchar_buffer")
-        | ("String", "num_scientific")
-        | ("String", "num")
-        | ("String", "num_int64")
-        | ("String", "num_uint64")
         | ("String", "chr")
         | ("String", "humanize_size")
-
-        // StringName
-        | ("StringName", "begins_with")
-        | ("StringName", "ends_with")
-        | ("StringName", "is_subsequence_of")
-        | ("StringName", "is_subsequence_ofn")
-        | ("StringName", "bigrams")
-        | ("StringName", "similarity")
-        | ("StringName", "replace")
-        | ("StringName", "replacen")
-        | ("StringName", "repeat")
-        | ("StringName", "reverse")
-        | ("StringName", "capitalize")
-        | ("StringName", "to_camel_case")
-        | ("StringName", "to_pascal_case")
-        | ("StringName", "to_snake_case")
-        | ("StringName", "split_floats")
-        | ("StringName", "join")
-        | ("StringName", "to_upper")
-        | ("StringName", "to_lower")
-        | ("StringName", "left")
-        | ("StringName", "right")
-        | ("StringName", "strip_edges")
-        | ("StringName", "strip_escapes")
-        | ("StringName", "lstrip")
-        | ("StringName", "rstrip")
-        | ("StringName", "get_extension")
-        | ("StringName", "get_basename")
-        | ("StringName", "path_join")
-        | ("StringName", "indent")
-        | ("StringName", "dedent")
-        | ("StringName", "md5_text")
-        | ("StringName", "sha1_text")
-        | ("StringName", "sha256_text")
-        | ("StringName", "md5_buffer")
-        | ("StringName", "sha1_buffer")
-        | ("StringName", "sha256_buffer")
-        | ("StringName", "is_empty")
-        | ("StringName", "contains")
-        | ("StringName", "containsn")
-        | ("StringName", "is_absolute_path")
-        | ("StringName", "is_relative_path")
-        | ("StringName", "simplify_path")
-        | ("StringName", "get_base_dir")
-        | ("StringName", "get_file")
-        | ("StringName", "xml_escape")
-        | ("StringName", "xml_unescape")
-        | ("StringName", "uri_encode")
-        | ("StringName", "uri_decode")
-        | ("StringName", "c_escape")
-        | ("StringName", "c_unescape")
-        | ("StringName", "json_escape")
-        | ("StringName", "validate_node_name")
-        | ("StringName", "validate_filename")
-        | ("StringName", "is_valid_identifier")
-        | ("StringName", "is_valid_int")
-        | ("StringName", "is_valid_float")
-        | ("StringName", "is_valid_hex_number")
-        | ("StringName", "is_valid_html_color")
-        | ("StringName", "is_valid_ip_address")
-        | ("StringName", "is_valid_filename")
-        | ("StringName", "to_int")
-        | ("StringName", "to_float")
-        | ("StringName", "hex_to_int")
-        | ("StringName", "bin_to_int")
-        | ("StringName", "trim_prefix")
-        | ("StringName", "trim_suffix")
-        | ("StringName", "to_ascii_buffer")
-        | ("StringName", "to_utf8_buffer")
-        | ("StringName", "to_utf16_buffer")
-        | ("StringName", "to_utf32_buffer")
-        | ("StringName", "hex_decode")
-        | ("StringName", "to_wchar_buffer")
+        | ("String", "num")
+        | ("String", "num_int64")
+        | ("String", "num_scientific")
+        | ("String", "num_uint64")
 
         // NodePath
         | ("NodePath", "is_absolute")
@@ -576,31 +645,78 @@ pub fn is_builtin_method_exposed(builtin_ty: &TyName, godot_method_name: &str) -
         | ("PackedByteArray", "get_string_from_wchar")
         | ("PackedByteArray", "hex_encode")
 
-        // Vector2i
-        | ("Vector2i", "clampi")
-        | ("Vector2i", "distance_squared_to")
-        | ("Vector2i", "distance_to")
-        | ("Vector2i", "maxi")
-        | ("Vector2i", "mini")
-        | ("Vector2i", "snappedi")
+        // Basis
+        | ("Basis", "looking_at")
+        | ("Transform3D", "looking_at")
 
         => true, _ => false
     }
 }
 
 #[rustfmt::skip]
-pub fn is_method_excluded_from_default_params(class_name: Option<&TyName>, godot_method_name: &str) -> bool {
-    // None if global/utilities function
-    let class_name = class_name.map_or("", |ty| ty.godot_ty.as_str());
+pub fn is_method_excluded_from_default_params(class_or_builtin_ty: Option<&TyName>, godot_method_name: &str) -> bool {
+    // Utility functions: use "" string.
+    let class_name = class_or_builtin_ty.map_or("", |ty| ty.godot_ty.as_str());
+
+    // Private methods don't need to generate extra code for default extender machinery.
+    if let Some(ty) = class_or_builtin_ty
+        && is_method_private(ty, godot_method_name)
+    {
+        return true;
+    }
 
     match (class_name, godot_method_name) {
+        // Class exclusions.
         | ("Object", "notification")
 
-        => true, _ => false
+        // Builtin exclusions.
+        // Do not add methods here that aren't also part of is_builtin_method_exposed(). Methods on Inner* structs
+        // do not have default-parameter code generation.
+
+        | ("String" | "StringName", "find")
+        | ("String" | "StringName", "findn")
+        | ("String" | "StringName", "rfind")
+        | ("String" | "StringName", "rfindn")
+        | ("String" | "StringName", "split")
+        | ("String" | "StringName", "rsplit")
+
+        | ("Array", "duplicate")
+        | ("Array", "duplicate_deep")
+        | ("Array", "slice")
+        | ("Array", "find")
+        | ("Array", "rfind")
+        | ("Array", "find_custom")
+        | ("Array", "rfind_custom")
+        | ("Array", "bsearch")
+        | ("Array", "bsearch_custom")
+        | ("Array", "reduce")
+
+        | ("Dictionary", "duplicate")
+
+        // PackedByteArray-specific methods with custom wrappers.
+        | ("PackedByteArray", "encode_var")
+        | ("PackedByteArray", "decode_var")
+        | ("PackedByteArray", "decode_var_size")
+        | ("PackedByteArray", "compress")
+        | ("PackedByteArray", "decompress")
+        | ("PackedByteArray", "decompress_dynamic")
+
+        => true,
+
+        // Packed*Array common methods with custom wrappers (slice, find, rfind, bsearch)
+        (builtin, "slice" | "find" | "rfind" | "bsearch")
+            if builtin.starts_with("Packed") && builtin.ends_with("Array")
+        => true,
+
+        _ => false
     }
 }
 
 /// Return `true` if a method should have `&self` receiver in Rust, `false` if `&mut self` and `None` if original qualifier should be kept.
+///
+/// Applies a heuristic: `get_*`/`is_*`/`has_*` methods are treated as const (pure reads), unless they appear in an explicit deny-list
+/// of false positives (methods that actually mutate state, e.g. stream reads advancing a cursor). Reason for this is that Godot's advertised
+/// const-ness is often wrong, causing unnecessary `mut` bindings in Rust code.
 ///
 /// In cases where the method falls under some general category (like getters) that have their own const-qualification overrides, `Some`
 /// should be returned to take precedence over general rules. Example: `FileAccess::get_pascal_string()` is mut, but would be const-qualified
@@ -613,72 +729,91 @@ pub fn is_class_method_const(class_name: &TyName, godot_method: &JsonClassMethod
         => Some(true),
 
         // Changed to mut.
-        // Needs some fixes to make sure _ex() builders have consistent signature, e.g. FileAccess::get_csv_line_full().
-        /*
-        | ("FileAccess", "get_16")
-        | ("FileAccess", "get_32")
-        | ("FileAccess", "get_64")
-        | ("FileAccess", "get_8")
-        | ("FileAccess", "get_csv_line")
-        | ("FileAccess", "get_real")
-        | ("FileAccess", "get_float")
-        | ("FileAccess", "get_double")
+        | ("EditorImportPlugin", "_import")
+        // StreamPeer: read from stream, advancing cursor.
+        | ("StreamPeer", "get_8" | "get_16" | "get_32" | "get_64")
+        | ("StreamPeer", "get_u8" | "get_u16" | "get_u32" | "get_u64")
+        | ("StreamPeer", "get_half" | "get_float" | "get_double")
+        | ("StreamPeer", "get_string" | "get_utf8_string")
+        | ("StreamPeer", "get_data" | "get_partial_data")
+        | ("StreamPeer", "get_var")
+
+        // PacketPeer: consume packet/variant from buffer.
+        | ("PacketPeer", "get_packet")
+        | ("PacketPeer", "get_var")
+
+        // FileAccess: read from file, advancing cursor.
+        // (get_as_text does not affect cursor).
+        | ("FileAccess", "get_8" | "get_16" | "get_32" | "get_64")
+        | ("FileAccess", "get_half" | "get_float" | "get_double" | "get_real" )
         | ("FileAccess", "get_var")
         | ("FileAccess", "get_line")
-        | ("FileAccess", "get_pascal_string") // already mut.
-        | ("StreamPeer", "get_8")
-        | ("StreamPeer", "get_16")
-        | ("StreamPeer", "get_32")
-        | ("StreamPeer", "get_64")
-        | ("StreamPeer", "get_float")
-        | ("StreamPeer", "get_double")
-        => Some(false),
-        */
-        
-        _ => {
-            // TODO Many getters are mutably qualified (GltfAccessor::get_max, CameraAttributes::get_exposure_multiplier, ...).
-            // As a default, set those to const.
+        | ("FileAccess", "get_csv_line")
+        | ("FileAccess", "get_buffer")
+        | ("FileAccess", "get_pascal_string")
 
-            None
-        },
+        // DirAccess: advance directory listing.
+        | ("DirAccess", "get_next")
+
+        // NavigationAgent2D/3D: updates internal path logic as side effect.
+        | ("NavigationAgent2D", "get_next_path_position")
+        | ("NavigationAgent3D", "get_next_path_position")
+
+        // GridMap: may trigger mesh baking as side effect -- internal fn make_baked_meshes() is mutable.
+        | ("GridMap", "get_bake_meshes")
+
+        // Node3D: creates interpolation pump on first call.
+        | ("Node3D", "get_global_transform_interpolated")
+        => Some(false),
+
+        // Heuristic: many Godot getters are not const-qualified despite being pure reads. Override get_*/is_*/has_* methods to const.
+        // Exceptions with actual side effects are listed as explicit Some(false) arms above.
+        _ if !godot_method.is_const && !godot_method.is_static && !godot_method.is_virtual
+            && ["get_", "is_", "has_"].iter().any(|p| godot_method.name.starts_with(p))
+        => Some(true),
+        
+        _ => None,
     }
 }
 
 /// Currently only for virtual methods; checks if the specified parameter is required (non-null) and can be declared as `Gd<T>`
-/// instead of `Option<Gd<T>>`.
+/// instead of `Option<Gd<T>>`. By default, parameters are optional since we don't have nullability information in GDExtension.
+#[rustfmt::skip]
 pub fn is_class_method_param_required(
     class_name: &TyName,
     godot_method_name: &str,
     param: &Ident, // Don't use `&str` to avoid to_string() allocations for each check on call-site.
 ) -> bool {
-    // Note: magically, it's enough if a base class method is declared here; it will be picked up by derived classes.
+    // Could possibly be unified with `meta=required` handling right at the JSON->domain mapping. Could then also apply to non-virtual fns.
+    
+    // Note: for virtual methods, it's enough if a base class method is declared here; it will be picked up by derived classes.
 
-    match (class_name.godot_ty.as_str(), godot_method_name) {
+    let param = param.to_string();
+    match (class_name.godot_ty.as_str(), godot_method_name, param.as_str()) {
         // Nodes.
-        ("Node", "_input") => true,
-        ("Node", "_shortcut_input") => true,
-        ("Node", "_unhandled_input") => true,
-        ("Node", "_unhandled_key_input") => true,
+        | ("Node", "_input", "event")
+        | ("Node", "_shortcut_input", "event")
+        | ("Node", "_unhandled_input", "event")
+        | ("Node", "_unhandled_key_input", "event")
+        | ("Control", "_gui_input", "event")
 
         // https://docs.godotengine.org/en/stable/classes/class_collisionobject2d.html#class-collisionobject2d-private-method-input-event
-        ("CollisionObject2D", "_input_event") => true, // both parameters.
+        | ("CollisionObject2D", "_input_event", "viewport" | "event") 
 
         // UI.
-        ("Control", "_gui_input") => true,
 
         // Script instances.
-        ("ScriptExtension", "_instance_create") => param == "for_object",
-        ("ScriptExtension", "_placeholder_instance_create") => param == "for_object",
-        ("ScriptExtension", "_inherits_script") => param == "script",
-        ("ScriptExtension", "_instance_has") => param == "object",
+        | ("ScriptExtension", "_instance_create", "for_object")
+        | ("ScriptExtension", "_placeholder_instance_create", "for_object")
+        | ("ScriptExtension", "_inherits_script", "script")
+        | ("ScriptExtension", "_instance_has", "object")
 
         // Editor.
-        ("EditorExportPlugin", "_customize_resource") => param == "resource",
-        ("EditorExportPlugin", "_customize_scene") => param == "scene",
+        | ("EditorExportPlugin", "_customize_resource", "resource")
+        | ("EditorExportPlugin", "_customize_scene", "scene")
+        | ("EditorPlugin", "_handles", "object")
 
-        ("EditorPlugin", "_handles") => param == "object",
-
-        _ => false,
+        => true, _ => false,
     }
 }
 
@@ -729,15 +864,25 @@ pub fn is_utility_function_private(function: &JsonUtilityFunction) -> bool {
     }
 }
 
-pub fn maybe_rename_class_method<'m>(class_name: &TyName, godot_method_name: &'m str) -> &'m str {
+pub fn maybe_rename_class_method<'m>(
+    class_name: &TyName,
+    godot_method_name: &'m str,
+) -> Cow<'m, str> {
     // This is for non-virtual methods only. For virtual methods, use other handler below.
 
-    match (class_name.godot_ty.as_str(), godot_method_name) {
+    if is_class_method_replaced_with_type_safe(class_name, godot_method_name) {
+        let new_name = format!("raw_{godot_method_name}");
+        return Cow::Owned(new_name);
+    }
+
+    let hardcoded = match (class_name.godot_ty.as_str(), godot_method_name) {
         // GDScript class, possibly more in the future.
         (_, "new") => "instantiate",
 
         _ => godot_method_name,
-    }
+    };
+
+    Cow::Borrowed(hardcoded)
 }
 
 // Maybe merge with above?
@@ -767,13 +912,17 @@ pub fn maybe_rename_virtual_method<'m>(
 
 pub fn get_class_extra_docs(class_name: &TyName) -> Option<&'static str> {
     match class_name.godot_ty.as_str() {
-        "FileAccess" => {
-            Some("The gdext library provides a higher-level abstraction, which should be preferred: [`GFile`][crate::tools::GFile].")
-        }
+        "FileAccess" => Some(
+            "The godot-rust library provides a higher-level abstraction, which should be preferred: [`GFile`][crate::tools::GFile].",
+        ),
         "ScriptExtension" => {
             Some("Use this in combination with the [`obj::script` module][crate::obj::script].")
         }
-
+        "ResourceFormatLoader" => Some(
+            "Enable the `experimental-threads` feature when using custom `ResourceFormatLoader`s. \
+            Otherwise the application will panic when the custom `ResourceFormatLoader` is used by Godot \
+            in a thread other than the main thread.",
+        ),
         _ => None,
     }
 }
@@ -983,39 +1132,120 @@ pub fn get_derived_virtual_method_presence(class_name: &TyName, godot_method_nam
          | ("AudioStreamPlaybackResampled", "_mix")
          => VirtualMethodPresence::Remove,
 
+         | ("PrimitiveMesh", "_get_surface_count")
+         | ("PrimitiveMesh", "_surface_get_array_len")
+         | ("PrimitiveMesh", "_surface_get_array_index_len")
+         | ("PrimitiveMesh", "_surface_get_arrays")
+         | ("PrimitiveMesh", "_surface_get_blend_shape_arrays")
+         | ("PrimitiveMesh", "_surface_get_lods")
+         | ("PrimitiveMesh", "_surface_get_format")
+         | ("PrimitiveMesh", "_surface_get_primitive_type")
+         | ("PrimitiveMesh", "_surface_set_material")
+         | ("PrimitiveMesh", "_surface_get_material")
+         | ("PrimitiveMesh", "_get_blend_shape_count")
+         | ("PrimitiveMesh", "_get_blend_shape_name")
+         | ("PrimitiveMesh", "_set_blend_shape_name")
+         | ("PrimitiveMesh", "_get_aabb")
+         => VirtualMethodPresence::Override { is_required: false },
+
+         // Methods which are required but not marked as such.
+         // https://docs.godotengine.org/en/stable/classes/class_editorsyntaxhighlighter.html#class-editorsyntaxhighlighter-private-method-create
+         | ("EditorSyntaxHighlighter", "_create") // https://github.com/godot-rust/gdext/issues/1452.
+         => VirtualMethodPresence::Override { is_required: true },
+
          // Default: inherit presence from base class.
          _ => VirtualMethodPresence::Inherit,
     }
 }
 
+/// Initialization order for Godot (see https://github.com/godotengine/godot/blob/master/main/main.cpp).
+/// - Main::setup()
+///   - register_core_types()
+///   - register_early_core_singletons()
+///   - initialize_extensions(GDExtension::INITIALIZATION_LEVEL_CORE)
+/// - Main::setup2()
+///   - register_server_types()
+///   - initialize_extensions(GDExtension::INITIALIZATION_LEVEL_SERVERS)
+///   - register_core_singletons() ...possibly a bug. Should this be before LEVEL_SERVERS?
+///   - register_scene_types()
+///   - register_scene_singletons()
+///   - initialize_extensions(GDExtension::INITIALIZATION_LEVEL_SCENE)
+///   - IF EDITOR
+///     - register_editor_types()
+///     - initialize_extensions(GDExtension::INITIALIZATION_LEVEL_EDITOR)
+///   - register_server_singletons() ...another weird one.
+///   - Autoloads, etc.
+///
+/// ## Singleton availability by initialization level
+/// - **Core level**: Basic singletons like `Engine`, `OS`, `ProjectSettings`, `Time` are available.
+/// - **Servers level**: Server singletons like `RenderingServer` are NOT yet available due to GDExtension timing issues.
+/// - **Scene level**: All singletons including `RenderingServer` are available.
+/// - **Editor level**: Editor-specific functionality is available.
+///
+/// GDExtension singletons are generally not available during *any* level initialization, with the exception of a few core singletons 
+/// (see above). This is different from how modules work, where servers are available at _Servers_ level.
+///
+/// See also:
+/// - Singletons not accessible in Scene (godot-cpp): <https://github.com/godotengine/godot-cpp/issues/1180>
+/// - `global_get_singleton` not returning singletons: <https://github.com/godotengine/godot/issues/64975>
+/// - PR to make singletons available: <https://github.com/godotengine/godot/pull/98862>
 #[rustfmt::skip]
-pub fn is_class_level_server(class_name: &str) -> bool {
-    // Unclear on if some of these classes should be registered earlier than `Scene`:
-    // - `RenderData` + `RenderDataExtension`
-    // - `RenderSceneData` + `RenderSceneDataExtension`
+pub fn classify_codegen_level(class_name: &str) -> Option<ClassCodegenLevel> {
+    let level = match class_name {
+        // See register_core_types() in https://github.com/godotengine/godot/blob/master/core/register_core_types.cpp,
+        // which is called before Core level is initialized. Only a small list is promoted to Core; carefully evaluate if more are added.
+        | "Object" | "RefCounted" | "Resource" | "MainLoop" | "GDExtension"
+        => ClassCodegenLevel::Core,
 
-    match class_name {
-        // TODO: These should actually be at level `Core`
-        | "Object" | "OpenXRExtensionWrapperExtension" 
+        // See register_early_core_singletons() in https://github.com/godotengine/godot/blob/master/core/register_core_types.cpp,
+        // which is called before Core level is initialized.
+        // ClassDB is available, however its *singleton* will be registered at Core level only from Godot 4.7 on, see
+        // https://github.com/godot-rust/gdext/pull/1474. Its function pointers can already be fetched in Core before; there's just no instance.
+        | "ProjectSettings" | "Engine" | "OS" | "Time" | "ClassDB"
+        => ClassCodegenLevel::Core,
 
-        // Declared final (un-inheritable) in Rust, but those are still servers.
-        | "AudioServer" | "CameraServer" | "NavigationServer2D" | "NavigationServer3D" | "RenderingServer" | "TranslationServer" | "XRServer" 
+        // See initialize_openxr_module() in https://github.com/godotengine/godot/blob/master/modules/openxr/register_types.cpp
+        | "OpenXRExtensionWrapper"
+        => ClassCodegenLevel::Core,
 
-        // PhysicsServer2D
+        // Symbols from another extension could be available in Core, but since GDExtension can currently not guarantee
+        // the order of different extensions being loaded, we prevent implicit dependencies and require Server.
+        | "OpenXRExtensionWrapperExtension"
+        => ClassCodegenLevel::Servers,
+
+        // See register_server_types() in https://github.com/godotengine/godot/blob/master/servers/register_server_types.cpp
         | "PhysicsDirectBodyState2D" | "PhysicsDirectBodyState2DExtension" 
         | "PhysicsDirectSpaceState2D" | "PhysicsDirectSpaceState2DExtension" 
         | "PhysicsServer2D" | "PhysicsServer2DExtension" 
         | "PhysicsServer2DManager" 
-
-        // PhysicsServer3D
         | "PhysicsDirectBodyState3D" | "PhysicsDirectBodyState3DExtension" 
         | "PhysicsDirectSpaceState3D" | "PhysicsDirectSpaceState3DExtension" 
         | "PhysicsServer3D" | "PhysicsServer3DExtension" 
         | "PhysicsServer3DManager" 
         | "PhysicsServer3DRenderingServerHandler"
+        | "RenderData" | "RenderDataExtension"
+        | "RenderSceneData" | "RenderSceneDataExtension"
+        => ClassCodegenLevel::Servers,
+        
+        // Declared final (un-inheritable) in Rust, but those are still servers.
+        | "AudioServer" | "CameraServer" | "NavigationServer2D" | "NavigationServer3D" | "RenderingServer" | "TranslationServer" | "XRServer" | "DisplayServer"
+        => ClassCodegenLevel::Servers,
 
-        => true, _ => false
-    }
+        // Work around wrong classification in https://github.com/godotengine/godot/issues/86206.
+        // https://github.com/godotengine/godot/issues/103867
+        "OpenXRInteractionProfileEditorBase"
+        | "OpenXRInteractionProfileEditor"
+        | "OpenXRBindingModifierEditor" if cfg!(before_api = "4.5") 
+        => ClassCodegenLevel::Editor,
+        
+        // https://github.com/godotengine/godot/issues/86206
+        "ResourceImporterOggVorbis" | "ResourceImporterMP3" if cfg!(before_api = "4.3") 
+        => ClassCodegenLevel::Editor,
+
+        // No special-case override for this class.
+        _ => return None,
+    };
+    Some(level)
 }
 
 /// Whether a generated enum is `pub(crate)`; useful for manual re-exports.
@@ -1028,6 +1258,11 @@ pub fn is_enum_private(class_name: Option<&TyName>, enum_name: &str) -> bool {
         | (None, "Side")
         | (None, "Variant.Operator")
         | (None, "Variant.Type")
+
+        // Re-exported to godot::register::info.
+        | (None, "PropertyHint")
+        | (None, "PropertyUsageFlags")
+        | (None, "MethodFlags")
 
         => true, _ => false
     }
@@ -1065,7 +1300,13 @@ pub fn is_enum_exhaustive(class_name: Option<&TyName>, enum_name: &str) -> bool 
 pub fn is_enum_bitfield(class_name: Option<&TyName>, enum_name: &str) -> Option<bool> {
     let class_name = class_name.map(|c| c.godot_ty.as_str());
     match (class_name, enum_name) {
+        | (Some("FileAccess"), "ModeFlags")
+        | (Some("GPUParticles2D"), "EmitFlags")
+        | (Some("GPUParticles3D"), "EmitFlags")
+        | (Some("Node"), "DuplicateFlags")
         | (Some("Object"), "ConnectFlags")
+        | (Some("SceneTree"), "GroupCallFlags")
+        | (Some("TextEdit"), "SearchFlags")
 
         => Some(true),
         _ => None

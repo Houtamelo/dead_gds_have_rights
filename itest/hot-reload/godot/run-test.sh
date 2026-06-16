@@ -11,9 +11,15 @@ if [[ $1 == "api-custom" ]]; then
   cargoArgs="--features godot/api-custom"
 elif [[ $1 == "stable" ]]; then
   cargoArgs=""
+elif [[ $1 == api-4-* ]]; then
+  cargoArgs="--features godot/$1"
 else
-  echo "[Bash]      Error: Unknown argument '$1'. Expected 'api-custom' or 'stable'."
+  echo "[Bash]      Error: Unknown argument '$1'. Expected 'stable', 'api-custom' or 'api-4.*'."
   exit 1
+fi
+
+if [[ $2 == "signal-test" ]]; then
+    cargoArgs="${cargoArgs} --features signal-test"
 fi
 
 # Restore un-reloaded files on exit (for local testing).
@@ -35,6 +41,49 @@ cleanup() {
 set -euo pipefail
 trap cleanup EXIT
 
+# Set up Godot binary env var, supporting both old and new names.
+GODOT_BIN="${GDRUST_GODOT_BIN:-${GODOT4_BIN:-}}"
+if [[ -z "$GODOT_BIN" ]]; then
+  echo "[Bash]      Error: Neither GDRUST_GODOT_BIN nor GODOT4_BIN is set."
+  exit 1
+fi
+if [[ -n "${GODOT4_BIN:-}" ]] && [[ -z "${GDRUST_GODOT_BIN:-}" ]]; then
+  echo "[Bash]      Warning: GODOT4_BIN is deprecated, use GDRUST_GODOT_BIN instead."
+fi
+
+godotAwait() {
+  if [[ $godotPid -ne 0 ]]; then
+    echo "[Bash]      Error: godotAwait called while Godot (PID $godotPid) is still running."
+    exit 1
+  fi
+
+  $GODOT_BIN -e --headless --path $rel &
+  godotPid=$!
+  echo "[Bash]      Wait for Godot ready (PID $godotPid)..."
+
+  $GODOT_BIN --headless --no-header --script ReloadOrchestrator.gd -- await
+}
+
+godotNotify() {
+  if [[ $godotPid -eq 0 ]]; then
+    echo "[Bash]      Error: godotNotify called but Godot is not running."
+    exit 1
+  fi
+
+  $GODOT_BIN --headless --no-header --script ReloadOrchestrator.gd -- notify
+
+  echo "[Bash]      Wait for Godot exit..."
+  local status=0
+  wait $godotPid
+  status=$?
+  echo "[Bash]      Godot (PID $godotPid) has completed with status $status."
+  godotPid=0
+
+  if [[ $status -ne 0 ]]; then
+    exit $status
+  fi
+}
+
 echo "[Bash]      Start hot-reload integration test..."
 
 # Restore un-reloaded file (for local testing).
@@ -52,22 +101,25 @@ cargo build -p hot-reload $cargoArgs
 # Wait briefly so artifacts are present on file system.
 sleep 0.5
 
-$GODOT4_BIN -e --headless --path $rel &
-godotPid=$!
-echo "[Bash]      Wait for Godot ready (PID $godotPid)..."
+# ----------------------------------------------------------------
+# Test Case 1: Update Rust source and compile to trigger reload.
+# ----------------------------------------------------------------
 
-$GODOT4_BIN --headless --no-header --script ReloadOrchestrator.gd -- await
-$GODOT4_BIN --headless --no-header --script ReloadOrchestrator.gd -- replace
+echo "[Bash]      Scenario 1: Reload after updating Rust source..."
 
+godotAwait
+$GODOT_BIN --headless --no-header --script ReloadOrchestrator.gd -- replace
 # Compile updated Rust source.
 cargo build -p hot-reload $cargoArgs
+godotNotify
 
-$GODOT4_BIN --headless --no-header --script ReloadOrchestrator.gd -- notify
+# ----------------------------------------------------------------
+# Test Case 2: Touch the .gdextension file to trigger reload.
+# ----------------------------------------------------------------
 
-echo "[Bash]      Wait for Godot exit..."
-wait $godotPid
-status=$?
-echo "[Bash]      Godot (PID $godotPid) has completed with status $status."
+echo "[Bash]      Scenario 2: Reload after touching rust.gdextension..."
 
-
-
+godotAwait
+# Update timestamp to trigger reload.
+touch "$rel/rust.gdextension"
+godotNotify

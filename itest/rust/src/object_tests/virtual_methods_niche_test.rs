@@ -7,14 +7,16 @@
 
 #![cfg(feature = "codegen-full")]
 
-use crate::framework::{itest, TestContext};
-use crate::object_tests::virtual_methods_test::VirtualInputTest;
 use godot::classes::resource_loader::CacheMode;
 use godot::classes::{
     BoxMesh, IResourceFormatLoader, IRigidBody2D, InputEvent, InputEventAction,
     ResourceFormatLoader, ResourceLoader, Viewport, Window,
 };
+use godot::obj::Singleton;
 use godot::prelude::*;
+
+use crate::framework::{TestContext, itest};
+use crate::object_tests::virtual_methods_test::VirtualInputTest;
 
 #[derive(GodotClass, Debug)]
 #[class(init, base=ResourceFormatLoader)]

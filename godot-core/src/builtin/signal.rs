@@ -5,25 +5,25 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use std::fmt;
-use std::ptr;
+use std::{fmt, ptr};
 
 use godot_ffi as sys;
+use sys::{ExtVariantType, GodotFfi, ffi_methods};
 
-use crate::builtin::{inner, Array, Callable, Dictionary, StringName, Variant};
+use crate::builtin::{Array, Callable, StringName, VarDictionary, Variant, inner};
 use crate::classes::Object;
+use crate::classes::object::ConnectFlags;
 use crate::global::Error;
 use crate::meta;
 use crate::meta::{FromGodot, GodotType, ToGodot};
 use crate::obj::bounds::DynMemory;
-use crate::obj::{Bounds, Gd, GodotClass, InstanceId};
-use sys::{ffi_methods, ExtVariantType, GodotFfi};
+use crate::obj::{Bounds, EngineBitfield, Gd, GodotClass, InstanceId};
 
 /// Untyped Godot signal.
 ///
 /// Signals are composed of a pointer to an `Object` and the name of the signal on this object.
 ///
-/// In Rust, you might want to work with type-safe signals, available under the [`TypedSignal`](crate::registry::signal::TypedSignal) struct.
+/// In Rust, you might want to work with type-safe signals, available under the [`TypedSignal`](crate::obj::signal::TypedSignal) struct.
 ///
 /// # Godot docs
 /// [`Signal` (stable)](https://docs.godotengine.org/en/stable/classes/class_signal.html)
@@ -68,17 +68,25 @@ impl Signal {
         }
     }
 
-    /// Connects this signal to the specified callable.
+    /// Connect signal to a callable.
     ///
-    /// Optional flags can be also added to configure the connection's behavior (see [`ConnectFlags`](crate::classes::object::ConnectFlags) constants).
+    /// To provide flags, see [`connect_flags()`][Self::connect_flags].
+    pub fn connect(&self, callable: &Callable) -> Error {
+        let error = self.as_inner().connect(callable, 0i64);
+
+        Error::from_godot(error as i32)
+    }
+
+    /// Connect signal to a callable, customizing with flags.
+    ///
+    /// Optional flags can be also added to configure the connection's behavior (see [`ConnectFlags`](ConnectFlags) constants).
     /// You can provide additional arguments to the connected callable by using `Callable::bind`.
     ///
-    /// A signal can only be connected once to the same [`Callable`]. If the signal is already connected,
-    /// returns [`Error::ERR_INVALID_PARAMETER`] and
-    /// pushes an error message, unless the signal is connected with [`ConnectFlags::REFERENCE_COUNTED`](crate::classes::object::ConnectFlags::REFERENCE_COUNTED).
+    /// A signal can only be connected once to the same [`Callable`]. If the signal is already connected, returns [`Error::ERR_INVALID_PARAMETER`]
+    /// and pushes an error message, unless the signal is connected with [`ConnectFlags::REFERENCE_COUNTED`](ConnectFlags::REFERENCE_COUNTED).
     /// To prevent this, check for existing connections with [`is_connected()`][Self::is_connected].
-    pub fn connect(&self, callable: &Callable, flags: i64) -> Error {
-        let error = self.as_inner().connect(callable, flags);
+    pub fn connect_flags(&self, callable: &Callable, flags: ConnectFlags) -> Error {
+        let error = self.as_inner().connect(callable, flags.ord() as i64);
 
         Error::from_godot(error as i32)
     }
@@ -106,10 +114,10 @@ impl Signal {
     /// Each connection is represented as a Dictionary that contains three entries:
     ///  - `signal` is a reference to this [`Signal`];
     ///  - `callable` is a reference to the connected [`Callable`];
-    ///  - `flags` is a combination of [`ConnectFlags`](crate::classes::object::ConnectFlags).
+    ///  - `flags` is a combination of [`ConnectFlags`](ConnectFlags).
     ///
     /// _Godot equivalent: `get_connections`_
-    pub fn connections(&self) -> Array<Dictionary> {
+    pub fn connections(&self) -> Array<VarDictionary> {
         self.as_inner()
             .get_connections()
             .iter_shared()
@@ -193,7 +201,7 @@ impl_builtin_traits! {
     }
 }
 
-crate::meta::impl_godot_as_self!(Signal);
+meta::impl_godot_as_self!(Signal: ByRef);
 
 impl fmt::Debug for Signal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

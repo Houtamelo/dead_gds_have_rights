@@ -1,8 +1,8 @@
 [package]
 name = "godot"
-version = "0.3.4"
-edition = "2021"
-rust-version = "1.87"
+version = "0.4.4"
+edition.workspace = true
+rust-version.workspace = true
 license = "MPL-2.0"
 keywords = ["gamedev", "godot", "engine", "2d", "3d"] # possibly: "ffi"
 categories = ["game-engines", "graphics"]
@@ -10,7 +10,7 @@ description = "Rust bindings for Godot 4"
 authors = ["Bromeon", "godot-rust contributors"]
 repository = "https://github.com/godot-rust/gdext"
 homepage = "https://godot-rust.github.io"
-documentation = "https://docs.rs/godot/0.3.4"
+documentation = "https://docs.rs/godot/0.4.4"
 readme = "crate-readme.md"
 
 [features]
@@ -31,17 +31,16 @@ api-custom = ["godot-core/api-custom"]
 api-custom-json = ["godot-core/api-custom-json"]
 # [version-sync] [[
 #  [line] api-$kebabVersion = ["godot-core/api-$kebabVersion"]
-api-4-1 = ["godot-core/api-4-1"]
-api-4-1-1 = ["godot-core/api-4-1-1"]
-api-4-1-2 = ["godot-core/api-4-1-2"]
-api-4-1-3 = ["godot-core/api-4-1-3"]
-api-4-1-4 = ["godot-core/api-4-1-4"]
 api-4-2 = ["godot-core/api-4-2"]
-api-4-2-1 = ["godot-core/api-4-2-1"]
-api-4-2-2 = ["godot-core/api-4-2-2"]
 api-4-3 = ["godot-core/api-4-3"]
 api-4-4 = ["godot-core/api-4-4"]
+api-4-5 = ["godot-core/api-4-5"]
+api-4-6 = ["godot-core/api-4-6"]
 # ]]
+
+# Safeguard levels (see godot/lib.rs for detailed documentation).
+safeguards-dev-balanced = ["godot-core/safeguards-dev-balanced"]
+safeguards-release-disengaged = ["godot-core/safeguards-release-disengaged"]
 
 default = ["__codegen-full"]
 
@@ -51,8 +50,8 @@ __debug-log = ["godot-core/debug-log"]
 __trace = ["godot-core/trace"]
 
 [dependencies]
-godot-core = { path = "../godot-core", version = "=0.3.4" }
-godot-macros = { path = "../godot-macros", version = "=0.3.4" }
+godot-core = { path = "../godot-core", version = "=0.4.4" }
+godot-macros = { path = "../godot-macros", version = "=0.4.4" }
 
 # https://docs.rs/about/metadata
 [package.metadata.docs.rs]

@@ -28,6 +28,8 @@ Commands:
     fmt           format code, fail if bad
     test          run unit tests (no Godot needed)
     itest         run integration tests (from within Godot)
+    test-web-t    run unit tests on web, threaded (requires node.js and emcc)
+    test-web-nt   run unit tests on web, nothreads (requires node.js and emcc)
     clippy        validate clippy lints
     klippy        validate + fix clippy
     doc           generate docs for 'godot' crate
@@ -35,7 +37,7 @@ Commands:
 
 Options:
     -h, --help               print this help text
-    --double                 run check with double-precision
+    --double                 run check with double-precision (implies 'api-custom' feature)
     -f, --filter <arg>       only run integration tests which contain any of the
                              args (comma-separated). requires itest.
     -a, --api-version <ver>  specify the Godot API version to use (e.g. 4.3, 4.3.1).
@@ -98,8 +100,14 @@ function findGodot() {
         return
     fi
 
-    # User-defined GODOT4_BIN.
-    if [[ -n "$GODOT4_BIN" ]]; then
+    # User-defined GDRUST_GODOT_BIN (try new name first).
+    if [[ -n "$GDRUST_GODOT_BIN" ]]; then
+        log "Using environment variable GDRUST_GODOT_BIN=$(printf %q "$GDRUST_GODOT_BIN")"
+        godotBin="$GDRUST_GODOT_BIN"
+
+    # User-defined GODOT4_BIN (deprecated, fallback to old name).
+    elif [[ -n "$GODOT4_BIN" ]]; then
+        log -e "${YELLOW}Warning: \`GODOT4_BIN\` is deprecated, use \`GDRUST_GODOT_BIN\` instead.${END}"
         log "Using environment variable GODOT4_BIN=$(printf %q "$GODOT4_BIN")"
         godotBin="$GODOT4_BIN"
 
@@ -129,7 +137,7 @@ function findGodot() {
 
     # Error case.
     else
-        log "Godot executable not found; try setting GODOT4_BIN to the full path to the executable"
+        log "Godot executable not found; try setting GDRUST_GODOT_BIN to the full path to the executable"
         return 1
     fi
 }
@@ -142,7 +150,13 @@ function findGodot() {
 # builtins like `test`.
 
 function cmd_fmt() {
-    run cargo fmt --all -- --check
+    # Run rustfmt in nightly toolchain if available.
+    if [[ $(rustup toolchain list) =~ nightly ]]; then
+        run cargo +nightly fmt --all -- --check
+    else
+        log -e "${YELLOW}Warning: nightly toolchain not found; stable rustfmt might not pass CI.${END}"
+        run cargo fmt --all -- --check
+    fi
 }
 
 function cmd_clippy() {
@@ -175,8 +189,76 @@ function cmd_test() {
 
 function cmd_itest() {
     findGodot && \
-        run cargo build -p itest "${extraCargoArgs[@]}" && \
-        run "$godotBin" $GODOT_ARGS --path itest/godot --headless -- "[${extraArgs[@]}]"
+        run cargo build -p itest "${extraCargoArgs[@]}" || return 1
+
+    # Logic to abort immediately if Godot outputs certain keywords (would otherwise fail only in CI).
+    # Keep in sync with: .github/composite/godot-itest/action.yml (steps "Run Godot integration tests" and "Check for memory leaks").
+
+    local logFile
+    logFile=$(mktemp)
+
+    cd itest/godot
+
+    # Explanation:
+    # * tee:      still output logs while scanning for errors.
+    # * grep -q:  no output, use exit code 0 if found -> thus also &&.
+    # * pkill:    stop Godot execution (since it hangs in headless mode); simple 'head -1' did not work as expected
+    #             since it's not available on Windows, use taskkill in that case.
+    # * exit:     the terminated process would return 143, but this is more explicit and future-proof.
+    "$godotBin" --headless -- "[${extraArgs[@]}]" 2>&1 \
+    | tee "$logFile" \
+    | tee >(grep -E "SCRIPT ERROR:|Can't open dynamic library|Error loading extension" -q && {
+      printf "\n${RED}Error: Script or dlopen error, abort...${END}\n" >&2;
+      # Unlike CI; do not kill processes called "godot" on user machine.
+      exit 2
+    })
+
+    local exitCode=$?
+
+    # Check for unrecoverable errors in log.
+    if grep -qE "SCRIPT ERROR:|Can't open dynamic library" "$logFile"; then
+      log -e "\n${RED}Error: Unrecoverable Godot error detected in logs.${END}"
+      exitCode=2
+    fi
+
+    # Check for memory leaks.
+    if grep -q "ObjectDB instances leaked at exit" "$logFile"; then
+      log -e "\n${RED}Error: Memory leak detected.${END}"
+      exitCode=3
+    fi
+
+    rm -f "$logFile"
+    cd ../..
+
+    return $exitCode
+}
+
+# Usage: testweb <rustflags> <features>
+function testweb() {
+    local rustflags="$1 -C link-args=-g"
+    local features="$2,godot/experimental-wasm,godot/lazy-function-tables"
+
+    # Avoid problems with emcc potentially writing to read-only dir.
+    local cacheDir="$(realpath ./target)/emscripten_cache"
+    mkdir -p "${cacheDir}"
+
+    # For runner env var, see https://github.com/rust-lang/cargo/issues/7471.
+    # grep: filter out non-suppressable warnings about unstable Wasm features (atomics).
+    run env CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUNNER=node \
+        RUSTFLAGS="${rustflags}" EM_CACHE="${cacheDir}" \
+        cargo +nightly test "${extraCargoArgs[@]}" \
+        --features "${features}" \
+        -Zbuild-std --target wasm32-unknown-emscripten --color=always \
+        2>&1 | grep -vE "unstable feature specified for \`-Ctarget-feature\`|generated 1 warning"
+}
+
+function cmd_test_web_t() {
+    # More memory (256 MiB) needed for parallel godot-cell tests which spawn 70 threads each.
+    testweb "-C link-args=-pthread -C target-feature=+atomics -C link-args=-sINITIAL_MEMORY=268435456" ""
+}
+
+function cmd_test_web_nt() {
+    testweb "" "godot/experimental-wasm-nothreads"
 }
 
 function cmd_doc() {
@@ -209,9 +291,9 @@ while [[ $# -gt 0 ]]; do
             extraCargoArgs+=("--features" "serde")
             ;;
         --double)
-            extraCargoArgs+=("--features" "godot/double-precision")
+            extraCargoArgs+=("--features" "godot/double-precision,godot/api-custom")
             ;;
-        fmt | test | itest | clippy | klippy | doc | dok)
+        fmt | test | itest | test-web-t | test-web-nt | clippy | klippy | doc | dok)
             cmds+=("$arg")
             ;;
         -f | --filter)
@@ -310,20 +392,20 @@ function compute_elapsed() {
 }
 
 for cmd in "${cmds[@]}"; do
-    "cmd_${cmd}" || {
+    "cmd_${cmd//-/_}" || {
         compute_elapsed
-        log -ne "$RED\n====================="
-        log -ne "\ngdext: checks FAILED."
-        log -ne "\n=====================\n$END"
+        log -ne "$RED\n=========================="
+        log -ne "\ngodot-rust: checks FAILED."
+        log -ne "\n==========================\n$END"
         log -ne "\nTotal duration: $elapsed.\n"
         exit 1
     }
 done
 
 compute_elapsed
-log -ne "$CYAN\n========================="
-log -ne "\ngdext: checks SUCCESSFUL."
-log -ne "\n=========================\n$END"
+log -ne "$CYAN\n=============================="
+log -ne "\ngodot-rust: checks SUCCESSFUL."
+log -ne "\n==============================\n$END"
 log -ne "\nTotal duration: $elapsed.\n"
 
 # If invoked with sh instead of bash, pressing Up arrow after executing `sh check.sh` may cause a `[A` to appear.

@@ -12,31 +12,33 @@
 //!
 //! See [`ScriptInstance`](trait.ScriptInstance.html) for usage.
 
-// Re-export guards.
-pub use crate::obj::guards::{ScriptBaseMut, ScriptBaseRef};
-
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 
+#[cfg(feature = "experimental-threads")]
+use godot_cell::blocking::{GdCell, MutGuard, RefGuard};
 #[cfg(not(feature = "experimental-threads"))]
 use godot_cell::panicking::{GdCell, MutGuard, RefGuard};
 
-#[cfg(feature = "experimental-threads")]
-use godot_cell::blocking::{GdCell, MutGuard, RefGuard};
-
 use crate::builtin::{GString, StringName, Variant, VariantType};
 use crate::classes::{Object, Script, ScriptLanguage};
-use crate::meta::{MethodInfo, PropertyInfo};
+use crate::meta::RawPtr;
+use crate::meta::error::CallErrorType;
 use crate::obj::{Base, Gd, GodotClass};
+use crate::registry::info::{MethodInfo, PropertyInfo};
 use crate::sys;
 
-#[cfg(before_api = "4.3")]
-use self::bounded_ptr_list::BoundedPtrList;
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Public re-exports.
 
-#[cfg(since_api = "4.2")]
-use crate::classes::IScriptExtension;
-#[cfg(since_api = "4.2")]
-use crate::obj::Inherits;
+mod reexport_pub {
+    pub use crate::classes::IScriptExtension;
+    pub use crate::obj::Inherits;
+}
+pub use reexport_pub::*;
+
+// Re-export guards.
+pub use crate::obj::guards::{ScriptBaseMut, ScriptBaseRef};
 
 /// Implement custom scripts that can be attached to objects in Godot.
 ///
@@ -113,12 +115,11 @@ pub trait ScriptInstance: Sized {
     /// mutable method calls like rust.
     ///
     /// It's important that the script does not cause a second call to this function while executing a method call. This would result in a panic.
-    // TODO: map the sys::GDExtensionCallErrorType to some public API type.
     fn call(
         this: SiMut<Self>,
         method: StringName,
         args: &[&Variant],
-    ) -> Result<Variant, sys::GDExtensionCallErrorType>;
+    ) -> Result<Variant, CallErrorType>;
 
     /// Identifies the script instance as a placeholder, routing property writes to a fallback if applicable.
     ///
@@ -169,9 +170,7 @@ pub trait ScriptInstance: Sized {
     fn get_method_argument_count(&self, _method: StringName) -> Option<u32>;
 }
 
-#[cfg(before_api = "4.2")]
-type ScriptInstanceInfo = sys::GDExtensionScriptInstanceInfo;
-#[cfg(all(since_api = "4.2", before_api = "4.3"))]
+#[cfg(before_api = "4.3")]
 type ScriptInstanceInfo = sys::GDExtensionScriptInstanceInfo2;
 #[cfg(since_api = "4.3")]
 type ScriptInstanceInfo = sys::GDExtensionScriptInstanceInfo3;
@@ -186,12 +185,19 @@ struct ScriptInstanceData<T: ScriptInstance> {
     base: Base<T::Base>,
 }
 
+// `RefUnwindSafe` requires that a `&Self` cannot expose logically inconsistent state after a caught panic. The interior mutability here
+// is panic-safe by construction: `GdCell<T>` uses RAII borrow guards (a panic during a borrow drops the guard, returning the cell to a
+// clean unborrowed state), and `Base<T::Base>` contains `Rc<Cell<InitState>>` whose `set` is an uninterruptible value replacement.
+// Therefore no inconsistent state is observable via a `&ScriptInstanceData<T>` after an unwind.
+impl<T: ScriptInstance> std::panic::RefUnwindSafe for ScriptInstanceData<T> {}
+
 impl<T: ScriptInstance> ScriptInstanceData<T> {
     ///  Convert a `ScriptInstanceData` sys pointer to a reference with unbounded lifetime.
     ///
     /// # Safety
     ///
     /// `ptr` must point to a live `ScriptInstanceData<T>` for the duration of `'a`.
+    #[allow(unsafe_op_in_unsafe_fn)] // Safety preconditions forwarded 1:1.
     unsafe fn borrow_script_sys<'a>(ptr: sys::GDExtensionScriptInstanceDataPtr) -> &'a Self {
         &*(ptr.cast::<ScriptInstanceData<T>>())
     }
@@ -236,7 +242,7 @@ impl<T: ScriptInstance> Drop for ScriptInstanceData<T> {
     }
 }
 
-/// Creates a new  from a type that implements [`ScriptInstance`].
+/// Creates a raw pointer to a Godot script instance, from a Rust [`ScriptInstance`] object.
 ///
 /// See [`ScriptInstance`] for usage. Discarding the resulting value will result in a memory leak.
 ///
@@ -248,7 +254,7 @@ impl<T: ScriptInstance> Drop for ScriptInstanceData<T> {
 pub unsafe fn create_script_instance<T: ScriptInstance>(
     rust_instance: T,
     for_object: Gd<T::Base>,
-) -> *mut c_void {
+) -> RawPtr<*mut c_void> {
     // Field grouping matches C header.
     let gd_instance = ScriptInstanceInfo {
         set_func: Some(script_instance_info::set_property_func::<T>),
@@ -259,13 +265,11 @@ pub unsafe fn create_script_instance<T: ScriptInstance>(
         #[cfg(since_api = "4.3")]
         free_property_list_func: Some(script_instance_info::free_property_list_func),
 
-        #[cfg(since_api = "4.2")]
         get_class_category_func: None, // not yet implemented.
 
         property_can_revert_func: None, // unimplemented until needed.
         property_get_revert_func: None, // unimplemented until needed.
 
-        // ScriptInstance::get_owner() is apparently not called by Godot 4.1 to 4.2 (to verify).
         get_owner_func: None,
         get_property_state_func: Some(script_instance_info::get_property_state_func::<T>),
 
@@ -275,7 +279,6 @@ pub unsafe fn create_script_instance<T: ScriptInstance>(
         #[cfg(since_api = "4.3")]
         free_method_list_func: Some(script_instance_info::free_method_list_func),
         get_property_type_func: Some(script_instance_info::get_property_type_func::<T>),
-        #[cfg(since_api = "4.2")]
         validate_property_func: None, // not yet implemented.
 
         has_method_func: Some(script_instance_info::has_method_func::<T>),
@@ -316,7 +319,7 @@ pub unsafe fn create_script_instance<T: ScriptInstance>(
         method_lists: BoundedPtrList::new(),
         // SAFETY: The script instance is always freed before the base object is destroyed. The weak reference should therefore never be
         // accessed after it has been freed.
-        base: unsafe { Base::from_gd(&for_object) },
+        base: unsafe { Base::from_script_gd(&for_object) },
     };
 
     let data_ptr = Box::into_raw(Box::new(data));
@@ -324,12 +327,9 @@ pub unsafe fn create_script_instance<T: ScriptInstance>(
     // SAFETY: `script_instance_create` expects a `GDExtensionScriptInstanceInfoPtr` and a generic `GDExtensionScriptInstanceDataPtr` of our
     // choice. The validity of the instance info struct is ensured by code generation.
     //
-    // It is expected that the engine upholds the safety invariants stated on each of the GDEXtensionScriptInstanceInfo functions.
-    unsafe {
-        #[cfg(before_api = "4.2")]
-        let create_fn = sys::interface_fn!(script_instance_create);
-
-        #[cfg(all(since_api = "4.2", before_api = "4.3"))]
+    // It is expected that the engine upholds the safety invariants stated on each of the GDExtensionScriptInstanceInfo functions.
+    let instance_extension: sys::GDExtensionScriptInstancePtr = unsafe {
+        #[cfg(before_api = "4.3")]
         let create_fn = sys::interface_fn!(script_instance_create2);
 
         #[cfg(since_api = "4.3")]
@@ -338,8 +338,11 @@ pub unsafe fn create_script_instance<T: ScriptInstance>(
         create_fn(
             instance_ptr,
             data_ptr as sys::GDExtensionScriptInstanceDataPtr,
-        ) as *mut c_void
-    }
+        )
+    };
+
+    // SAFETY: object validity guaranteed per this function's safety precondition.
+    unsafe { RawPtr::new(instance_extension.cast::<c_void>()) }
 }
 
 /// Checks if an instance of the script exists for a given object.
@@ -348,22 +351,16 @@ pub unsafe fn create_script_instance<T: ScriptInstance>(
 /// there is an instance for the script.
 ///
 /// Use this function to implement [`IScriptExtension::instance_has`].
-#[cfg(since_api = "4.2")]
 pub fn script_instance_exists<O, S>(object: &Gd<O>, script: &Gd<S>) -> bool
 where
     O: Inherits<Object>,
     S: Inherits<Script> + IScriptExtension + super::Bounds<Declarer = super::bounds::DeclUser>,
 {
-    let object_script_variant = object.upcast_ref().get_script();
-
-    if object_script_variant.is_nil() {
+    let Some(object_script) = object.upcast_ref().get_script() else {
         return false;
-    }
+    };
 
-    if object_script_variant
-        .object_id()
-        .is_none_or(|instance_id| instance_id != script.instance_id())
-    {
+    if object_script.instance_id() != script.instance_id() {
         return false;
     }
 
@@ -413,8 +410,10 @@ impl<'a, T: ScriptInstance> SiMut<'a, T> {
     /// # use godot::prelude::*;
     /// # use godot::classes::{ScriptLanguage, Script};
     /// # use godot::obj::script::{ScriptInstance, SiMut};
-    /// # use godot::meta::{MethodInfo, PropertyInfo};
+    /// # use godot::register::info::{MethodInfo, PropertyInfo};
+    /// # use godot::meta::error::CallErrorType;
     /// # use godot::sys;
+    ///
     /// struct ExampleScriptInstance;
     ///
     /// impl ScriptInstance for ExampleScriptInstance {
@@ -424,7 +423,7 @@ impl<'a, T: ScriptInstance> SiMut<'a, T> {
     ///         this: SiMut<Self>,
     ///         method: StringName,
     ///         args: &[&Variant],
-    ///     ) -> Result<Variant, sys::GDExtensionCallErrorType>{
+    ///     ) -> Result<Variant, CallErrorType>{
     ///         let name = this.base().get_name();
     ///         godot_print!("name is {name}");
     ///         // However, we cannot call methods that require `&mut Base`, such as:
@@ -451,7 +450,8 @@ impl<'a, T: ScriptInstance> SiMut<'a, T> {
     /// }
     /// ```
     pub fn base(&self) -> ScriptBaseRef<'_, T> {
-        ScriptBaseRef::new(self.base_ref.to_gd(), self.mut_ref)
+        let passive_gd = self.base_ref.to_script_passive();
+        ScriptBaseRef::new(passive_gd, self.mut_ref)
     }
 
     /// Returns a mutable reference suitable for calling engine methods on this object.
@@ -468,8 +468,10 @@ impl<'a, T: ScriptInstance> SiMut<'a, T> {
     /// # use godot::prelude::*;
     /// # use godot::classes::{ScriptLanguage, Script};
     /// # use godot::obj::script::{ScriptInstance, SiMut};
-    /// # use godot::meta::{MethodInfo, PropertyInfo};
+    /// # use godot::register::info::{MethodInfo, PropertyInfo};
+    /// # use godot::meta::error::CallErrorType;
     /// # use godot::sys;
+    ///
     /// struct ExampleScriptInstance;
     ///
     /// impl ScriptInstance for ExampleScriptInstance {
@@ -479,7 +481,7 @@ impl<'a, T: ScriptInstance> SiMut<'a, T> {
     ///         mut this: SiMut<Self>,
     ///         method: StringName,
     ///         args: &[&Variant],
-    ///     ) -> Result<Variant, sys::GDExtensionCallErrorType> {
+    ///     ) -> Result<Variant, CallErrorType> {
     ///         // Check whether method is available on this script
     ///         if method == StringName::from("script_method") {
     ///             godot_print!("script_method called!");
@@ -514,8 +516,9 @@ impl<'a, T: ScriptInstance> SiMut<'a, T> {
     /// ```
     pub fn base_mut(&mut self) -> ScriptBaseMut<'_, T> {
         let guard = self.cell.make_inaccessible(self.mut_ref).unwrap();
+        let passive_gd = self.base_ref.to_script_passive();
 
-        ScriptBaseMut::new(self.base_ref.to_gd(), guard)
+        ScriptBaseMut::new(passive_gd, guard)
     }
 }
 
@@ -581,7 +584,6 @@ mod bounded_ptr_list {
         /// - `ptr` must not have been used in a call to this function before.
         /// - `ptr` must not have been mutated since the call to `list_into_sys`.
         /// - `ptr` must not be accessed after calling this function.
-        #[deny(unsafe_op_in_unsafe_fn)]
         pub unsafe fn list_from_sys(&self, ptr: *const T) -> Box<[T]> {
             let ptr: *mut T = ptr.cast_mut();
             let len = self
@@ -602,20 +604,22 @@ mod bounded_ptr_list {
     }
 }
 
-#[deny(unsafe_op_in_unsafe_fn)]
+#[cfg(before_api = "4.3")]
+use self::bounded_ptr_list::BoundedPtrList;
+
 mod script_instance_info {
     use std::any::type_name;
     use std::ffi::c_void;
 
-    use crate::builtin::{StringName, Variant};
-    use crate::private::handle_panic;
-    use crate::sys;
-
-    use super::{ScriptInstance, ScriptInstanceData, SiMut};
-    use crate::meta::{MethodInfo, PropertyInfo};
-    use sys::conv::{bool_to_sys, SYS_FALSE, SYS_TRUE};
+    use sys::conv::{SYS_FALSE, SYS_TRUE, bool_to_sys};
     #[cfg(since_api = "4.3")]
     use sys::conv::{ptr_list_from_sys, ptr_list_into_sys};
+
+    use super::{ScriptInstance, ScriptInstanceData, SiMut};
+    use crate::builtin::{StringName, Variant};
+    use crate::private::{PanicPayload, handle_panic};
+    use crate::registry::info::{MethodInfo, PropertyInfo};
+    use crate::sys;
 
     /// # Safety
     ///
@@ -627,22 +631,15 @@ mod script_instance_info {
         p_name: sys::GDExtensionConstStringNamePtr,
         p_value: sys::GDExtensionConstVariantPtr,
     ) -> sys::GDExtensionBool {
-        let (name, value);
-        // SAFETY: `p_name` and `p_value` are valid pointers to a `StringName` and `Variant`.
+        let (instance, name, value);
+        // SAFETY: `p_instance` is valid for this call; `p_name` and `p_value` are valid `StringName` and `Variant` pointers.
         unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
             name = StringName::new_from_string_sys(p_name);
             value = Variant::borrow_var_sys(p_value);
         }
-        let ctx = || format!("error when calling {}::set", type_name::<T>());
-
-        let result = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
-            let mut guard = instance.borrow_mut();
-
-            let instance_guard = SiMut::new(instance.cell_ref(), &mut guard, &instance.base);
-
-            ScriptInstance::set_property(instance_guard, name, value)
+        let result = with_instance_mut(instance, "set", |i| {
+            ScriptInstance::set_property(i, name, value)
         })
         // Unwrapping to a default of false, to indicate that the assignment is not handled by the script.
         .unwrap_or_default();
@@ -660,16 +657,13 @@ mod script_instance_info {
         p_name: sys::GDExtensionConstStringNamePtr,
         r_ret: sys::GDExtensionVariantPtr,
     ) -> sys::GDExtensionBool {
-        // SAFETY: `p_name` is a valid [`StringName`] pointer.
-        let name = unsafe { StringName::new_from_string_sys(p_name) };
-        let ctx = || format!("error when calling {}::get", type_name::<T>());
-
-        let return_value = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .get_property(name)
-        });
+        let (instance, name);
+        // SAFETY: `p_instance` is valid for this call; `p_name` is a valid `StringName` pointer.
+        unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
+            name = StringName::new_from_string_sys(p_name);
+        }
+        let return_value = with_instance(instance, "get", |i| i.get_property(name));
 
         match return_value {
             Ok(Some(variant)) => {
@@ -689,18 +683,10 @@ mod script_instance_info {
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
         r_count: *mut u32,
     ) -> *const sys::GDExtensionPropertyInfo {
-        let ctx = || format!("error when calling {}::get_property_list", type_name::<T>());
-
-        // Encapsulate this unsafe block to avoid repeating the safety comment.
-        // SAFETY: This closure is only used in this function, and we may dereference `p_instance` to an immutable reference for the duration of
-        // this call.
-        let borrow_instance =
-            move || unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
-
-        let property_list = handle_panic(ctx, || {
-            let property_list = borrow_instance().borrow().get_property_list();
-
-            property_list
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        let property_list = with_instance(instance, "get_property_list", |i| {
+            i.get_property_list()
                 .into_iter()
                 .map(|prop| prop.into_owned_property_sys())
                 .collect::<Vec<_>>()
@@ -708,9 +694,7 @@ mod script_instance_info {
         .unwrap_or_default();
 
         #[cfg(before_api = "4.3")]
-        let (list_ptr, list_length) = borrow_instance()
-            .property_lists
-            .list_into_sys(property_list);
+        let (list_ptr, list_length) = instance.property_lists.list_into_sys(property_list);
 
         #[cfg(since_api = "4.3")]
         let (list_ptr, list_length) = ptr_list_into_sys(property_list);
@@ -731,18 +715,10 @@ mod script_instance_info {
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
         r_count: *mut u32,
     ) -> *const sys::GDExtensionMethodInfo {
-        let ctx = || format!("error when calling {}::get_method_list", type_name::<T>());
-
-        // Encapsulate this unsafe block to avoid repeating the safety comment.
-        // SAFETY: This closure is only used in this function, and we may dereference `p_instance` to an immutable reference for the duration of
-        // this call.
-        let borrow_instance =
-            move || unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
-
-        let method_list = handle_panic(ctx, || {
-            let method_list = borrow_instance().borrow().get_method_list();
-
-            method_list
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        let method_list = with_instance(instance, "get_method_list", |i| {
+            i.get_method_list()
                 .into_iter()
                 .map(|method| method.into_owned_method_sys())
                 .collect()
@@ -750,8 +726,7 @@ mod script_instance_info {
         .unwrap_or_default();
 
         #[cfg(before_api = "4.3")]
-        let (return_pointer, list_length) =
-            borrow_instance().method_lists.list_into_sys(method_list);
+        let (return_pointer, list_length) = instance.method_lists.list_into_sys(method_list);
         #[cfg(since_api = "4.3")]
         let (return_pointer, list_length) = ptr_list_into_sys(method_list);
 
@@ -772,12 +747,12 @@ mod script_instance_info {
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
         p_prop_info: *const sys::GDExtensionPropertyInfo,
     ) {
-        // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
-
-        // SAFETY: `p_prop_info` was returned from a call to `list_into_sys`, and has not been mutated since. This is also the first call
-        // to `list_from_sys` with this pointer.
-        let property_infos = unsafe { instance.property_lists.list_from_sys(p_prop_info) };
+        let (instance, property_infos);
+        // SAFETY: `p_instance` is valid for this call; `p_prop_info` was returned from `list_into_sys` and has not been mutated since.
+        unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
+            property_infos = instance.property_lists.list_from_sys(p_prop_info);
+        }
 
         for info in property_infos.iter() {
             // SAFETY: `info` was returned from a call to `into_owned_property_sys` and this is the first and only time this function is called
@@ -796,8 +771,7 @@ mod script_instance_info {
         p_prop_info: *const sys::GDExtensionPropertyInfo,
         p_len: u32,
     ) {
-        // SAFETY: `p_prop_info` was returned from a call to `list_into_sys`, and has not been mutated since. This is also the first call
-        // to `list_from_sys` with this pointer.
+        // SAFETY: `p_prop_info` was returned from `list_into_sys` and has not been mutated since.
         let property_infos = unsafe { ptr_list_from_sys(p_prop_info, p_len) };
 
         for info in property_infos.iter() {
@@ -824,27 +798,20 @@ mod script_instance_info {
         r_return: sys::GDExtensionVariantPtr,
         r_error: *mut sys::GDExtensionCallError,
     ) {
-        // SAFETY: `p_method` is a valid [`StringName`] pointer.
-        let method = unsafe { StringName::new_from_string_sys(p_method) };
-        // SAFETY: `p_args` is a valid array of length `p_argument_count`
-        let args = unsafe {
-            Variant::borrow_ref_slice(
+        let (instance, method, args);
+        // SAFETY: `p_self` is valid during call; `p_method` is a valid `StringName` pointer; `p_args` is a valid array of len `p_argument_count`.
+        unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_self);
+            method = StringName::new_from_string_sys(p_method);
+            args = Variant::borrow_ref_slice(
                 p_args,
                 p_argument_count
                     .try_into()
                     .expect("argument count should be a valid `u32`"),
-            )
-        };
-        let ctx = || format!("error when calling {}::call", type_name::<T>());
-
-        let result = handle_panic(ctx, || {
-            // SAFETY: `p_self` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_self) };
-            let mut guard = instance.borrow_mut();
-
-            let instance_guard = SiMut::new(instance.cell_ref(), &mut guard, &instance.base);
-
-            ScriptInstance::call(instance_guard, method.clone(), args)
+            );
+        }
+        let result = with_instance_mut(instance, "call", |i| {
+            ScriptInstance::call(i, method.clone(), args)
         });
 
         let error = match result {
@@ -854,7 +821,7 @@ mod script_instance_info {
                 sys::GDEXTENSION_CALL_OK
             }
 
-            Ok(Err(err)) => err,
+            Ok(Err(err)) => err.to_sys(),
 
             Err(_) => sys::GDEXTENSION_CALL_ERROR_INVALID_METHOD,
         };
@@ -872,15 +839,9 @@ mod script_instance_info {
     pub(super) unsafe extern "C" fn get_script_func<T: ScriptInstance>(
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
     ) -> sys::GDExtensionObjectPtr {
-        let ctx = || format!("error when calling {}::get_script", type_name::<T>());
-
-        let script = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .get_script()
-                .clone()
-        });
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        let script = with_instance(instance, "get_script", |i| i.get_script().clone());
 
         match script {
             Ok(script) => script.obj_sys(),
@@ -894,15 +855,10 @@ mod script_instance_info {
     pub(super) unsafe extern "C" fn is_placeholder_func<T: ScriptInstance>(
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
     ) -> sys::GDExtensionBool {
-        let ctx = || format!("error when calling {}::is_placeholder", type_name::<T>());
-
-        let is_placeholder = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .is_placeholder()
-        })
-        .unwrap_or_default();
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        let is_placeholder =
+            with_instance(instance, "is_placeholder", |i| i.is_placeholder()).unwrap_or_default();
 
         bool_to_sys(is_placeholder)
     }
@@ -915,17 +871,14 @@ mod script_instance_info {
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
         p_method: sys::GDExtensionConstStringNamePtr,
     ) -> sys::GDExtensionBool {
-        // SAFETY: `p_method` is a valid [`StringName`] pointer.
-        let method = unsafe { StringName::new_from_string_sys(p_method) };
-        let ctx = || format!("error when calling {}::has_method", type_name::<T>());
-
-        let has_method = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .has_method(method)
-        })
-        .unwrap_or_default();
+        let (instance, method);
+        // SAFETY: `p_instance` is valid for this call; `p_method` is a valid `StringName` pointer.
+        unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
+            method = StringName::new_from_string_sys(p_method);
+        }
+        let has_method =
+            with_instance(instance, "has_method", |i| i.has_method(method)).unwrap_or_default();
 
         bool_to_sys(has_method)
     }
@@ -940,12 +893,12 @@ mod script_instance_info {
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
         p_method_info: *const sys::GDExtensionMethodInfo,
     ) {
-        // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
-
-        // SAFETY: `p_method_info` was returned from a call to `list_into_sys`, and has not been mutated since. This is also the first call
-        // to `list_from_sys` with this pointer.
-        let method_infos = unsafe { instance.method_lists.list_from_sys(p_method_info) };
+        let (instance, method_infos);
+        // SAFETY: `p_instance` is valid for this call; `p_method_info` was returned from `list_into_sys` and has not been mutated since.
+        unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
+            method_infos = instance.method_lists.list_from_sys(p_method_info);
+        }
 
         for info in method_infos.iter() {
             // SAFETY: `info` was returned from a call to `into_owned_method_sys`, and this is the first and only time we call this method on
@@ -965,8 +918,7 @@ mod script_instance_info {
         p_method_info: *const sys::GDExtensionMethodInfo,
         p_len: u32,
     ) {
-        // SAFETY: `p_method_info` was returned from a call to `list_into_sys`, and has not been mutated since. This is also the first call
-        // to `list_from_sys` with this pointer.
+        // SAFETY: `p_method_info` was returned from `list_into_sys` and has not been mutated since.
         let method_infos = unsafe { ptr_list_from_sys(p_method_info, p_len) };
 
         for info in method_infos.iter() {
@@ -986,20 +938,14 @@ mod script_instance_info {
         p_name: sys::GDExtensionConstStringNamePtr,
         r_is_valid: *mut sys::GDExtensionBool,
     ) -> sys::GDExtensionVariantType {
-        let ctx = || {
-            format!(
-                "error while calling {}::get_property_type",
-                type_name::<T>()
-            )
-        };
-        // SAFETY: `p_name` is a valid [`StringName`] pointer.
-        let name = unsafe { StringName::new_from_string_sys(p_name) };
-
-        let result = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .get_property_type(name.clone())
+        let (instance, name);
+        // SAFETY: `p_instance` is valid for this call; `p_name` is a valid `StringName` pointer.
+        unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
+            name = StringName::new_from_string_sys(p_name);
+        }
+        let result = with_instance(instance, "get_property_type", |i| {
+            i.get_property_type(name.clone())
         });
 
         let (is_valid, result) = if let Ok(result) = result {
@@ -1023,15 +969,9 @@ mod script_instance_info {
         r_is_valid: *mut sys::GDExtensionBool,
         r_str: sys::GDExtensionStringPtr,
     ) {
-        let ctx = || format!("error when calling {}::to_string", type_name::<T>());
-
-        let string = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .to_string()
-        })
-        .ok();
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        let string = with_instance(instance, "to_string", |i| i.to_string()).ok();
 
         let Some(string) = string else {
             return;
@@ -1055,20 +995,11 @@ mod script_instance_info {
         property_state_add: sys::GDExtensionScriptInstancePropertyStateAdd,
         userdata: *mut c_void,
     ) {
-        let ctx = || {
-            format!(
-                "error when calling {}::get_property_state",
-                type_name::<T>()
-            )
-        };
-
-        let property_states = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .get_property_state()
-        })
-        .unwrap_or_default();
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        let property_states =
+            with_instance(instance, "get_property_state", |i| i.get_property_state())
+                .unwrap_or_default();
 
         let Some(property_state_add) = property_state_add else {
             return;
@@ -1095,14 +1026,9 @@ mod script_instance_info {
     pub(super) unsafe extern "C" fn get_language_func<T: ScriptInstance>(
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
     ) -> sys::GDExtensionScriptLanguagePtr {
-        let ctx = || format!("error when calling {}::get_language", type_name::<T>());
-
-        let language = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .get_language()
-        });
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        let language = with_instance(instance, "get_language", |i| i.get_language());
 
         if let Ok(language) = language {
             language.obj_sys().cast()
@@ -1126,18 +1052,10 @@ mod script_instance_info {
     pub(super) unsafe extern "C" fn refcount_decremented_func<T: ScriptInstance>(
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
     ) -> sys::GDExtensionBool {
-        let ctx = || {
-            format!(
-                "error when calling {}::refcount_decremented",
-                type_name::<T>()
-            )
-        };
-
-        let result = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .on_refcount_decremented()
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        let result = with_instance(instance, "refcount_decremented", |i| {
+            i.on_refcount_decremented()
         })
         .unwrap_or(true);
 
@@ -1150,18 +1068,10 @@ mod script_instance_info {
     pub(super) unsafe extern "C" fn refcount_incremented_func<T: ScriptInstance>(
         p_instance: sys::GDExtensionScriptInstanceDataPtr,
     ) {
-        let ctx = || {
-            format!(
-                "error when calling {}::refcount_incremented",
-                type_name::<T>()
-            )
-        };
-
-        handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .on_refcount_incremented();
+        // SAFETY: `p_instance` is valid for this call.
+        let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
+        with_instance(instance, "refcount_incremented", |i| {
+            i.on_refcount_incremented()
         })
         .unwrap_or_default();
     }
@@ -1176,21 +1086,15 @@ mod script_instance_info {
         p_name: sys::GDExtensionConstStringNamePtr,
         r_ret: sys::GDExtensionVariantPtr,
     ) -> sys::GDExtensionBool {
-        // SAFETY: `p_name` is a valid `StringName` pointer.
-        let name = unsafe { StringName::new_from_string_sys(p_name) };
+        let (instance, name);
+        // SAFETY: `p_instance` is valid for this call; `p_name` is a valid `StringName` pointer.
+        unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
+            name = StringName::new_from_string_sys(p_name);
+        }
 
-        let ctx = || {
-            format!(
-                "error when calling {}::property_get_fallback",
-                type_name::<T>()
-            )
-        };
-
-        let return_value = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                .borrow()
-                .property_get_fallback(name)
+        let return_value = with_instance(instance, "property_get_fallback", |i| {
+            i.property_get_fallback(name)
         });
 
         match return_value {
@@ -1213,27 +1117,16 @@ mod script_instance_info {
         p_name: sys::GDExtensionConstStringNamePtr,
         p_value: sys::GDExtensionConstVariantPtr,
     ) -> sys::GDExtensionBool {
-        let (name, value);
-        // SAFETY: `p_name` and `p_value` are valid `StringName` and `Variant` pointers respectively.
+        let (instance, name, value);
+        // SAFETY: `p_instance` is valid for this call; `p_name` and `p_value` are valid `StringName` and `Variant` pointers.
         unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
             name = StringName::new_from_string_sys(p_name);
             value = Variant::borrow_var_sys(p_value);
-        };
+        }
 
-        let ctx = || {
-            format!(
-                "error when calling {}::property_set_fallback",
-                type_name::<T>()
-            )
-        };
-
-        let result = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            let instance = unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) };
-            let mut guard = instance.borrow_mut();
-
-            let instance_guard = SiMut::new(instance.cell_ref(), &mut guard, &instance.base);
-            ScriptInstance::property_set_fallback(instance_guard, name, value)
+        let result = with_instance_mut(instance, "property_set_fallback", |i| {
+            ScriptInstance::property_set_fallback(i, name, value)
         })
         .unwrap_or_default();
 
@@ -1251,24 +1144,16 @@ mod script_instance_info {
         p_method: sys::GDExtensionConstStringNamePtr,
         r_is_valid: *mut sys::GDExtensionBool,
     ) -> sys::GDExtensionInt {
-        // SAFETY: `p_method` is a valid [`StringName`] pointer.
-        let method = unsafe { StringName::new_from_string_sys(p_method) };
-        let ctx = || {
-            format!(
-                "error when calling {}::get_method_argument_count_func",
-                type_name::<T>()
-            )
-        };
-
-        let method_argument_count = handle_panic(ctx, || {
-            // SAFETY: `p_instance` points to a live immutable `ScriptInstanceData<T>` for the duration of this call.
-            unsafe { ScriptInstanceData::<T>::borrow_script_sys(p_instance) }
-                // Can panic if the GdCell is currently mutably bound.
-                .borrow()
-                // This is user code and could cause a panic.
-                .get_method_argument_count(method)
-        })
+        let (instance, method);
+        // SAFETY: `p_instance` is valid for this call; `p_method` is a valid `StringName` pointer.
+        unsafe {
+            instance = ScriptInstanceData::<T>::borrow_script_sys(p_instance);
+            method = StringName::new_from_string_sys(p_method);
+        }
         // In case of a panic, handle_panic will print an error message. We will recover from the panic by falling back to the default value None.
+        let method_argument_count = with_instance(instance, "get_method_argument_count", |i| {
+            i.get_method_argument_count(method)
+        })
         .unwrap_or_default();
 
         let (result, is_valid) = match method_argument_count {
@@ -1280,5 +1165,29 @@ mod script_instance_info {
         unsafe { *r_is_valid = is_valid };
 
         result.into()
+    }
+
+    fn error_ctx<T: ScriptInstance>(method: &'static str) -> impl Fn() -> String {
+        move || format!("{}::{method}(), script instance method", type_name::<T>())
+    }
+
+    fn with_instance<T: ScriptInstance, R>(
+        instance: &ScriptInstanceData<T>,
+        method: &'static str,
+        f: impl FnOnce(&T) -> R + std::panic::UnwindSafe,
+    ) -> Result<R, PanicPayload> {
+        handle_panic(error_ctx::<T>(method), || f(&instance.borrow()))
+    }
+
+    fn with_instance_mut<T: ScriptInstance, R>(
+        instance: &ScriptInstanceData<T>,
+        method: &'static str,
+        f: impl FnOnce(SiMut<T>) -> R + std::panic::UnwindSafe,
+    ) -> Result<R, PanicPayload> {
+        handle_panic(error_ctx::<T>(method), || {
+            let mut guard = instance.borrow_mut();
+            let instance_guard = SiMut::new(instance.cell_ref(), &mut guard, &instance.base);
+            f(instance_guard)
+        })
     }
 }

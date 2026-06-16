@@ -5,9 +5,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::marker::PhantomData;
+
 use crate as sys;
 use crate::VariantType;
-use std::marker::PhantomData;
 
 /// Types that can directly and fully represent some Godot type.
 ///
@@ -27,11 +28,6 @@ use std::marker::PhantomData;
 pub unsafe trait GodotFfi {
     #[doc(hidden)]
     const VARIANT_TYPE: ExtVariantType;
-
-    #[doc(hidden)]
-    fn default_param_metadata() -> sys::GDExtensionClassMethodArgumentMetadata {
-        sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_NONE
-    }
 
     /// Construct from Godot opaque pointer.
     ///
@@ -236,19 +232,19 @@ macro_rules! ffi_methods_one {
     // type $Ptr = *mut Self
     (SelfPtr $Ptr:ty; $( #[$attr:meta] )? $vis:vis $new_from_sys:ident = new_from_sys) => {
         $( #[$attr] )? $vis
-        unsafe fn $new_from_sys(ptr: <$Ptr as $crate::SysPtr>::Const) -> Self {
+        unsafe fn $new_from_sys(ptr: <$Ptr as $crate::SysPtr>::Const) -> Self { unsafe {
             let borrowed = &*ptr.cast::<Self>();
             borrowed.clone()
-        }
+        }}
     };
     (SelfPtr $Ptr:ty; $( #[$attr:meta] )? $vis:vis $new_with_uninit:ident = new_with_uninit) => {
         $( #[$attr] )? $vis
-        unsafe fn $new_with_uninit(init: impl FnOnce(<$Ptr as $crate::SysPtr>::Uninit)) -> Self {
+        unsafe fn $new_with_uninit(init: impl FnOnce(<$Ptr as $crate::SysPtr>::Uninit)) -> Self { unsafe {
             let mut raw = std::mem::MaybeUninit::<Self>::uninit();
             init(raw.as_mut_ptr().cast());
 
             raw.assume_init()
-        }
+        }}
     };
     (SelfPtr $Ptr:ty; $( #[$attr:meta] )? $vis:vis $new_with_init:ident = new_with_init) => {
         $( #[$attr] )? $vis
@@ -272,15 +268,15 @@ macro_rules! ffi_methods_one {
     };
     (SelfPtr $Ptr:ty; $( #[$attr:meta] )? $vis:vis $from_arg_ptr:ident = from_arg_ptr) => {
         $( #[$attr] )? $vis
-        unsafe fn $from_arg_ptr(ptr: $Ptr, _call_type: $crate::PtrcallType) -> Self {
+        unsafe fn $from_arg_ptr(ptr: $Ptr, _call_type: $crate::PtrcallType) -> Self { unsafe {
             Self::new_from_sys(ptr.cast())
-        }
+        }}
     };
     (SelfPtr $Ptr:ty; $( #[$attr:meta] )? $vis:vis $move_return_ptr:ident = move_return_ptr) => {
         $( #[$attr] )? $vis
-        unsafe fn $move_return_ptr(self, dst: $Ptr, _call_type: $crate::PtrcallType) {
+        unsafe fn $move_return_ptr(self, dst: $Ptr, _call_type: $crate::PtrcallType) { unsafe {
             *(dst.cast::<Self>()) = self
-        }
+        }}
     };
 }
 
@@ -324,7 +320,7 @@ macro_rules! ffi_methods_rest {
 ///   Implements FFI methods for a type implemented with standard Rust fields (not opaque).
 ///   The address of `Self` is directly reinterpreted as the sys pointer.
 ///   The size of the corresponding sys type (the `N` in `Opaque*<N>`) must not be bigger than `size_of::<Self>()`.
-///   This cannot be checked easily, because Self cannot be used in size_of(). There would of course be workarounds.
+///   This cannot be checked easily, because Self cannot be used in size_of(). There would certainly be workarounds.
 ///
 /// Using this macro as a complete implementation for [`GodotFfi`] is sound only when:
 ///
@@ -460,19 +456,11 @@ mod scalars {
     unsafe impl GodotFfi for i64 {
         const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::INT);
 
-        fn default_param_metadata() -> sys::GDExtensionClassMethodArgumentMetadata {
-            sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_INT_IS_INT64
-        }
-
         ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
     }
 
     unsafe impl GodotFfi for f64 {
         const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::FLOAT);
-
-        fn default_param_metadata() -> sys::GDExtensionClassMethodArgumentMetadata {
-            sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_REAL_IS_DOUBLE
-        }
 
         ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
     }

@@ -5,34 +5,44 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use super::*;
-use crate::builtin::*;
-use crate::global;
-use crate::meta::error::{ConvertError, FromVariantError};
-use crate::meta::{
-    ArrayElement, GodotFfiVariant, GodotType, PropertyHintInfo, PropertyInfo, RefArg,
-};
 use godot_ffi as sys;
+use sys::GodotFfi;
+
+use crate::builtin::*;
+use crate::meta::error::{ConvertError, FromVariantError};
+use crate::meta::sealed::Sealed;
+use crate::meta::{Element, GodotFfiVariant, GodotType, RefArg};
+use crate::registry::info::ParamMetadata;
+use crate::task::{DynamicSend, IntoDynamicSend, ThreadConfined, impl_dynamic_send};
+
 // For godot-cpp, see https://github.com/godotengine/godot-cpp/blob/master/include/godot_cpp/core/type_info.hpp.
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Macro definitions
 
-// Certain types need to be passed as initialized pointers in their from_variant implementations in 4.0. Because
-// 4.0 uses `*ptr = value` to return the type, and some types in C++ override `operator=` in C++ in a way
-// that requires the pointer to be initialized. But some other types will cause a memory leak in 4.1 if initialized.
-//
-// Therefore, we can use `init` to indicate when it must be initialized in 4.0.
+// Historical note: In Godot 4.0, certain types needed to be passed as initialized pointers in their from_variant implementations, because
+// 4.0 used `*ptr = value` to return the type, and some types in C++ override `operator=` in a way that requires the pointer to be initialized.
+// However, those same types would cause memory leaks in Godot 4.1 if pre-initialized. A compat layer `new_with_uninit_or_init()` addressed this.
+// As these Godot versions are no longer supported, the current implementation uses `new_with_uninit()` uniformly for all versions.
 macro_rules! impl_ffi_variant {
-    (ref $T:ty, $from_fn:ident, $to_fn:ident $(; $GodotTy:ident)?) => {
-        impl_ffi_variant!(@impls by_ref; $T, $from_fn, $to_fn $(; $GodotTy)?);
+    // With explicit metadata (e.g. for i64, f64).
+    (ref $T:ty, $from_fn:ident, $to_fn:ident; $metadata:expr) => {
+        impl_ffi_variant!(@impls by_ref, $metadata; $T, $from_fn, $to_fn);
     };
-    ($T:ty, $from_fn:ident, $to_fn:ident $(; $GodotTy:ident)?) => {
-        impl_ffi_variant!(@impls by_val; $T, $from_fn, $to_fn $(; $GodotTy)?);
+    ($T:ty, $from_fn:ident, $to_fn:ident; $metadata:expr) => {
+        impl_ffi_variant!(@impls by_val, $metadata; $T, $from_fn, $to_fn);
+    };
+
+    // Without metadata (defaults to ParamMetadata::NONE).
+    (ref $T:ty, $from_fn:ident, $to_fn:ident) => {
+        impl_ffi_variant!(@impls by_ref, ParamMetadata::NONE; $T, $from_fn, $to_fn);
+    };
+    ($T:ty, $from_fn:ident, $to_fn:ident) => {
+        impl_ffi_variant!(@impls by_val, ParamMetadata::NONE; $T, $from_fn, $to_fn);
     };
 
     // Implementations
-    (@impls $by_ref_or_val:ident; $T:ty, $from_fn:ident, $to_fn:ident $(; $GodotTy:ident)?) => {
+    (@impls $by_ref_or_val:ident, $metadata:expr; $T:ty, $from_fn:ident, $to_fn:ident) => {
         impl GodotFfiVariant for $T {
             fn ffi_to_variant(&self) -> Variant {
                 let variant = unsafe {
@@ -78,24 +88,12 @@ macro_rules! impl_ffi_variant {
                 Ok(ffi)
             }
 
-            impl_ffi_variant!(@godot_type_name $T $(, $GodotTy)?);
+            fn default_metadata() -> ParamMetadata {
+                $metadata
+            }
         }
 
-        impl ArrayElement for $T {}
-
-        impl_ffi_variant!(@as_arg $by_ref_or_val $T);
-    };
-
-    (@godot_type_name $T:ty) => {
-        fn godot_type_name() -> String {
-            stringify!($T).into()
-        }
-    };
-
-    (@godot_type_name $T:ty, $godot_type_name:ident) => {
-        fn godot_type_name() -> String {
-            stringify!($godot_type_name).into()
-        }
+        impl Element for $T {}
     };
 
     (@assoc_to_ffi by_ref) => {
@@ -113,14 +111,6 @@ macro_rules! impl_ffi_variant {
             self.clone()
         }
     };
-
-    (@as_arg by_ref $T:ty) => {
-        $crate::meta::impl_asarg_by_ref!($T);
-    };
-
-    (@as_arg by_val $T:ty) => {
-        $crate::meta::impl_asarg_by_value!($T);
-    };
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -135,8 +125,8 @@ mod impls {
     // used in codegen get_builtin_arg_passing().
 
     impl_ffi_variant!(bool, bool_to_variant, bool_from_variant);
-    impl_ffi_variant!(i64, int_to_variant, int_from_variant; int);
-    impl_ffi_variant!(f64, float_to_variant, float_from_variant; float);
+    impl_ffi_variant!(i64, int_to_variant, int_from_variant; ParamMetadata::INT_IS_INT64);
+    impl_ffi_variant!(f64, float_to_variant, float_from_variant; ParamMetadata::REAL_IS_DOUBLE);
     impl_ffi_variant!(Vector2, vector2_to_variant, vector2_from_variant);
     impl_ffi_variant!(Vector3, vector3_to_variant, vector3_from_variant);
     impl_ffi_variant!(Vector4, vector4_to_variant, vector4_from_variant);
@@ -151,110 +141,90 @@ mod impls {
     impl_ffi_variant!(Plane, plane_to_variant, plane_from_variant);
     impl_ffi_variant!(Rect2, rect2_to_variant, rect2_from_variant);
     impl_ffi_variant!(Rect2i, rect2i_to_variant, rect2i_from_variant);
-    impl_ffi_variant!(Aabb, aabb_to_variant, aabb_from_variant; AABB);
+    impl_ffi_variant!(Aabb, aabb_to_variant, aabb_from_variant);
     impl_ffi_variant!(Color, color_to_variant, color_from_variant);
-    impl_ffi_variant!(Rid, rid_to_variant, rid_from_variant; RID);
-    impl_ffi_variant!(ref GString, string_to_variant, string_from_variant; String);
+    impl_ffi_variant!(Rid, rid_to_variant, rid_from_variant);
+    impl_ffi_variant!(ref GString, string_to_variant, string_from_variant);
     impl_ffi_variant!(ref StringName, string_name_to_variant, string_name_from_variant);
     impl_ffi_variant!(ref NodePath, node_path_to_variant, node_path_from_variant);
-    impl_ffi_variant!(ref Dictionary, dictionary_to_variant, dictionary_from_variant);
-    impl_ffi_variant!(ref PackedByteArray, packed_byte_array_to_variant, packed_byte_array_from_variant);
-    impl_ffi_variant!(ref PackedInt32Array, packed_int32_array_to_variant, packed_int32_array_from_variant);
-    impl_ffi_variant!(ref PackedInt64Array, packed_int64_array_to_variant, packed_int64_array_from_variant);
-    impl_ffi_variant!(ref PackedFloat32Array, packed_float32_array_to_variant, packed_float32_array_from_variant);
-    impl_ffi_variant!(ref PackedFloat64Array, packed_float64_array_to_variant, packed_float64_array_from_variant);
-    impl_ffi_variant!(ref PackedStringArray, packed_string_array_to_variant, packed_string_array_from_variant);
-    impl_ffi_variant!(ref PackedVector2Array, packed_vector2_array_to_variant, packed_vector2_array_from_variant);
-    impl_ffi_variant!(ref PackedVector3Array, packed_vector3_array_to_variant, packed_vector3_array_from_variant);
-    impl_ffi_variant!(ref PackedColorArray, packed_color_array_to_variant, packed_color_array_from_variant);
     impl_ffi_variant!(ref Signal, signal_to_variant, signal_from_variant);
     impl_ffi_variant!(ref Callable, callable_to_variant, callable_from_variant);
+}
 
-    #[cfg(since_api = "4.2")]
-    mod api_4_2 {
-        use crate::builtin::Array;
-        use crate::meta::ArrayElement;
-        use crate::meta::sealed::Sealed;
-        use crate::task::{impl_dynamic_send, DynamicSend, IntoDynamicSend, ThreadConfined};
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Async trait support
 
+impl<T: Element> Sealed for ThreadConfined<Array<T>> {}
 
-        impl_dynamic_send!(
-            Send;
-            bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64
-        );
-
-        impl_dynamic_send!(
-            Send;
-            builtin::{
-                StringName, Transform2D, Transform3D, Vector2, Vector2i, Vector2Axis,
-                Vector3, Vector3i, Vector3Axis, Vector4, Vector4i, Rect2, Rect2i, Plane, Quaternion, Aabb, Basis, Projection, Color, Rid
-            }
-        );
-
-        impl<T: ArrayElement> Sealed for ThreadConfined<Array<T>> {}
-
-        unsafe impl<T:ArrayElement> DynamicSend for ThreadConfined<Array<T>> {
-            type Inner = Array<T>;
-            fn extract_if_safe(self) -> Option<Self::Inner> {
-                self.extract()
-            }
-        }
-
-        impl<T: ArrayElement> IntoDynamicSend for Array<T> {
-            type Target = ThreadConfined<Array<T>>;
-            fn into_dynamic_send(self) -> Self::Target {
-                crate::task::ThreadConfined::new(self)
-            }
-        }
-
-        impl_dynamic_send!(
-            !Send;
-            Variant, GString, Dictionary, Callable, NodePath, PackedByteArray, PackedInt32Array, PackedInt64Array, PackedFloat32Array,
-            PackedFloat64Array, PackedStringArray, PackedVector2Array, PackedVector3Array, PackedColorArray, Signal
-        );
-
-        // This should be kept in sync with crate::registry::signal::variadic.
-        impl_dynamic_send!(tuple; );
-        impl_dynamic_send!(tuple; arg1: A1);
-        impl_dynamic_send!(tuple; arg1: A1, arg2: A2);
-        impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3);
-        impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4);
-        impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5);
-        impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5, arg6: A6);
-        impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5, arg6: A6, arg7: A7);
-        impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5, arg6: A6, arg7: A7, arg8: A8);
-        impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5, arg6: A6, arg7: A7, arg8: A8, arg9: A9);
-    }
-
-    #[cfg(since_api = "4.3")]
-    mod api_4_3 {
-        use crate::task::impl_dynamic_send;
-
-        use super::*;
-
-        impl_ffi_variant!(ref PackedVector4Array, packed_vector4_array_to_variant, packed_vector4_array_from_variant);
-
-        impl_dynamic_send!(!Send; PackedVector4Array);
+unsafe impl<T: Element> DynamicSend for ThreadConfined<Array<T>> {
+    type Inner = Array<T>;
+    fn extract_if_safe(self) -> Option<Self::Inner> {
+        self.extract()
     }
 }
+
+impl<T: Element> IntoDynamicSend for Array<T> {
+    type Target = ThreadConfined<Array<T>>;
+    fn into_dynamic_send(self) -> Self::Target {
+        ThreadConfined::new(self)
+    }
+}
+
+impl_dynamic_send!(
+    Send;
+    bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64
+);
+
+impl_dynamic_send!(
+    Send;
+    StringName, Color, Rid,
+    Vector2, Vector2i, Vector2Axis,
+    Vector3, Vector3i, Vector3Axis,
+    Vector4, Vector4i,
+    Rect2, Rect2i, Aabb,
+    Transform2D, Transform3D, Basis,
+    Plane, Quaternion, Projection
+);
+
+impl_dynamic_send!(
+    !Send;
+    Variant, NodePath, GString, VarDictionary, Callable, Signal,
+    PackedByteArray, PackedInt32Array, PackedInt64Array, PackedFloat32Array, PackedFloat64Array, PackedStringArray,
+    PackedVector2Array, PackedVector3Array, PackedColorArray
+);
+
+// This should be kept in sync with crate::obj::signal::variadic.
+impl_dynamic_send!(tuple; );
+impl_dynamic_send!(tuple; arg1: A1);
+impl_dynamic_send!(tuple; arg1: A1, arg2: A2);
+impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3);
+impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4);
+impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5);
+impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5, arg6: A6);
+impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5, arg6: A6, arg7: A7);
+impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5, arg6: A6, arg7: A7, arg8: A8);
+impl_dynamic_send!(tuple; arg1: A1, arg2: A2, arg3: A3, arg4: A4, arg5: A5, arg6: A6, arg7: A7, arg8: A8, arg9: A9);
+
+#[cfg(since_api = "4.3")]
+mod api_4_3 {
+    use crate::task::impl_dynamic_send;
+
+    impl_dynamic_send!(!Send; PackedVector4Array);
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Internal verification
 
 // Compile time check that we cover all the Variant types with trait implementations for:
 // - IntoDynamicSend
 // - DynamicSend
 // - GodotType
-// - ArrayElement
+// - Element
 const _: () = {
     use crate::classes::Object;
     use crate::obj::{Gd, IndexEnum};
 
-    #[cfg(before_api = "4.2")]
-    const fn variant_type<T: GodotType + ArrayElement>() -> VariantType {
-        <T::Ffi as sys::GodotFfi>::VARIANT_TYPE.variant_as_nil()
-    }
-
-    #[cfg(since_api = "4.2")]
-    const fn variant_type<T: crate::task::IntoDynamicSend + GodotType + ArrayElement>(
-    ) -> VariantType {
+    const fn variant_type<T: crate::task::IntoDynamicSend + GodotType + Element>() -> VariantType {
         <T::Ffi as sys::GodotFfi>::VARIANT_TYPE.variant_as_nil()
     }
 
@@ -286,8 +256,8 @@ const _: () = {
     const OBJECT: VariantType = variant_type::<Gd<Object>>();
     const CALLABLE: VariantType = variant_type::<Callable>();
     const SIGNAL: VariantType = variant_type::<Signal>();
-    const DICTIONARY: VariantType = variant_type::<Dictionary>();
-    const ARRAY: VariantType = variant_type::<VariantArray>();
+    const DICTIONARY: VariantType = variant_type::<VarDictionary>();
+    const ARRAY: VariantType = variant_type::<VarArray>();
     const PACKED_BYTE_ARRAY: VariantType = variant_type::<PackedByteArray>();
     const PACKED_INT32_ARRAY: VariantType = variant_type::<PackedInt32Array>();
     const PACKED_INT64_ARRAY: VariantType = variant_type::<PackedInt64Array>();
@@ -385,10 +355,6 @@ impl GodotType for () {
     fn try_from_ffi(_: Self::Ffi) -> Result<Self, ConvertError> {
         Ok(())
     }
-
-    fn godot_type_name() -> String {
-        "Variant".to_string()
-    }
 }
 
 impl GodotFfiVariant for Variant {
@@ -415,23 +381,5 @@ impl GodotType for Variant {
 
     fn try_from_ffi(ffi: Self::Ffi) -> Result<Self, ConvertError> {
         Ok(ffi)
-    }
-
-    fn param_metadata() -> sys::GDExtensionClassMethodArgumentMetadata {
-        sys::GDEXTENSION_METHOD_ARGUMENT_METADATA_NONE
-    }
-
-    fn property_info(property_name: &str) -> PropertyInfo {
-        PropertyInfo {
-            variant_type: Self::VARIANT_TYPE.variant_as_nil(),
-            class_name: Self::class_name(),
-            property_name: StringName::from(property_name),
-            hint_info: PropertyHintInfo::none(),
-            usage: global::PropertyUsageFlags::DEFAULT | global::PropertyUsageFlags::NIL_IS_VARIANT,
-        }
-    }
-
-    fn godot_type_name() -> String {
-        "Variant".to_string()
     }
 }

@@ -5,34 +5,44 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-pub use crate::gen::classes::class_macros;
-pub use crate::obj::rtti::ObjectRtti;
-pub use crate::registry::callbacks;
-pub use crate::registry::plugin::{
-    ClassPlugin, DynTraitImpl, ErasedDynGd, ErasedRegisterFn, ITraitImpl, InherentImpl, PluginItem,
-    Struct,
-};
-#[cfg(since_api = "4.2")]
-pub use crate::registry::signal::priv_re_export::*;
-pub use crate::storage::{as_storage, Storage};
-pub use sys::out;
-
-#[cfg(all(since_api = "4.3", feature = "register-docs"))]
-pub use crate::possibly_docs::*;
-
-#[cfg(feature = "trace")]
-pub use crate::meta::trace;
-#[cfg(debug_assertions)]
+#[cfg(safeguards_strict)]
 use std::cell::RefCell;
-
-use crate::global::godot_error;
-use crate::meta::error::CallError;
-use crate::meta::CallContext;
-use crate::obj::Gd;
-use crate::{classes, sys};
 use std::io::Write;
 use std::sync::atomic;
+
 use sys::Global;
+
+use crate::global::godot_error;
+use crate::meta::CallContext;
+use crate::meta::error::{CallError, CallResult};
+use crate::obj::Gd;
+use crate::registry::property::Var;
+use crate::{classes, sys};
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Public re-exports
+
+mod reexport_pub {
+    #[cfg(all(since_api = "4.3", feature = "register-docs"))]
+    pub use crate::docs::{DocsItem, DocsPlugin, InherentImplDocs, StructDocs};
+    pub use crate::r#gen::classes::class_macros;
+    pub use crate::r#gen::virtuals; // virtual fn names, hashes, signatures
+    #[cfg(feature = "trace")]
+    pub use crate::meta::trace;
+    pub use crate::obj::rtti::ObjectRtti;
+    pub use crate::obj::signal::priv_re_export::*;
+    pub use crate::registry::callbacks;
+    pub use crate::registry::plugin::{
+        ClassPlugin, DynTraitImpl, ErasedDynGd, ErasedRegisterFn, ITraitImpl, InherentImpl,
+        PluginItem, Struct,
+    };
+    pub use crate::storage::{
+        IntoVirtualMethodReceiver, RecvGdSelf, RecvMut, RecvRef, Storage, VirtualMethodReceiver,
+        as_storage,
+    };
+    pub use crate::sys::out;
+}
+pub use reexport_pub::*;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Global variables
@@ -109,8 +119,7 @@ impl CallErrors {
 fn call_error_insert(err: CallError) -> i32 {
     // Wraps around if entire i32 is depleted. If this happens in practice (unlikely, users need to deliberately ignore errors that are printed),
     // we just overwrite the oldest errors, should still work.
-    let id = CALL_ERRORS.lock().insert(err);
-    id
+    CALL_ERRORS.lock().insert(err)
 }
 
 pub(crate) fn call_error_remove(in_error: &sys::GDExtensionCallError) -> Option<CallError> {
@@ -148,15 +157,15 @@ pub(crate) fn iterate_docs_plugins(mut visitor: impl FnMut(&DocsPlugin)) {
 }
 
 #[cfg(feature = "codegen-full")] // Remove if used in other scenarios.
-pub(crate) fn find_inherent_impl(class_name: crate::meta::ClassName) -> Option<InherentImpl> {
+pub(crate) fn find_inherent_impl(class_name: crate::meta::ClassId) -> Option<InherentImpl> {
     // We do this manually instead of using `iterate_plugins()` because we want to break as soon as we find a match.
     let plugins = __GODOT_PLUGIN_REGISTRY.lock().unwrap();
 
     plugins.iter().find_map(|elem| {
-        if elem.class_name == class_name {
-            if let PluginItem::InherentImpl(inherent_impl) = &elem.item {
-                return Some(inherent_impl.clone());
-            }
+        if elem.class_name == class_name
+            && let PluginItem::InherentImpl(inherent_impl) = &elem.item
+        {
+            return Some(inherent_impl.clone());
         }
 
         None
@@ -180,6 +189,14 @@ pub struct ClassConfig {
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
+// Type-checkers for user-defined getters/setters in Var
+
+// These functions are used to generate nice error messages if a #[var(get)], [var(get = my_getter)] etc. mismatches types.
+// Don't modify without thorough UX testing; the use of `impl Fn` vs. `fn` is deliberate.
+pub fn typecheck_getter<C, T: Var>(_getter: impl Fn(&C) -> T::PubType) {}
+pub fn typecheck_setter<C, T: Var>(_setter: fn(&mut C, T::PubType)) {}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
 // Capability queries and internal access
 
 pub fn auto_init<T>(l: &mut crate::obj::OnReady<T>, base: &crate::obj::Gd<crate::classes::Node>) {
@@ -191,7 +208,10 @@ pub unsafe fn has_virtual_script_method(
     object_ptr: sys::GDExtensionObjectPtr,
     method_sname: sys::GDExtensionConstStringNamePtr,
 ) -> bool {
-    sys::interface_fn!(object_has_script_method)(sys::to_const_ptr(object_ptr), method_sname) != 0
+    unsafe {
+        sys::interface_fn!(object_has_script_method)(sys::to_const_ptr(object_ptr), method_sname)
+            != 0
+    }
 }
 
 /// Ensure `T` is an editor plugin.
@@ -200,6 +220,8 @@ pub const fn is_editor_plugin<T: crate::obj::Inherits<crate::classes::EditorPlug
 // Starting from 4.3, Godot has "runtime classes"; this emulation is no longer needed.
 #[cfg(before_api = "4.3")]
 pub fn is_class_inactive(is_tool: bool) -> bool {
+    use crate::obj::Singleton;
+
     if is_tool {
         return false;
     }
@@ -227,6 +249,25 @@ pub fn is_class_runtime(is_tool: bool) -> bool {
     global_config.tool_only_in_editor
 }
 
+/// Converts a default parameter value to a runtime-immutable `Variant`.
+///
+/// This function is used internally by the `#[opt(default)]` attribute to:
+/// 1. Convert the value using `AsArg` trait for argument conversions (e.g. `"str"` for `AsArg<GString>`).
+/// 2. Apply immutability transformation.
+/// 3. Convert to `Variant` for Godot's storage.
+pub fn opt_default_value<T>(value: impl crate::meta::AsArg<T>) -> crate::builtin::Variant
+where
+    T: crate::meta::GodotImmutable + crate::meta::ToGodot + Clone,
+{
+    // We currently need cow_into_owned() to create an owned value for the immutability transform. This may be revisited once `#[opt]`
+    // supports more types (e.g. `Gd<RefCounted>`, where `cow_into_owned()` would increment ref-counts).
+
+    let value = crate::meta::AsArg::<T>::into_arg(value);
+    let value = value.cow_into_owned();
+    let value = <T as crate::meta::GodotImmutable>::into_runtime_immutable(value);
+    crate::builtin::Variant::from(value)
+}
+
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Panic *hook* management
 
@@ -243,8 +284,8 @@ pub fn extract_panic_message(err: &(dyn Send + std::any::Any)) -> String {
 pub fn format_panic_message(panic_info: &std::panic::PanicHookInfo) -> String {
     let mut msg = extract_panic_message(panic_info.payload());
 
-    if let Some(context) = get_gdext_panic_context() {
-        msg = format!("{msg}\nContext: {context}");
+    if let Some(context) = fetch_last_panic_context() {
+        msg = format!("{msg}\nin {context}"); // used to be "Context: {context}".
     }
 
     let prefix = if let Some(location) = panic_info.location() {
@@ -265,10 +306,10 @@ pub fn format_panic_message(panic_info: &std::panic::PanicHookInfo) -> String {
 }
 
 // Macro instead of function, to avoid 1 extra frame in backtrace.
-#[cfg(debug_assertions)]
+#[cfg(safeguards_strict)]
 #[macro_export]
 macro_rules! format_backtrace {
-    ($prefix:expr, $backtrace:expr) => {{
+    ($prefix:expr_2021, $backtrace:expr_2021) => {{
         use std::backtrace::BacktraceStatus;
 
         let backtrace = $backtrace;
@@ -286,12 +327,12 @@ macro_rules! format_backtrace {
         }
     }};
 
-    ($prefix:expr) => {
+    ($prefix:expr_2021) => {
         $crate::format_backtrace!($prefix, std::backtrace::Backtrace::capture())
     };
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(safeguards_strict))]
 #[macro_export]
 macro_rules! format_backtrace {
     ($prefix:expr $(, $backtrace:expr)? ) => {
@@ -333,20 +374,27 @@ pub(crate) fn has_error_print_level(level: u8) -> bool {
 
 /// Internal type used to store context information for debug purposes. Debug context is stored on the thread-local
 /// ERROR_CONTEXT_STACK, which can later be used to retrieve the current context in the event of a panic. This value
-/// probably shouldn't be used directly; use ['get_gdext_panic_context()'](get_gdext_panic_context) instead.
-#[cfg(debug_assertions)]
+/// probably shouldn't be used directly; use ['get_gdext_panic_context()'](fetch_last_panic_context) instead.
+#[cfg(safeguards_strict)]
 struct ScopedFunctionStack {
     functions: Vec<*const dyn Fn() -> String>,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(safeguards_strict)]
 impl ScopedFunctionStack {
     /// # Safety
     /// Function must be removed (using [`pop_function()`](Self::pop_function)) before lifetime is invalidated.
-    unsafe fn push_function(&mut self, function: &dyn Fn() -> String) {
-        let function = std::ptr::from_ref(function);
-        #[allow(clippy::unnecessary_cast)]
-        let function = function as *const (dyn Fn() -> String + 'static);
+    unsafe fn push_function<'a, 'b>(&'a mut self, function: &'b (dyn Fn() -> String + 'b)) {
+        // SAFETY: Function has its lifetime `'b` extended to `'static` to satisfy the signature
+        // of `functions` which has an implied `'static` bound.
+        // Given function must be removed before lifetime `'b` is invalidated.
+        let function = unsafe {
+            std::mem::transmute::<
+                *const (dyn Fn() -> String + 'b),
+                *const (dyn Fn() -> String + 'static),
+            >(function)
+        };
+
         self.functions.push(function);
     }
 
@@ -364,7 +412,7 @@ impl ScopedFunctionStack {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(safeguards_strict)]
 thread_local! {
     static ERROR_CONTEXT_STACK: RefCell<ScopedFunctionStack> = const {
         RefCell::new(ScopedFunctionStack { functions: Vec::new() })
@@ -372,11 +420,11 @@ thread_local! {
 }
 
 // Value may return `None`, even from panic hook, if called from a non-Godot thread.
-pub fn get_gdext_panic_context() -> Option<String> {
-    #[cfg(debug_assertions)]
+pub fn fetch_last_panic_context() -> Option<String> {
+    #[cfg(safeguards_strict)]
     return ERROR_CONTEXT_STACK.with(|cell| cell.borrow().get_last());
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(safeguards_strict))]
     None
 }
 
@@ -406,17 +454,17 @@ impl PanicPayload {
 ///
 /// Returns `Err(message)` if a panic occurred, and `Ok(result)` with the result of `code` otherwise.
 ///
-/// In contrast to [`handle_varcall_panic`] and [`handle_ptrcall_panic`], this function is not intended for use in `try_` functions,
+/// In contrast to [`handle_fallible_varcall`] and [`handle_fallible_ptrcall`], this function is not intended for use in `try_` functions,
 /// where the error is propagated as a `CallError` in a global variable.
 pub fn handle_panic<E, F, R>(error_context: E, code: F) -> Result<R, PanicPayload>
 where
     E: Fn() -> String,
     F: FnOnce() -> R + std::panic::UnwindSafe,
 {
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(safeguards_strict))]
     let _ = error_context; // Unused in Release.
 
-    #[cfg(debug_assertions)]
+    #[cfg(safeguards_strict)]
     ERROR_CONTEXT_STACK.with(|cell| unsafe {
         // SAFETY: &error_context is valid for lifetime of function, and is removed from LAST_ERROR_CONTEXT before end of function.
         cell.borrow_mut().push_function(&error_context)
@@ -424,77 +472,92 @@ where
 
     let result = std::panic::catch_unwind(code).map_err(PanicPayload::new);
 
-    #[cfg(debug_assertions)]
+    #[cfg(safeguards_strict)]
     ERROR_CONTEXT_STACK.with(|cell| cell.borrow_mut().pop_function());
     result
 }
 
-// TODO(bromeon): make call_ctx lazy-evaluated (like error_ctx) everywhere;
-// or make it eager everywhere and ensure it's cheaply constructed in the call sites.
-pub fn handle_varcall_panic<F, R>(
+/// Invokes a function with the _varcall_ calling convention, handling both expected errors and user panics.
+pub fn handle_fallible_varcall<F, R>(
     call_ctx: &CallContext,
     out_err: &mut sys::GDExtensionCallError,
     code: F,
 ) where
-    F: FnOnce() -> Result<R, CallError> + std::panic::UnwindSafe,
+    F: FnOnce() -> CallResult<R> + std::panic::UnwindSafe,
 {
-    let outcome: Result<Result<R, CallError>, PanicPayload> =
-        handle_panic(|| call_ctx.to_string(), code);
-
-    let call_error = match outcome {
-        // All good.
-        Ok(Ok(_result)) => return,
-
-        // Call error signalled by Godot's or gdext's validation.
-        Ok(Err(err)) => err,
-
-        // Panic occurred (typically through user): forward message.
-        Err(panic_msg) => CallError::failed_by_user_panic(call_ctx, panic_msg),
-    };
-
-    let error_id = report_call_error(call_error, true);
-
-    // Abuse 'argument' field to store our ID.
-    *out_err = sys::GDExtensionCallError {
-        error: sys::GODOT_RUST_CUSTOM_CALL_ERROR,
-        argument: error_id,
-        expected: 0,
+    if let Some(error_id) = handle_fallible_call(call_ctx, code, true) {
+        // Abuse 'argument' field to store our ID.
+        *out_err = sys::GDExtensionCallError {
+            error: sys::GODOT_RUST_CUSTOM_CALL_ERROR,
+            argument: error_id,
+            expected: 0,
+        };
     };
 
     //sys::interface_fn!(variant_new_nil)(sys::AsUninit::as_uninit(ret));
 }
 
-pub fn handle_ptrcall_panic<F, R>(call_ctx: &CallContext, code: F)
+/// Invokes a function with the _ptrcall_ calling convention, handling both expected errors and user panics.
+pub fn handle_fallible_ptrcall<F>(call_ctx: &CallContext, code: F)
 where
-    F: FnOnce() -> R + std::panic::UnwindSafe,
+    F: FnOnce() -> CallResult<()> + std::panic::UnwindSafe,
 {
-    let outcome: Result<R, PanicPayload> = handle_panic(|| call_ctx.to_string(), code);
+    handle_fallible_call(call_ctx, code, false);
+}
+
+/// Common error handling for fallible calls, handling detectable errors and user panics.
+///
+/// Returns `None` if the call succeeded, or `Some(error_id)` if it failed.
+///
+/// `track_globally` indicates whether the error should be stored as an index in the global error database (for varcall calls), to convey
+/// out-of-band, godot-rust specific error information to the caller.
+fn handle_fallible_call<F, R>(call_ctx: &CallContext, code: F, track_globally: bool) -> Option<i32>
+where
+    F: FnOnce() -> CallResult<R> + std::panic::UnwindSafe,
+{
+    let outcome: Result<CallResult<R>, PanicPayload> =
+        handle_panic(|| format!("{call_ctx}()"), code);
 
     let call_error = match outcome {
         // All good.
-        Ok(_result) => return,
+        Ok(Ok(_result)) => return None,
 
-        // Panic occurred (typically through user): forward message.
-        Err(payload) => CallError::failed_by_user_panic(call_ctx, payload),
+        // Error from Godot or godot-rust validation (e.g. parameter conversion).
+        Ok(Err(err)) => err,
+
+        // User panic occurred: forward message.
+        Err(panic_msg) => CallError::failed_by_user_panic(call_ctx, panic_msg),
     };
 
-    let _id = report_call_error(call_error, false);
-}
-
-fn report_call_error(call_error: CallError, track_globally: bool) -> i32 {
     // Print failed calls to Godot's console.
-    // TODO Level 1 is not yet set, so this will always print if level != 0. Needs better logic to recognize try_* calls and avoid printing.
+    // TODO(v0.6): Level 1 is not yet set, so this will always print if level != 0. Needs better logic to recognize try_* calls and avoid printing.
     // But a bit tricky with multiple threads and re-entrancy; maybe pass in info in error struct.
-    if has_error_print_level(2) {
+
+    // caused_by_panic() check to avoid printing (2) once the panic message (1) is already printed:
+    //
+    // (1)  ERROR: [panic hot-reload/rust/src/lib.rs:37]
+    //      some panic message
+    //      Context: MyClass::my_method
+    //       at: godot_core::private::set_gdext_hook::{{closure}} (/.../godot-core/src/private.rs:354)
+    //       GDScript backtrace (most recent call first):
+    //           [0] _ready (res://script.gd:9)
+    //     (backtrace disabled, run application with `RUST_BACKTRACE=1` environment variable)
+    //
+    // (2) ERROR: godot-rust function call failed: MyClass::my_method()
+    //        Reason: function panicked: some panic message
+    //     at: ...
+    if has_error_print_level(2) && !call_error.caused_by_panic() {
         godot_error!("{call_error}");
     }
 
     // Once there is a way to auto-remove added errors, this could be always true.
-    if track_globally {
+    let error_id = if track_globally {
         call_error_insert(call_error)
     } else {
         0
-    }
+    };
+
+    Some(error_id)
 }
 
 // Currently unused; implemented due to temporary need and may come in handy.

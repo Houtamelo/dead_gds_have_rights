@@ -13,15 +13,10 @@ use crate::context::Context;
 use crate::models::json::{JsonBuiltinMethod, JsonClassMethod, JsonUtilityFunction};
 use crate::special_cases;
 
-pub(crate) fn is_builtin_method_excluded(method: &JsonBuiltinMethod) -> bool {
-    // The `cfg` below becomes `false` for api > 4.1 so clippy would complain it's always false.
-    #[allow(clippy::needless_bool)]
-    if method.is_vararg {
-        // Support for calling varargs using gdextension were added in 4.2.
-        cfg!(before_api = "4.2")
-    } else {
-        false
-    }
+pub(crate) fn is_builtin_method_excluded(_method: &JsonBuiltinMethod) -> bool {
+    // Prior to Godot 4.2, builtin varargs (method.is_vararg) weren't supported, but that's now our minimum supported version.
+
+    false
 }
 
 #[cfg(not(feature = "codegen-full"))]
@@ -52,9 +47,23 @@ fn is_type_excluded(ty: &str, ctx: &mut Context) -> bool {
     fn is_rust_type_excluded(ty: &RustTy) -> bool {
         match ty {
             RustTy::BuiltinIdent { .. } => false,
-            RustTy::BuiltinArray { .. } => false,
+            RustTy::TypedArray { elem_class, .. } => elem_class
+                .as_ref()
+                .is_some_and(|c| is_class_excluded(c.as_str())),
             RustTy::RawPointer { inner, .. } => is_rust_type_excluded(inner),
-            RustTy::EngineArray { elem_class, .. } => is_class_excluded(elem_class.as_str()),
+            RustTy::SysPointerType { .. } => true,
+            RustTy::TypedDictionary {
+                key_class,
+                value_class,
+                ..
+            } => {
+                key_class
+                    .as_ref()
+                    .is_some_and(|c| is_class_excluded(c.as_str()))
+                    || value_class
+                        .as_ref()
+                        .is_some_and(|c| is_class_excluded(c.as_str()))
+            }
             RustTy::EngineEnum {
                 surrounding_class, ..
             } => match surrounding_class.as_ref() {
@@ -65,7 +74,9 @@ fn is_type_excluded(ty: &str, ctx: &mut Context) -> bool {
             RustTy::ExtenderReceiver { .. } => false,
         }
     }
-    is_rust_type_excluded(&conv::to_rust_type(ty, None, ctx))
+
+    // Both meta + flow direction are irrelevant here.
+    is_rust_type_excluded(&conv::to_rust_temporary_type(ty, ctx))
 }
 
 #[cfg(feature = "codegen-full")]
@@ -169,7 +180,6 @@ const SELECTED_CLASSES: &[&str] = &[
     //
     // Example resources
     "PackedScene", // manual_extensions
-    "Texture",
     //
     // Meshes (virtual_methods_test)
     "Mesh",

@@ -5,16 +5,17 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use functions_common as fns;
+use proc_macro2::{Ident, TokenStream};
+use quote::{format_ident, quote};
+
 use crate::generator::functions_common;
 use crate::generator::functions_common::{
-    make_arg_expr, make_param_or_field_type, FnArgExpr, FnCode, FnKind, FnParamDecl, FnParamTokens,
+    FnArgExpr, FnCode, FnKind, FnParamDecl, make_arg_expr, make_param_or_field_type,
 };
 use crate::models::domain::{FnParam, FnQualifier, Function, RustTy, TyName};
 use crate::util::{ident, safe_ident};
 use crate::{conv, special_cases};
-use functions_common as fns;
-use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote};
 
 pub fn make_function_definition_with_defaults(
     sig: &dyn Function,
@@ -29,11 +30,12 @@ pub fn make_function_definition_with_defaults(
 
     let simple_fn_name = safe_ident(sig.name());
     let extended_fn_name = format_ident!("{}_ex", simple_fn_name);
-    let default_parameter_usage = format!("To set the default parameters, use [`Self::{extended_fn_name}`] and its builder methods. \
-     See [the book](https://godot-rust.github.io/book/godot-api/functions.html#default-parameters) for detailed usage instructions.");
+    let default_parameter_usage = format!(
+        "To set the default parameters, use [`Self::{extended_fn_name}`] and its builder methods.  See [the book](https://godot-rust.github.io/book/godot-api/functions.html#default-parameters) for detailed usage instructions."
+    );
     let vis = functions_common::make_vis(sig.is_private());
 
-    let (builder_doc, surround_class_prefix) = make_extender_doc(sig, &extended_fn_name);
+    let (builder_doc, surround_class_path) = make_extender_doc(sig, &extended_fn_name);
 
     let ExtenderReceiver {
         object_fn_param,
@@ -59,38 +61,30 @@ pub fn make_function_definition_with_defaults(
         &default_fn_params,
     );
 
-    // ExBuilder::new() constructor signature.
-    let FnParamTokens {
-        func_general_lifetime: simple_fn_lifetime,
-        ..
-    } = fns::make_params_exprs(
-        required_fn_params.iter().cloned(),
-        FnKind::ExBuilderConstructor,
-    );
-
     let return_decl = &sig.return_value().decl;
+    let (maybe_deprecated, maybe_expect_deprecated) = fns::make_deprecation_attribute(sig);
 
     // If either the builder has a lifetime (non-static/global method), or one of its parameters is a reference,
-    // then we need to annotate the _ex() function with an explicit lifetime. Also adjust &self -> &'a self.
+    // then we need to annotate the _ex() function with an explicit lifetime. Also adjust &self -> &'ex self.
     let receiver_self = &code.receiver.self_prefix;
     let simple_receiver_param = &code.receiver.param;
-    let extended_receiver_param = &code.receiver.param_lifetime_a;
+    let extended_receiver_param = &code.receiver.param_lifetime_ex;
 
     let builders = quote! {
         #[doc = #builder_doc]
         #[must_use]
         #cfg_attributes
-        pub struct #builder_ty<'a> {
-            _phantom: std::marker::PhantomData<&'a ()>,
+        #vis struct #builder_ty<'ex> {
+            _phantom: std::marker::PhantomData<&'ex ()>,
             #( #builder_field_decls, )*
         }
 
         // #[allow] exceptions:
         // - wrong_self_convention:     to_*() and from_*() are taken from Godot
         // - redundant_field_names:     'value: value' is a possible initialization pattern
-        // - needless-update:           Remainder expression '..self' has nothing left to change
+        // - needless_update:           Remainder expression '..self' has nothing left to change
         #[allow(clippy::wrong_self_convention, clippy::redundant_field_names, clippy::needless_update)]
-        impl<'a> #builder_ty<'a> {
+        impl<'ex> #builder_ty<'ex> {
             fn new(
                 //#object_param
                 #( #builder_ctor_params, )*
@@ -105,9 +99,10 @@ pub fn make_function_definition_with_defaults(
             #( #builder_methods )*
 
             #[inline]
+            #maybe_expect_deprecated
             pub fn done(self) #return_decl {
                 let Self { _phantom, #( #builder_field_names, )* } = self;
-                #surround_class_prefix #full_fn_name(
+                #surround_class_path::#full_fn_name(
                     #( #full_fn_args, )* // includes `surround_object` if present
                 )
             }
@@ -117,9 +112,11 @@ pub fn make_function_definition_with_defaults(
     let functions = quote! {
         // Simple function:
         // Lifetime is set if any parameter is a reference.
+        #maybe_deprecated
+        #maybe_expect_deprecated
         #[doc = #default_parameter_usage]
         #[inline]
-        #vis fn #simple_fn_name #simple_fn_lifetime (
+        #vis fn #simple_fn_name (
             #simple_receiver_param
             #( #class_method_required_params, )*
         ) #return_decl {
@@ -130,11 +127,12 @@ pub fn make_function_definition_with_defaults(
 
         // _ex() function:
         // Lifetime is set if any parameter is a reference OR if the method is not static/global (and thus can refer to self).
+        #maybe_deprecated
         #[inline]
-        #vis fn #extended_fn_name<'a> (
+        #vis fn #extended_fn_name<'ex> (
             #extended_receiver_param
             #( #class_method_required_params_lifetimed, )*
-        ) -> #builder_ty<'a> {
+        ) -> #builder_ty<'ex> {
             #builder_ty::new(
                 #object_arg
                 #( #class_method_required_args, )*
@@ -146,11 +144,19 @@ pub fn make_function_definition_with_defaults(
 }
 
 pub fn function_uses_default_params(sig: &dyn Function) -> bool {
-    sig.params().iter().any(|arg| arg.default_value.is_some())
+    let fn_declares_default_params = sig.params().iter().any(|arg| arg.default_value.is_some())
         && !special_cases::is_method_excluded_from_default_params(
             sig.surrounding_class(),
             sig.name(),
-        )
+        );
+
+    // For builtins, only generate `Ex*` builders if the method is exposed on the outer type.
+    // This saves on code generation and compile time for `Inner*` methods.
+    if fn_declares_default_params && sig.is_builtin() {
+        return sig.is_exposed_outer_builtin();
+    }
+
+    fn_declares_default_params
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -188,15 +194,26 @@ fn make_extender_doc(sig: &dyn Function, extended_fn_name: &Ident) -> (String, T
     #[allow(clippy::uninlined_format_args)]
     match sig.surrounding_class() {
         Some(TyName { rust_ty, .. }) => {
-            surround_class_prefix = quote! { re_export::#rust_ty:: };
-            builder_doc = format!("Default-param extender for [`{rust_ty}::{extended_fn_name}`][super::{rust_ty}::{extended_fn_name}].");
+            surround_class_prefix = make_qualified_type(sig, rust_ty, true);
+            let path = if sig.is_builtin() {
+                format!("crate::builtin::{rust_ty}")
+            } else {
+                format!("super::{rust_ty}")
+            };
+            builder_doc = format!(
+                "Default-param extender for [`{class}::{method}`][{path}::{method}].",
+                class = rust_ty,
+                method = extended_fn_name,
+                path = path,
+            );
         }
         None => {
             // There are currently no default parameters for utility functions
             // -> this is currently dead code, but _should_ work if Godot ever adds them.
             surround_class_prefix = TokenStream::new();
             builder_doc = format!(
-                "Default-param extender for [`{extended_fn_name}`][super::{extended_fn_name}]."
+                "Default-param extender for [`{function}`][super::{function}].",
+                function = extended_fn_name
             );
         }
     };
@@ -217,13 +234,13 @@ fn make_extender_receiver(sig: &dyn Function) -> ExtenderReceiver {
     // Only add it if the method is not global or static.
     match sig.surrounding_class() {
         Some(surrounding_class) if !sig.qualifier().is_static_or_global() => {
-            let class = &surrounding_class.rust_ty;
+            let ty = make_qualified_type(sig, &surrounding_class.rust_ty, false);
 
             ExtenderReceiver {
                 object_fn_param: Some(FnParam {
                     name: ident("surround_object"),
                     type_: RustTy::ExtenderReceiver {
-                        tokens: quote! { &'a #builder_mut re_export::#class },
+                        tokens: quote! { &'ex #builder_mut #ty },
                     },
                     default_value: None,
                 }),
@@ -333,5 +350,25 @@ fn make_extender(
         class_method_required_params,
         class_method_required_params_lifetimed,
         class_method_required_args,
+    }
+}
+
+/// Returns a qualified type path for builtin or class.
+///
+/// Type categories:
+/// - Exposed outer builtins (like `GString`): direct type reference without `re_export::`.
+/// - `Inner\*` types (like `InnerString`): `re_export::Type<'ex>`, with lifetime if `with_inner_lifetime` is true.
+/// - Classes (like `Node`): `re_export::Type` without lifetime.
+fn make_qualified_type(
+    sig: &dyn Function,
+    class_or_builtin: &Ident,
+    with_inner_lifetime: bool,
+) -> TokenStream {
+    if sig.is_exposed_outer_builtin() {
+        quote! { #class_or_builtin }
+    } else if with_inner_lifetime && sig.is_builtin() {
+        quote! { re_export::#class_or_builtin<'ex> }
+    } else {
+        quote! { re_export::#class_or_builtin }
     }
 }

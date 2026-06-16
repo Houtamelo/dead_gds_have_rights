@@ -24,6 +24,10 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+use std::path::{Path, PathBuf};
+
+use proc_macro2::TokenStream;
+
 use crate::context::Context;
 use crate::generator::builtins::generate_builtin_class_files;
 use crate::generator::classes::generate_class_files;
@@ -33,13 +37,10 @@ use crate::generator::utility_functions::generate_utilities_file;
 use crate::generator::{
     generate_core_central_file, generate_core_mod_file, generate_sys_builtin_lifecycle_file,
     generate_sys_builtin_methods_file, generate_sys_central_file, generate_sys_classes_file,
-    generate_sys_module_file, generate_sys_utilities_file,
+    generate_sys_module_file, generate_sys_utilities_file, virtual_definitions,
 };
 use crate::models::domain::{ApiView, ExtensionApi};
-use crate::models::json::{load_extension_api, JsonExtensionApi};
-
-use proc_macro2::TokenStream;
-use std::path::{Path, PathBuf};
+use crate::models::json::{JsonExtensionApi, load_extension_api};
 
 pub type SubmitFn = dyn FnMut(PathBuf, TokenStream);
 
@@ -65,9 +66,10 @@ fn submit_fn(path: PathBuf, tokens: TokenStream) {
 
 #[cfg(feature = "codegen-rustfmt")]
 mod rustfmt {
-    use super::*;
     use std::process::Command;
     use std::sync::Mutex;
+
+    use super::*;
 
     pub fn submit_fn(path: PathBuf, tokens: TokenStream) {
         write_file(&path, tokens.to_string());
@@ -81,7 +83,7 @@ mod rustfmt {
         for files in out_files.chunks(20) {
             let mut command = Command::new("rustfmt");
             command.arg("--edition");
-            command.arg("2021");
+            command.arg("2024");
 
             for file in files {
                 command.arg(file);
@@ -165,13 +167,7 @@ pub fn generate_core_files(core_gen_path: &Path) {
     // Deallocate all the JSON models; no longer needed for codegen.
     // drop(json_api);
 
-    generate_core_central_file(&api, &mut ctx, core_gen_path, &mut submit_fn);
-    watch.record("generate_central_file");
-
-    generate_utilities_file(&api, core_gen_path, &mut submit_fn);
-    watch.record("generate_utilities_file");
-
-    // Class files -- currently output in godot-core; could maybe be separated cleaner
+    // Class files -- currently output in godot-core; could maybe be separated more cleanly.
     // Note: deletes entire generated directory!
     generate_class_files(
         &api,
@@ -197,6 +193,22 @@ pub fn generate_core_files(core_gen_path: &Path) {
         &mut submit_fn,
     );
     watch.record("generate_native_structures_files");
+
+    // Note – generated at the very end since context could be updated while processing other files.
+    // For example – SysPointerTypes (ones defined in gdextension_interface) are declared only
+    // as parameters for various APIs.
+    generate_core_central_file(&api, &mut ctx, core_gen_path, &mut submit_fn);
+    watch.record("generate_central_file");
+
+    generate_utilities_file(&api, core_gen_path, &mut submit_fn);
+    watch.record("generate_utilities_file");
+
+    // From 4.4 onward, generate table that maps all virtual methods to their known hashes.
+    // This allows Godot to fall back to an older compatibility function if one is not supported.
+    // Also expose tuple signatures of virtual methods.
+    let code = virtual_definitions::make_virtual_definitions_file(&api, &mut ctx);
+    submit_fn(core_gen_path.join("virtuals.rs"), code);
+    watch.record("generate_virtual_definitions");
 
     #[cfg(feature = "codegen-rustfmt")]
     {

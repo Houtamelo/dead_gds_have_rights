@@ -5,8 +5,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-#[cfg(since_api = "4.2")]
 mod async_test;
+mod autoload_test;
+mod classdb_test;
 mod codegen_enums_test;
 mod codegen_test;
 mod engine_enum_test;
@@ -19,3 +20,5 @@ mod node_test;
 mod save_load_test;
 mod translate_test;
 mod utilities_test;
+
+pub use classdb_test::check_classdb_full_api;

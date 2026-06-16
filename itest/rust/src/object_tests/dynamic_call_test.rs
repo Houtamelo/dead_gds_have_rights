@@ -5,16 +5,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::framework::{expect_panic, itest, runs_release};
-use crate::object_tests::object_test::ObjPayload;
-use godot::builtin::{vslice, Variant, Vector3};
+use std::error::Error;
+use std::sync::{Arc, Mutex};
+
+use godot::builtin::{Variant, Vector3, vslice};
 use godot::classes::{Node, Node3D, Object};
 use godot::init::GdextBuild;
 use godot::meta::error::CallError;
 use godot::meta::{FromGodot, ToGodot};
 use godot::obj::{InstanceId, NewAlloc};
-use std::error::Error;
-use std::sync::{Arc, Mutex};
+
+use crate::framework::{expect_panic, itest, runs_release};
+use crate::object_tests::object_test::ObjPayload;
 
 #[itest]
 fn dynamic_call_no_args() {
@@ -150,7 +152,7 @@ fn dynamic_call_with_panic() {
     std::panic::set_hook(Box::new(move |panic_info| {
         let error_message = godot::private::format_panic_message(panic_info);
         *panic_message_clone.lock().unwrap() =
-            Some((error_message, godot::private::get_gdext_panic_context()));
+            Some((error_message, godot::private::fetch_last_panic_context()));
     }));
 
     let mut obj = ObjPayload::new_alloc();
@@ -182,12 +184,12 @@ fn dynamic_call_with_panic() {
     // Obtain line number dynamically -- avoids tedious maintenance on code reorganization.
     let line = ObjPayload::get_panic_line();
     let context = error_context
-        .map(|context| format!("\n  Context: {context}"))
+        .map(|context| format!("\n  in {context}"))
         .unwrap_or_default();
 
-    // In Debug, there is a context -> message is multi-line -> '\n' is inserted after [panic ...].
-    // In Release, simpler message -> single line -> no '\n'.
-    let expected_panic_message = if cfg!(debug_assertions) {
+    // In strict level, there is a context -> message is multi-line -> '\n' is inserted after [panic ...].
+    // In balanced+disengaged level, simpler message -> single line -> no '\n'.
+    let expected_panic_message = if cfg!(safeguards_strict) {
         format!("[panic {path}:{line}]\n  do_panic exploded 💥{context}")
     } else {
         format!("[panic {path}:{line}]  do_panic exploded 💥")
@@ -205,7 +207,7 @@ fn dynamic_call_with_panic() {
 fn dynamic_call_with_too_few_args_engine() {
     // Disabled in release (parameter count is unchecked by engine).
     // Before 4.2, the Godot check had a bug: https://github.com/godotengine/godot/pull/80844.
-    if runs_release() || cfg!(before_api = "4.2") {
+    if runs_release() {
         return;
     }
 
@@ -236,7 +238,7 @@ fn dynamic_call_with_too_few_args_engine() {
 fn dynamic_call_with_too_many_args_engine() {
     // Disabled in release (parameter count is unchecked by engine).
     // Before 4.2, the Godot check had a bug: https://github.com/godotengine/godot/pull/80844.
-    if runs_release() || cfg!(before_api = "4.2") {
+    if runs_release() {
         return;
     }
 

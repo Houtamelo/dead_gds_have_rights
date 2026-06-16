@@ -5,13 +5,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::ops::{Deref, DerefMut};
+
 use crate::obj::bounds::{DeclEngine, DeclUser};
 use crate::obj::{Gd, GdMut, GdRef, GodotClass, WithBaseField};
-use std::ops::{Deref, DerefMut};
 
 /// Unifies dereferencing of user and engine classes, as `&T`/`&mut T` and `Gd<T>`.
 ///
-/// This is mainly used by the `connect_*` functions of [`TypedSignal`](crate::registry::signal::TypedSignal).
+/// This is mainly used by the `connect_*` functions of [`TypedSignal`](crate::obj::signal::TypedSignal).
 ///
 /// # Motivation
 /// Although both user and engine classes are often wrapped in a `Gd<T>`, dereferencing them is done differently depending
@@ -32,7 +33,7 @@ use std::ops::{Deref, DerefMut};
 ///
 /// Despite being 2 different traits, a function can accept both by simply being generic over `Declarer`:
 /// ```no_run
-/// use godot::meta::UniformObjectDeref;
+/// use godot::meta::conv::UniformObjectDeref;
 /// # use godot::prelude::*;
 ///
 /// fn abstract_over_objects<Declarer, C>(obj: &Gd<C>)
@@ -59,6 +60,9 @@ use std::ops::{Deref, DerefMut};
 ///     abstract_over_objects(&user_obj);
 /// }
 /// ```
+///
+/// # Similar traits
+/// - [`ObjectToOwned`][crate::meta::ObjectToOwned] provides conversion from `&self` or `&Gd<T>` to owned `Gd<T>`.
 //
 // The crate `https://crates.io/crates/disjoint_impls` handles this in a more user-friendly way, we should
 // consider using it if disjoint impls are going to be frequently used.

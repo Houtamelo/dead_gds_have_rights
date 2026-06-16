@@ -6,12 +6,12 @@
  */
 
 use proc_macro2::TokenStream;
-use quote::{quote, ToTokens};
+use quote::{ToTokens, quote};
 
-use crate::util::{
-    bail, extract_typename, ident, path_ends_with, retain_attributes_except, KvParser,
-};
 use crate::ParseResult;
+use crate::util::{
+    KvParser, bail, extract_typename, ident, path_ends_with, retain_attributes_except,
+};
 
 pub fn attribute_itest(input_item: venial::Item) -> ParseResult<TokenStream> {
     let func = match input_item {
@@ -64,10 +64,9 @@ pub fn attribute_itest(input_item: venial::Item) -> ParseResult<TokenStream> {
         quote! { __unused_context: &crate::framework::TestContext }
     };
 
+    let return_ty = func.return_ty.as_ref();
     if is_async
-        && func
-            .return_ty
-            .as_ref()
+        && return_ty
             .and_then(extract_typename)
             .is_none_or(|segment| segment.ident != "TaskHandle")
     {
@@ -78,7 +77,8 @@ pub fn attribute_itest(input_item: venial::Item) -> ParseResult<TokenStream> {
 
     let (return_tokens, test_case_ty, plugin_name);
     if is_async {
-        return_tokens = quote! { -> TaskHandle };
+        let [arrow, arrow_head] = func.tk_return_arrow.unwrap();
+        return_tokens = quote! { #arrow #arrow_head #return_ty }; // retain span.
         test_case_ty = quote! { crate::framework::AsyncRustTestCase };
         plugin_name = ident("__GODOT_ASYNC_ITEST");
     } else {
@@ -92,9 +92,8 @@ pub fn attribute_itest(input_item: venial::Item) -> ParseResult<TokenStream> {
 
     Ok(quote! {
         #(#other_attributes)*
-        pub fn #test_name(#param) #return_tokens {
+        pub fn #test_name(#param) #return_tokens
             #body
-        }
 
         ::godot::sys::plugin_add!(crate::framework::#plugin_name; #test_case_ty {
             name: #test_name_str,

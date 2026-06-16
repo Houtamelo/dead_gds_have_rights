@@ -10,23 +10,18 @@
 // It's the only purpose of this build.rs file. If a better solution is found, this file can be removed.
 
 #[rustfmt::skip]
-fn main() {    
+fn main() {
     let mut count = 0;
     if cfg!(feature = "api-custom") { count += 1; }
     if cfg!(feature = "api-custom-json") { count += 1; }
 
     // [version-sync] [[
     //  [line] \tif cfg!(feature = "api-$kebabVersion") { count += 1; }
-    if cfg!(feature = "api-4-1") { count += 1; }
-    if cfg!(feature = "api-4-1-1") { count += 1; }
-    if cfg!(feature = "api-4-1-2") { count += 1; }
-    if cfg!(feature = "api-4-1-3") { count += 1; }
-    if cfg!(feature = "api-4-1-4") { count += 1; }
     if cfg!(feature = "api-4-2") { count += 1; }
-    if cfg!(feature = "api-4-2-1") { count += 1; }
-    if cfg!(feature = "api-4-2-2") { count += 1; }
     if cfg!(feature = "api-4-3") { count += 1; }
     if cfg!(feature = "api-4-4") { count += 1; }
+    if cfg!(feature = "api-4-5") { count += 1; }
+    if cfg!(feature = "api-4-6") { count += 1; }
     // ]]
 
     assert!(count <= 1, "ERROR: at most one `api-*` feature can be enabled");

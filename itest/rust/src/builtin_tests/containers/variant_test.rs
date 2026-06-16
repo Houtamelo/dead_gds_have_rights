@@ -10,18 +10,18 @@ use std::fmt;
 use std::fmt::Display;
 
 use godot::builtin::{
-    array, varray, vdict, vslice, Array, Color, GString, NodePath, PackedInt32Array,
-    PackedStringArray, Projection, Quaternion, Signal, StringName, Transform2D, Transform3D,
-    Variant, Vector2, Vector2i, Vector3, Vector3i,
+    Array, Basis, Color, GString, NodePath, PackedInt32Array, PackedStringArray, Projection,
+    Quaternion, Signal, StringName, Transform2D, Transform3D, VarArray, VarDictionary, Variant,
+    VariantOperator, VariantType, Vector2, Vector2i, Vector3, Vector3i, array, iarray, varray,
+    vdict, vslice,
 };
-use godot::builtin::{Basis, Dictionary, VariantArray, VariantOperator, VariantType};
 use godot::classes::{Node, Node2D, Resource};
 use godot::meta::{FromGodot, ToGodot};
 use godot::obj::{Gd, InstanceId, NewAlloc, NewGd};
 use godot::sys::GodotFfi;
 
 use crate::common::roundtrip;
-use crate::framework::{expect_panic, itest, runs_release};
+use crate::framework::{expect_panic, expect_panic_or_ub, itest, runs_release};
 
 const TEST_BASIS: Basis = Basis::from_rows(
     Vector3::new(1.0, 2.0, 3.0),
@@ -124,25 +124,25 @@ fn variant_relaxed_conversions() {
     convert_relaxed_fail::<i64>(Variant::nil());
     convert_relaxed_fail::<GString>(Variant::nil());
     convert_relaxed_fail::<Gd<Node>>(Variant::nil());
-    convert_relaxed_fail::<VariantArray>(Variant::nil());
-    convert_relaxed_fail::<Dictionary>(Variant::nil());
+    convert_relaxed_fail::<VarArray>(Variant::nil());
+    convert_relaxed_fail::<VarDictionary>(Variant::nil());
 
     // anything -> Variant
     convert_relaxed_to(123, Variant::from(123));
     convert_relaxed_to("hello", Variant::from("hello"));
 
-    // Array -> Packed*Array
+    // Array -> PackedArray
     let packed_ints = PackedInt32Array::from([1, 2, 3]);
     let packed_strings = PackedStringArray::from(["a".into(), "bb".into()]);
     let strings: Array<GString> = array!["a", "bb"];
 
-    convert_relaxed_to(array![1, 2, 3], packed_ints.clone());
+    convert_relaxed_to(iarray![1, 2, 3], packed_ints.clone());
     convert_relaxed_to(varray![1, 2, 3], packed_ints.clone());
     convert_relaxed_to(strings.clone(), packed_strings.clone());
     convert_relaxed_to(varray!["a", "bb"], packed_strings.clone());
 
     // Packed*Array -> Array
-    convert_relaxed_to(packed_ints.clone(), array![1, 2, 3]);
+    convert_relaxed_to(packed_ints.clone(), iarray![1, 2, 3]);
     convert_relaxed_to(packed_ints, varray![1, 2, 3]);
     convert_relaxed_to(packed_strings.clone(), strings);
     convert_relaxed_to(packed_strings, varray!["a", "bb"]);
@@ -212,7 +212,8 @@ fn variant_bad_integer_conversions() {
     truncate_bad::<u32>(4294967296);
     truncate_bad::<u32>(-1);
 
-    truncate_bad::<u64>(-1);
+    // u64 no longer implements FromGodot, so this test is not applicable.
+    // truncate_bad::<u64>(-1);
 }
 
 #[itest]
@@ -231,21 +232,18 @@ fn variant_bad_conversions() {
     assert_convert_err::<f32, i32>(1.23);
     assert_convert_err::<i32, bool>(10);
     assert_convert_err::<_, String>(false);
-    assert_convert_err::<_, StringName>(VariantArray::default());
+    assert_convert_err::<_, StringName>(VarArray::default());
 
-    // Special case: ToVariant is not yet fallible, so u64 -> i64 conversion error panics.
-    expect_panic("u64 -> i64 conversion error", || {
-        u64::MAX.to_variant();
-    });
-
+    // u64 no longer implements ToGodot: u64::MAX.to_variant() would fail to compile.
     //assert_eq!(
-    //    Dictionary::default().to_variant().try_to::<Array>(),
+    //    VarDictionary::default().to_variant().try_to::<Array>(),
     //    Err(VariantConversionError)
     //);
+
     Variant::nil()
         .to_variant()
-        .try_to::<Dictionary>()
-        .expect_err("`nil` should not convert to `Dictionary`");
+        .try_to::<VarDictionary>()
+        .expect_err("`nil` should not convert to `VarDictionary`");
 }
 
 #[itest]
@@ -272,7 +270,7 @@ fn variant_dead_object_conversions() {
     );
 
     // Variant::to().
-    expect_panic("Variant::to() with dead object should panic", || {
+    expect_panic_or_ub("Variant::to() with dead object should panic", || {
         let _: Gd<Node> = variant.to();
     });
 
@@ -301,24 +299,85 @@ fn variant_bad_conversion_error_message() {
     assert_eq!(err.to_string(), "cannot convert from INT to OBJECT: 123");
 }
 
+// Different builtin types: i32 -> Object.
 #[itest]
-fn variant_array_bad_conversions() {
+fn variant_array_bad_type_conversions() {
+    let i32_array: Array<i32> = array![1, 2, 160, -40];
+    let i32_variant = i32_array.to_variant();
+    let object_array = i32_variant.try_to::<Array<Gd<Node>>>();
+
+    let err = object_array.expect_err("Array<i32> -> Array<Gd<Node>> conversion should fail");
+    assert_eq!(
+        err.to_string(),
+        "expected array of type Class(Node), got Builtin(INT): [1, 2, 160, -40]"
+    )
+}
+
+// Incompatible class types: Node -> Node2D.
+#[itest]
+fn variant_array_bad_class_conversions() {
+    // Even empty arrays are typed and cannot be converted.
+    let node_array: Array<Gd<Node>> = array![];
+    let node_variant = node_array.to_variant();
+    let node2d_array = node_variant.try_to::<Array<Gd<Node2D>>>();
+
+    let err =
+        node2d_array.expect_err("Array<Gd<Node>> -> Array<Gd<Node2D>> conversion should fail");
+    assert_eq!(
+        err.to_string(),
+        "expected array of type Class(Node2D), got Class(Node): []"
+    )
+}
+
+// Convert typed to untyped array (incompatible).
+#[itest]
+fn variant_array_to_untyped_conversions() {
+    // Even empty arrays are typed and cannot be converted.
+    let node_array: Array<Gd<Node>> = array![];
+    let node_variant = node_array.to_variant();
+    let untyped_array = node_variant.try_to::<VarArray>();
+
+    let err = untyped_array.expect_err("Array<Gd<Node>> -> VarArray conversion should fail");
+    assert_eq!(
+        err.to_string(),
+        "expected array of type Untyped, got Class(Node): []"
+    )
+}
+
+// Convert typed to untyped array (incompatible).
+#[itest]
+fn variant_array_from_untyped_conversions() {
+    // Even empty arrays are typed and cannot be converted.
+    let untyped_array: VarArray = varray![1, 2];
+    let untyped_variant = untyped_array.to_variant();
+    let int_array = untyped_variant.try_to::<Array<i64>>();
+
+    let err = int_array.expect_err("VarArray -> Array<i64> conversion should fail");
+    assert_eq!(
+        err.to_string(),
+        "expected array of type Builtin(INT), got Untyped: [1, 2]"
+    )
+}
+
+// Same builtin type INT, but incompatible integers (strict-safeguards only).
+#[itest]
+fn variant_array_bad_integer_conversions() {
     let i32_array: Array<i32> = array![1, 2, 160, -40];
     let i32_variant = i32_array.to_variant();
     let i8_back = i32_variant.try_to::<Array<i8>>();
 
-    // In Debug mode, we expect an error upon conversion.
-    #[cfg(debug_assertions)]
+    // In strict safeguard mode, we expect an error upon conversion.
+    #[cfg(safeguards_strict)]
     {
         let err = i8_back.expect_err("Array<i32> -> Array<i8> conversion should fail");
         assert_eq!(
             err.to_string(),
-            "integer value 160 does not fit into Array of type INT: [1, 2, 160, -40]"
+            "integer value 160 does not fit into Array<i8>: [1, 2, 160, -40]"
         )
     }
 
-    // In Release mode, we expect the conversion to succeed, but a panic to occur on element access.
-    #[cfg(not(debug_assertions))]
+    // In balanced/disengaged modes, we expect the conversion to succeed, but a panic to occur on element access.
+    #[cfg(not(safeguards_strict))]
     {
         let i8_array = i8_back.expect("Array<i32> -> Array<i8> conversion should succeed");
         expect_panic("accessing element 160 as i8 should panic", || {
@@ -618,7 +677,7 @@ fn variant_stringify() {
         gstr("[1, \"hello\", false]")
     );
     assert_eq!(
-        vdict! { "KEY": 50 }.to_variant().stringify(),
+        vdict! { "KEY" => 50 }.to_variant().stringify(),
         gstr("{ \"KEY\": 50 }")
     );
 }
@@ -628,9 +687,9 @@ fn variant_booleanize() {
     assert!(gstr("string").to_variant().booleanize());
     assert!(10.to_variant().booleanize());
     assert!(varray![""].to_variant().booleanize());
-    assert!(vdict! { "Key": 50 }.to_variant().booleanize());
+    assert!(vdict! { "Key" => 50 }.to_variant().booleanize());
 
-    assert!(!Dictionary::new().to_variant().booleanize());
+    assert!(!VarDictionary::new().to_variant().booleanize());
     assert!(!varray![].to_variant().booleanize());
     assert!(!0.to_variant().booleanize());
     assert!(!Variant::nil().booleanize());
@@ -648,21 +707,24 @@ fn variant_hash() {
         gstr("string").to_variant(),
         varray![false, true, 4, "7"].to_variant(),
         0.to_variant(),
-        vdict! { 0 : vdict!{ 0: 1 } }.to_variant(),
+        vdict! { 0 => &vdict!{ 0 => 1 } }.to_variant(),
     ];
 
     for variant in hash_is_not_0 {
-        assert_ne!(variant.hash(), 0)
+        assert_ne!(variant.hash_u32(), 0)
     }
     for variant in self_equal {
-        assert_eq!(variant.hash(), variant.hash())
+        assert_eq!(variant.hash_u32(), variant.hash_u32())
     }
 
-    assert_eq!(Variant::nil().hash(), 0);
+    assert_eq!(Variant::nil().hash_u32(), 0);
 
     // It's not guaranteed that different object will have different hash, but it is
     // extremely unlikely for a collision to happen.
-    assert_ne!(vdict! { 0: vdict! { 0: 0 } }, vdict! { 0: vdict! { 0: 1 } });
+    assert_ne!(
+        vdict! { 0 => &vdict! { 0 => 0 } },
+        vdict! { 0 => &vdict! { 0 => 1 } }
+    );
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------

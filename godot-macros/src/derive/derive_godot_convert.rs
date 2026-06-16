@@ -5,12 +5,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::derive::data_models::GodotConvert;
-use crate::derive::{make_fromgodot, make_togodot};
-use crate::ParseResult;
+use std::collections::HashMap;
+
 use proc_macro2::{Ident, TokenStream, TokenTree};
 use quote::quote;
-use std::collections::HashMap;
+
+use crate::ParseResult;
+use crate::derive::data_models::{ConvertType, GodotConvert, ViaType};
+use crate::derive::{make_fromgodot, make_togodot};
 
 /// Derives `GodotConvert` for the given declaration.
 ///
@@ -25,14 +27,82 @@ pub fn derive_godot_convert(item: venial::Item) -> ParseResult<TokenStream> {
     let to_godot_impl = make_togodot(&convert, &mut cache);
     let from_godot_impl = make_fromgodot(&convert, &mut cache);
 
+    let shape_override = make_shape_override(&convert.convert_type, &mut cache);
+
     Ok(quote! {
         impl ::godot::meta::GodotConvert for #name  {
             type Via = #via_type;
+            #shape_override
         }
 
         #to_godot_impl
         #from_godot_impl
+
+        // Marker impl: defaults derive element metadata from shape().
+        impl ::godot::meta::Element for #name {}
     })
+}
+
+/// Generates `shape()` override for enum types. Newtypes return `Builtin` (the default), so no override needed.
+fn make_shape_override(convert_type: &ConvertType, cache: &mut EnumeratorExprCache) -> TokenStream {
+    match convert_type {
+        ConvertType::Enum { variants, via } => {
+            let names = variants.enumerator_names();
+
+            let enumerator_entries: Vec<TokenStream> = match via {
+                ViaType::Int { int_ident, .. } => {
+                    // Int-backed enum: EnumeratorShape::new_int("Grass", <ord> as i64).
+                    let ord_exprs = variants.enumerator_ord_exprs();
+                    let mapped = cache.map_ord_exprs(int_ident, names, ord_exprs);
+                    names
+                        .iter()
+                        .zip(mapped)
+                        .map(|(ident, ord_expr)| {
+                            let name_str = ident.to_string();
+                            quote! {
+                                ::godot::meta::shape::EnumeratorShape::new_int(#name_str, #ord_expr as i64)
+                            }
+                        })
+                        .collect()
+                }
+                ViaType::GString { .. } => {
+                    // String-backed enum: EnumeratorShape::new_string("Grass").
+                    names
+                        .iter()
+                        .map(|ident| {
+                            let name_str = ident.to_string();
+                            quote! {
+                                ::godot::meta::shape::EnumeratorShape::new_string(#name_str)
+                            }
+                        })
+                        .collect()
+                }
+            };
+
+            quote! {
+                fn godot_shape() -> ::godot::meta::shape::GodotShape {
+                    // Rust enum discriminants are always const expressions, so this works even for `MyVariant = OTHER_CONST as isize`.
+                    const ENUMERATORS: &[::godot::meta::shape::EnumeratorShape] = &[
+                        #( #enumerator_entries ),*
+                    ];
+                    ::godot::meta::shape::GodotShape::Enum {
+                        variant_type: ::godot::meta::element_variant_type::<Self>(),
+                        enumerators: std::borrow::Cow::Borrowed(ENUMERATORS),
+                        godot_name: None, // User enums have no Godot class_name (future: register via classdb FFI).
+                        is_bitfield: false,
+                    }
+                }
+            }
+        }
+        ConvertType::NewType { .. } => {
+            // Newtypes delegate to the Via type's shape.
+            quote! {
+                fn godot_shape() -> ::godot::meta::shape::GodotShape {
+                    <Self::Via as ::godot::meta::GodotConvert>::godot_shape()
+                }
+            }
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -98,7 +168,6 @@ fn adjust_ord_expr(ord_expr: &TokenStream, int: &Ident) -> Option<TokenStream> {
         return None;
     };
 
-    // Could technically save this allocation by using field + clear() + extend().
     let mut tokens = Vec::from_iter(paren_expr.stream());
 
     match tokens.as_slice() {

@@ -5,11 +5,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use proc_macro2::{Group, Ident, Span, TokenStream, TokenTree};
+use quote::{format_ident, quote, quote_spanned};
+
 use crate::class::RpcAttr;
-use crate::util::{bail_fn, ident, safe_ident};
-use crate::{util, ParseResult};
-use proc_macro2::{Group, Ident, TokenStream, TokenTree};
-use quote::{format_ident, quote};
+use crate::util::{bail, bail_fn, ident, safe_ident, to_spanned_tuple};
+use crate::{ParseResult, util};
 
 /// Information used for registering a Rust function with Godot.
 pub struct FuncDefinition {
@@ -29,6 +30,15 @@ pub struct FuncDefinition {
 
     /// Information about the RPC configuration, if provided.
     pub rpc_info: Option<RpcAttr>,
+
+    /// If true, skip the `ToGodot`/`FromGodot` user-facing bounds check (`ensure_func_bounds`).
+    ///
+    /// Generated property getters/setters operate on `GodotConvert::Via`, which has `EngineToGodot`/`EngineFromGodot` bounds -- sufficient
+    /// for the `Signature` machinery, but not necessarily `ToGodot`/`FromGodot` (which need `ensure_func_bounds` checks). For example, engine
+    /// bitfields have `Via = u64`, which implements `EngineToGodot` but deliberately not `ToGodot`. We can't use `Var::PubType` instead of
+    /// `Via` in these getters, because `PubType` has no `ToGodot`/`FromGodot` bound -- and adding one would be too disruptive, as many manual
+    /// `Var` implementations (`Option<T>`, `Array<T>`, `Dictionary<K,V>`, `OnEditor<T>`, etc.) have `PubType` types without those bounds.
+    pub is_generated_accessor: bool,
 }
 
 impl FuncDefinition {
@@ -50,15 +60,21 @@ impl FuncDefinition {
 // Virtual methods are non-static by their nature; so there's no support for static ones.
 pub fn make_virtual_callback(
     class_name: &Ident,
+    trait_base_class: &Ident,
     signature_info: &SignatureInfo,
     before_kind: BeforeKind,
     interface_trait: Option<&venial::TypeExpr>,
 ) -> TokenStream {
     let method_name = &signature_info.method_name;
 
-    let wrapped_method =
-        make_forwarding_closure(class_name, signature_info, before_kind, interface_trait);
-    let sig_params = signature_info.param_types_tuple();
+    let wrapped_method = make_forwarding_closure(
+        class_name,
+        trait_base_class,
+        signature_info,
+        before_kind,
+        interface_trait,
+    );
+    let sig_params = signature_info.params_type();
     let sig_ret = &signature_info.return_type;
 
     let call_ctx = make_call_context(
@@ -79,7 +95,7 @@ pub fn make_virtual_callback(
                 ret: sys::GDExtensionTypePtr,
             ) {
                 let call_ctx = #call_ctx;
-                let _success = ::godot::private::handle_ptrcall_panic(
+                ::godot::private::handle_fallible_ptrcall(
                     &call_ctx,
                     || #invocation
                 );
@@ -95,9 +111,11 @@ pub fn make_method_registration(
     func_definition: FuncDefinition,
     interface_trait: Option<&venial::TypeExpr>,
 ) -> ParseResult<TokenStream> {
+    // Fresh ident, discarding span -- prevents IDE syntax highlighter from mapping generated unsafe code to user's class declaration.
+    let class_name = ident(&class_name.to_string());
+
     let signature_info = &func_definition.signature_info;
-    let sig_params = signature_info.param_types_tuple();
-    let sig_std_params = signature_info.std_param_types_tuple();
+    let sig_params = signature_info.params_type();
     let sig_ret = &signature_info.return_type;
 
     let is_script_virtual = func_definition.is_script_virtual;
@@ -107,22 +125,38 @@ pub fn make_method_registration(
     };
 
     let forwarding_closure = make_forwarding_closure(
-        class_name,
+        &class_name,
+        &class_name, // Not used in this case.
         signature_info,
         BeforeKind::Without,
         interface_trait,
     );
+
+    let default_parameters = make_default_argument_vec(
+        &signature_info.optional_param_default_exprs,
+        &signature_info.param_types,
+    )?;
 
     // String literals
     let class_name_str = class_name.to_string();
     let method_name_str = func_definition.godot_name();
 
     let call_ctx = make_call_context(&class_name_str, &method_name_str);
-    let varcall_fn_decl = make_varcall_fn(&call_ctx, &forwarding_closure, &func_definition);
+
+    // Both varcall and ptrcall functions are always generated and registered, even when default parameters are present via #[opt].
+    // Key differences are:
+    // - varcall: handles default parameters, applying them when caller provides fewer arguments.
+    // - ptrcall: optimized path without default handling, can be used when caller provides all arguments.
+    //
+    // Godot decides at call-time which calling convention to use based on available type information.
+    let varcall_fn_decl = make_varcall_fn(&call_ctx, &forwarding_closure, &default_parameters);
     let ptrcall_fn_decl = make_ptrcall_fn(&call_ctx, &forwarding_closure);
 
     // String literals II
-    let param_ident_strs = signature_info.param_idents().map(|ident| ident.to_string());
+    let param_ident_strs = signature_info
+        .param_idents
+        .iter()
+        .map(|ident| ident.to_string());
 
     // Transport #[cfg] attrs to the FFI glue to ensure functions which were conditionally
     // removed from compilation don't cause errors.
@@ -130,8 +164,17 @@ pub fn make_method_registration(
         .into_iter()
         .collect::<Vec<_>>();
 
-    let default_types = signature_info.default_params.iter().map(|(p, _)| &p.ty);
-    let default_values = signature_info.default_params.iter().map(|(_, expr)| expr);
+    // Statically check that all parameters implement FromGodot + return type implements ToGodot. Span to localize compile error.
+    // Skipped for generated property accessors -- see `FuncDefinition::is_generated_accessor` for rationale.
+    let type_and_bounds_check = if func_definition.is_generated_accessor {
+        TokenStream::new()
+    } else {
+        let sig_ret_span = signature_info.params_span; // Alternative: sig_ret's span (first token).
+
+        quote_spanned! { sig_ret_span=>
+            ::godot::meta::ensure_func_bounds::<CallParams, CallRet>();
+        }
+    };
 
     let registration = quote! {
         #(#cfg_attrs)*
@@ -140,11 +183,11 @@ pub fn make_method_registration(
             use ::godot::register::private::method::ClassMethodInfo;
             use ::godot::builtin::{StringName, Variant};
             use ::godot::sys;
-            use ::godot::meta::{ParamTuple, InParamTuple};
 
             type CallParams = #sig_params;
-            type CallStdParams = #sig_std_params;
             type CallRet = #sig_ret;
+
+            #type_and_bounds_check
 
             let method_name = StringName::from(#method_name_str);
 
@@ -152,7 +195,7 @@ pub fn make_method_registration(
             #ptrcall_fn_decl;
 
             // SAFETY: varcall_fn + ptrcall_fn interpret their in/out parameters correctly.
-            let mut method_info = unsafe {
+            let method_info = unsafe {
                 ClassMethodInfo::from_signature::<#class_name, CallParams, CallRet>(
                     method_name,
                     Some(varcall_fn),
@@ -161,13 +204,9 @@ pub fn make_method_registration(
                     &[
                         #( #param_ident_strs ),*
                     ],
+                    #default_parameters,
                 )
             };
-
-            #({
-                let default_val: #default_types = #default_values;
-                method_info.default_arguments.push(default_val.to_variant());
-            })*
 
             ::godot::private::out!(
                 "   Register fn:   {}::{}",
@@ -183,6 +222,46 @@ pub fn make_method_registration(
     Ok(registration)
 }
 
+/// Generates code to create a `Vec<Variant>` containing default argument values for varcall. Allocates on every call.
+fn make_default_argument_vec(
+    optional_param_default_exprs: &[TokenStream],
+    all_params: &[venial::TypeExpr],
+) -> ParseResult<TokenStream> {
+    // Optional params appearing at the end has already been validated in validate_default_exprs().
+
+    // Early exit: all parameters are required, not optional. This check is not necessary for correctness.
+    if optional_param_default_exprs.is_empty() {
+        return Ok(quote! { vec![] });
+    }
+
+    let optional_param_types = all_params
+        .iter()
+        .skip(all_params.len() - optional_param_default_exprs.len());
+
+    let default_parameters = optional_param_default_exprs
+        .iter()
+        .zip(optional_param_types)
+        .map(|(value, param_type)| {
+            quote! {
+                ::godot::private::opt_default_value::<#param_type>(#value)
+            }
+        });
+
+    // Performance: This generates `vec![...]` in the varcall FFI function, which allocates on *every* call when default parameters
+    // are present. This is a performance cost we accept for now.
+    //
+    // If no #[opt] attributes are used, this generates `vec![]` which does *not* allocate, so most #[func] functions are unaffected.
+    //
+    // Potential future improvements:
+    // - Use `Global<Vec<Variant>>` (or LazyLock/thread_local) to allocate once per function instead of per call.
+    // - Store defaults in MethodInfo during registration and retrieve via method_data pointer.
+    //
+    // Note also that there may be a semantic difference on reusing the same object vs. recreating it, see Python's default-param issue.
+    Ok(quote! {
+        vec![ #(#default_parameters),* ]
+    })
+}
+
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Implementation
 
@@ -195,21 +274,22 @@ pub enum ReceiverType {
 }
 
 #[derive(Debug)]
-pub struct ParamInfo {
-    pub ident: Ident,
-    /// Parameter types *without* receiver.
-    pub ty: venial::TypeExpr,
-    /// Only for changed parameters; empty if no changes.
-    pub modified_ty: Option<(usize, venial::TypeExpr)>,
-}
-
-#[derive(Debug)]
 pub struct SignatureInfo {
     pub method_name: Ident,
     pub receiver_type: ReceiverType,
-    pub std_params: Vec<ParamInfo>,
-    pub default_params: Vec<(ParamInfo, TokenStream)>,
+    pub params_span: Span,
+    pub param_idents: Vec<Ident>,
+    /// Parameter types *without* receiver.
+    pub param_types: Vec<venial::TypeExpr>,
     pub return_type: TokenStream,
+
+    /// `(original index, new type)` only for changed parameters; empty if no changes.
+    ///
+    /// Index points into original venial tokens (i.e. takes into account potential receiver params).
+    pub modified_param_types: Vec<(usize, venial::TypeExpr)>,
+
+    /// Default value expressions `EXPR` from `#[opt(default = EXPR)]`, for all optional parameters.
+    pub optional_param_default_exprs: Vec<TokenStream>,
 }
 
 impl SignatureInfo {
@@ -217,36 +297,23 @@ impl SignatureInfo {
         Self {
             method_name: ident("ready"),
             receiver_type: ReceiverType::Mut,
-            std_params: vec![],
-            default_params: vec![],
+            params_span: Span::call_site(),
+            param_idents: vec![],
+            param_types: vec![],
             return_type: quote! { () },
+            modified_param_types: vec![],
+            optional_param_default_exprs: vec![],
         }
     }
 
-    pub fn param_types_tuple(&self) -> TokenStream {
-        let std_params = self.std_params.iter().map(|p| &p.ty);
-        let default_params = self.default_params.iter().map(|(p, _)| &p.ty);
-        quote! { (#(#std_params,)* #(#default_params,)*) }
+    /// Returns params (e.g. `(v1, v2, v3...)`) of this signature as a properly spanned group.
+    pub fn params_tuple(&self) -> Group {
+        to_spanned_tuple(&self.param_idents, self.params_span)
     }
 
-    pub fn std_param_types_tuple(&self) -> TokenStream {
-        let std_params = self.std_params.iter().map(|p| &p.ty);
-        quote! { ( #(#std_params,)* ) }
-    }
-
-    #[allow(unused)]
-    pub fn param_types(&self) -> impl Iterator<Item = &venial::TypeExpr> {
-        self.std_params
-            .iter()
-            .map(|p| &p.ty)
-            .chain(self.default_params.iter().map(|(p, _)| &p.ty))
-    }
-
-    pub fn param_idents(&self) -> impl Iterator<Item = &Ident> {
-        self.std_params
-            .iter()
-            .map(|p| &p.ident)
-            .chain(self.default_params.iter().map(|(p, _)| &p.ident))
+    /// Returns param types (e.g. `(f32, f64, GString...)`) of this signature as a properly spanned group.
+    pub fn params_type(&self) -> Group {
+        to_spanned_tuple(&self.param_types, self.params_span)
     }
 }
 
@@ -265,27 +332,35 @@ pub enum BeforeKind {
 /// Returns a closure expression that forwards the parameters to the Rust instance.
 fn make_forwarding_closure(
     class_name: &Ident,
+    trait_base_class: &Ident,
     signature_info: &SignatureInfo,
     before_kind: BeforeKind,
     interface_trait: Option<&venial::TypeExpr>,
 ) -> TokenStream {
     let method_name = &signature_info.method_name;
-    let params = signature_info.param_idents().collect::<Vec<_>>();
+    let params = &signature_info.param_idents;
+    let params_tuple = signature_info.params_tuple();
+    let param_ident = Ident::new("params", signature_info.params_span);
 
     let instance_decl = match &signature_info.receiver_type {
         ReceiverType::Ref => quote! {
-            let instance = ::godot::private::Storage::get(storage);
+            let __gdext_self = ::godot::private::Storage::get(storage);
         },
         ReceiverType::Mut => quote! {
-            let mut instance = ::godot::private::Storage::get_mut(storage);
+            let mut __gdext_self = ::godot::private::Storage::get_mut(storage);
         },
         _ => quote! {},
     };
 
     let before_method_call = match before_kind {
         BeforeKind::WithBefore | BeforeKind::OnlyBefore => {
-            let before_method = format_ident!("__before_{}", method_name);
-            quote! { instance.#before_method(); }
+            let before_method = format_ident!("__before_{method_name}", span = method_name.span());
+            if let ReceiverType::GdSelf = signature_info.receiver_type {
+                // In case of GdSelf receiver use instance only to call the before_method.
+                quote! { ::godot::private::Storage::get_mut(storage).#before_method(); }
+            } else {
+                quote! { __gdext_self.#before_method(); }
+            }
         }
         BeforeKind::Without => TokenStream::new(),
     };
@@ -294,29 +369,44 @@ fn make_forwarding_closure(
         ReceiverType::Ref | ReceiverType::Mut => {
             // Generated default virtual methods (e.g. for ready) may not have an actual implementation (user code), so
             // all they need to do is call the __before_ready() method. This means the actual method call may be optional.
-            let method_call = if matches!(before_kind, BeforeKind::OnlyBefore) {
-                TokenStream::new()
+            let method_call;
+            let sig_tuple_annotation;
+
+            if matches!(before_kind, BeforeKind::OnlyBefore) {
+                sig_tuple_annotation = TokenStream::new();
+                method_call = TokenStream::new()
+            } else if let Some(interface_trait) = interface_trait {
+                // impl ITrait for Class {...}
+                // Virtual methods.
+
+                let instance_ref = match signature_info.receiver_type {
+                    ReceiverType::Ref => quote! { &__gdext_self },
+                    ReceiverType::Mut => quote! { &mut __gdext_self },
+                    _ => unreachable!("unexpected receiver type"), // checked above.
+                };
+
+                sig_tuple_annotation = make_sig_tuple_annotation(trait_base_class, method_name);
+
+                // Use fresh spans for generated code (class_name, interface_trait), but keep method_name's original span for proper
+                // IDE navigation to user's function.
+                method_call = quote! {
+                    <#class_name as #interface_trait>::#method_name( #instance_ref, #(#params),* )
+                };
             } else {
-                match interface_trait {
-                    // impl ITrait for Class {...}
-                    Some(interface_trait) => {
-                        let instance_ref = match signature_info.receiver_type {
-                            ReceiverType::Ref => quote! { &instance },
-                            ReceiverType::Mut => quote! { &mut instance },
-                            _ => unreachable!("unexpected receiver type"), // checked above.
-                        };
+                // impl Class {...}
+                // Methods are non-virtual.
 
-                        quote! { <#class_name as #interface_trait>::#method_name( #instance_ref, #(#params),* ) }
-                    }
-
-                    // impl Class {...}
-                    None => quote! { instance.#method_name( #(#params),* ) },
-                }
+                sig_tuple_annotation = TokenStream::new();
+                method_call = quote! {
+                    __gdext_self.#method_name( #(#params),* )
+                };
             };
 
             quote! {
-                |instance_ptr, params| {
-                    let ( #(#params,)* ) = params;
+                // Identifiers need to share the span to avoid proc macro hygiene issues
+                // similar to https://github.com/godot-rust/gdext/pull/1397.
+                |instance_ptr, #param_ident| {
+                    let #params_tuple #sig_tuple_annotation = #param_ident;
 
                     let storage =
                         unsafe { ::godot::private::as_storage::<#class_name>(instance_ptr) };
@@ -330,9 +420,19 @@ fn make_forwarding_closure(
         ReceiverType::GdSelf => {
             // Method call is always present, since GdSelf implies that the user declares the method.
             // (Absent method is only used in the case of a generated default virtual method, e.g. for ready()).
+
+            let sig_tuple_annotation = if interface_trait.is_some() {
+                make_sig_tuple_annotation(trait_base_class, method_name)
+            } else {
+                TokenStream::new()
+            };
+
             quote! {
-                |instance_ptr, params| {
-                    let ( #(#params,)* ) = params;
+                // Identifiers need to share the span to avoid proc macro hygiene issues
+                // similar to https://github.com/godot-rust/gdext/pull/1397.
+                |instance_ptr, #param_ident| {
+                    // Not using `virtual_sig`, since virtual methods with `#[func(gd_self)]` are being moved out of the trait to inherent impl.
+                    let #params_tuple #sig_tuple_annotation = #param_ident;
 
                     let storage =
                         unsafe { ::godot::private::as_storage::<#class_name>(instance_ptr) };
@@ -344,9 +444,12 @@ fn make_forwarding_closure(
         }
         ReceiverType::Static => {
             // No before-call needed, since static methods are not virtual.
+            //
+            // Identifiers need to share the span to avoid proc macro hygiene issues
+            // similar to https://github.com/godot-rust/gdext/pull/1397.
             quote! {
-                |_, params| {
-                    let ( #(#params,)* ) = params;
+                |_, #param_ident| {
+                    let #params_tuple = #param_ident;
                     #class_name::#method_name(#(#params),*)
                 }
             }
@@ -390,83 +493,52 @@ pub(crate) fn into_signature_info(
     };
 
     let num_params = signature.params.inner.len();
-    let mut std_params = Vec::with_capacity(num_params);
-    let mut default_params = Vec::new();
-
+    let params_span = signature.span();
+    let mut param_idents = Vec::with_capacity(num_params);
+    let mut param_types = Vec::with_capacity(num_params);
     let return_type = match signature.return_ty {
         None => quote! { () },
         Some(ty) => map_self_to_class_name(ty.tokens, class_name),
     };
 
-    let mut found_default = false;
-
     let mut next_unnamed_index = 0;
+    let mut modified_param_types = vec![];
     for (index, (arg, _)) in signature.params.inner.into_iter().enumerate() {
         match arg {
             venial::FnParam::Receiver(recv) => {
-                if receiver_type == ReceiverType::GdSelf {
-                    // This shouldn't happen, as when has_gd_self is true the first function parameter should have been removed.
-                    // And the first parameter should be the only one that can be a Receiver.
-                    panic!("has_gd_self is true for a signature starting with a Receiver param.");
-                }
+                // Unsupported receivers (gd_self + receiver, or `self` by value) are validated before this function.
+                assert_ne!(receiver_type, ReceiverType::GdSelf);
+                assert!(recv.tk_ref.is_some());
+
                 receiver_type = if recv.tk_mut.is_some() {
                     ReceiverType::Mut
-                } else if recv.tk_ref.is_some() {
-                    ReceiverType::Ref
                 } else {
-                    panic!("Receiver not supported");
+                    ReceiverType::Ref
                 };
             }
             venial::FnParam::Typed(arg) => {
+                // The first parameter - Receiver - should be removed.
+                let index = if receiver_type == ReceiverType::GdSelf {
+                    index + 1
+                } else {
+                    index
+                };
                 let ident = maybe_rename_parameter(arg.name, &mut next_unnamed_index);
-                let (ty, modified_ty) =
-                    match maybe_change_parameter_type(arg.ty, &method_name, index) {
-                        // Parameter type was modified.
-                        Ok(ty) => (ty.clone(), Some((index, ty))),
+                let ty = match maybe_change_parameter_type(arg.ty, &method_name, index) {
+                    // Parameter type was modified.
+                    Ok(ty) => {
+                        modified_param_types.push((index, ty.clone()));
+                        ty
+                    }
 
-                        // Not an error, just unchanged.
-                        Err(ty) => {
-                            let ty = venial::TypeExpr {
-                                tokens: map_self_to_class_name(ty.tokens, class_name),
-                            };
-                            (ty, None)
-                        }
-                    };
-
-                let param_info = ParamInfo {
-                    ident,
-                    ty,
-                    modified_ty,
+                    // Not an error, just unchanged.
+                    Err(ty) => venial::TypeExpr {
+                        tokens: map_self_to_class_name(ty.tokens, class_name),
+                    },
                 };
 
-                let default_expr = arg.attributes.iter().find_map(|attr| {
-                    let ident = attr.path.first().and_then(|t| {
-                        if let TokenTree::Ident(id) = t {
-                            Some(id)
-                        } else {
-                            None
-                        }
-                    })?;
-
-                    if ident == "default" {
-                        let expr_tokens = attr.get_value_tokens();
-                        Some(quote! { #(#expr_tokens)* })
-                    } else {
-                        None
-                    }
-                });
-
-                match (default_expr, found_default) {
-                    (Some(expr), _) => {
-                        found_default = true;
-                        default_params.push((param_info, expr));
-                    }
-                    (None, true) => {
-                        // All default parameters must come after non-default ones.
-                        panic!("Non-default parameter cannot follow default parameters");
-                    }
-                    (None, false) => std_params.push(param_info),
-                }
+                param_types.push(ty);
+                param_idents.push(ident);
             }
         }
     }
@@ -474,9 +546,12 @@ pub(crate) fn into_signature_info(
     SignatureInfo {
         method_name,
         receiver_type,
-        std_params,
-        default_params,
+        params_span,
+        param_idents,
+        param_types,
         return_type,
+        modified_param_types,
+        optional_param_default_exprs: vec![], // Assigned outside, if relevant.
     }
 }
 
@@ -493,8 +568,11 @@ fn maybe_change_parameter_type(
         && param_ty.tokens.len() == 1
         && param_ty.tokens[0].to_string() == "f32"
     {
+        // Retain span of input parameter -> for error messages, IDE support, etc.
+        let f64_ty = Ident::new("f64", param_ty.span());
+
         Ok(venial::TypeExpr {
-            tokens: vec![TokenTree::Ident(ident("f64"))],
+            tokens: vec![TokenTree::Ident(f64_ty)],
         })
     } else {
         Err(param_ty)
@@ -506,7 +584,7 @@ pub(crate) fn maybe_rename_parameter(param_ident: Ident, next_unnamed_index: &mu
     let param_str = param_ident.to_string(); // a pity that Ident has no string operations.
 
     if param_str == "_" {
-        let ident = format_ident!("__unnamed_{next_unnamed_index}");
+        let ident = format_ident!("__unnamed_{next_unnamed_index}", span = param_ident.span());
         *next_unnamed_index += 1;
         ident
     } else if let Some(remain) = param_str.strip_prefix('_') {
@@ -524,7 +602,7 @@ fn make_method_flags(
     method_type: ReceiverType,
     is_script_virtual: bool,
 ) -> Result<TokenStream, String> {
-    let flags = quote! { ::godot::global::MethodFlags };
+    let flags = quote! { ::godot::register::info::MethodFlags };
 
     let base_flags = match method_type {
         ReceiverType::Ref => {
@@ -557,36 +635,9 @@ fn make_method_flags(
 fn make_varcall_fn(
     call_ctx: &TokenStream,
     wrapped_method: &TokenStream,
-    func: &FuncDefinition,
+    default_parameters: &TokenStream,
 ) -> TokenStream {
-    let std_param_names = func
-        .signature_info
-        .std_params
-        .iter()
-        .map(|p| &p.ident)
-        .collect::<Vec<_>>();
-    let default_param_names = func
-        .signature_info
-        .default_params
-        .iter()
-        .map(|(p, _)| &p.ident)
-        .collect::<Vec<_>>();
-    let default_param_values = func
-        .signature_info
-        .default_params
-        .iter()
-        .map(|(_, v)| v)
-        .collect::<Vec<_>>();
-    let default_param_types = func
-        .signature_info
-        .default_params
-        .iter()
-        .map(|(p, _)| &p.ty);
-
-    let base_offset = func.signature_info.std_params.len();
-    let default_param_offsets = (0..func.signature_info.default_params.len())
-        .map(|i| base_offset + i)
-        .collect::<Vec<_>>();
+    let invocation = make_varcall_invocation(wrapped_method, default_parameters);
 
     // TODO reduce amount of code generated, by delegating work to a library function. Could even be one that produces this function pointer.
     quote! {
@@ -599,48 +650,10 @@ fn make_varcall_fn(
             err: *mut sys::GDExtensionCallError,
         ) {
             let call_ctx = #call_ctx;
-
-            ::godot::private::handle_varcall_panic(
+            ::godot::private::handle_fallible_varcall(
                 &call_ctx,
                 &mut *err,
-                || {
-                    let arg_count = arg_count as usize;
-                    if arg_count < CallStdParams::LEN {
-                        return Err(::godot::meta::error::CallError::failed_param_count(&call_ctx, arg_count, CallStdParams::LEN));
-                    }
-
-                    if arg_count > CallParams::LEN {
-                        return Err(::godot::meta::error::CallError::failed_param_count(&call_ctx, arg_count, CallParams::LEN));
-                    }
-
-                    let (#(#std_param_names,)*) =
-                        unsafe { CallStdParams::from_varcall_args(args_ptr, &call_ctx)? };
-
-                    #(
-                        let #default_param_names: #default_param_types = if #default_param_offsets < arg_count {
-                            let arg = unsafe { *args_ptr.add(#default_param_offsets) };
-                            unsafe {
-                                ::godot::meta::varcall_arg::<#default_param_types>(
-                                    arg,
-                                    &call_ctx,
-                                    #default_param_offsets as isize,
-                                )?
-                            }
-                        } else {
-                            #default_param_values
-                        };
-                    )*;
-
-                    let args = (
-                        #(#std_param_names,)*
-                        #(#default_param_names,)*
-                    );
-
-                    let func = #wrapped_method;
-                    let rust_result = unsafe { func(instance_ptr, args) };
-                    unsafe { ::godot::meta::varcall_return::<CallRet>(rust_result, ret, err) };
-                    Ok(())
-                }
+                || #invocation
             );
         }
     }
@@ -658,14 +671,10 @@ fn make_ptrcall_fn(call_ctx: &TokenStream, wrapped_method: &TokenStream) -> Toke
             ret: sys::GDExtensionTypePtr,
         ) {
             let call_ctx = #call_ctx;
-            let _success = ::godot::private::handle_panic(
-                || format!("{call_ctx}"),
+            ::godot::private::handle_fallible_ptrcall(
+                &call_ctx,
                 || #invocation
             );
-
-            // if success.is_err() {
-            //     // TODO set return value to T::default()?
-            // }
         }
     }
 }
@@ -690,8 +699,110 @@ fn make_ptrcall_invocation(wrapped_method: &TokenStream, is_virtual: bool) -> To
     }
 }
 
+/// Generate code for a `varcall()` call expression.
+fn make_varcall_invocation(
+    wrapped_method: &TokenStream,
+    default_parameters: &TokenStream,
+) -> TokenStream {
+    quote! {
+        {
+            let defaults = #default_parameters;
+            ::godot::meta::Signature::<CallParams, CallRet>::in_varcall(
+                instance_ptr,
+                &call_ctx,
+                args_ptr,
+                arg_count,
+                &defaults,
+                ret,
+                err,
+                #wrapped_method,
+            )
+        }
+    }
+}
+
 fn make_call_context(class_name_str: &str, method_name_str: &str) -> TokenStream {
     quote! {
         ::godot::meta::CallContext::func(#class_name_str, #method_name_str)
     }
+}
+
+/// Returns a type annotation for the tuple corresponding to the signature declared on given ITrait method,
+/// allowing to validate params for a generated method call at compile time.
+///
+/// For example `::godot::private::virtuals::Node::Sig_physics_process` is `(f64, )`,
+/// thus `let params: ::godot::private::virtuals::Node::Sig_physics_process = ();`
+/// will not compile.
+fn make_sig_tuple_annotation(trait_base_class: &Ident, method_name: &Ident) -> TokenStream {
+    let span = method_name.span();
+    let rust_sig_name = format_ident!("Sig_{method_name}", span = span);
+
+    quote_spanned! { span=>
+        : ::godot::private::virtuals::#trait_base_class::#rust_sig_name
+    }
+}
+
+pub fn bail_attr<R>(attr_name: &Ident, msg: &str, method_name: &Ident) -> ParseResult<R> {
+    bail!(method_name, "#[{attr_name}]: {msg}")
+}
+
+/// Validates and processes receiver before `into_signature_info`.
+///
+/// - If `has_gd_self`: extracts `Gd<Self>` parameter, returns `Some(param_name)`.
+/// - Otherwise: validates receiver is `&self` or `&mut self`, returns `None`.
+pub fn validate_receiver_extract_gdself(
+    signature: &mut venial::Function,
+    has_gd_self: bool,
+    attr_name: &Ident,
+) -> ParseResult<Option<Ident>> {
+    let param_ident = if has_gd_self {
+        // #[func(gd_self)] case: extract Gd<Self> parameter.
+        // Note: parameter is explicitly NOT renamed (maybe_rename_parameter).
+        let ident = extract_gd_self(signature, attr_name)?;
+        Some(ident)
+    } else {
+        // Regular case: validate that receiver is `&self` or `&mut self`.
+        validate_ref_receiver(signature)?;
+        None
+    };
+
+    Ok(param_ident)
+}
+
+/// Validates that the function signature has a reference receiver (`&self` or `&mut self`).
+fn validate_ref_receiver(signature: &venial::Function) -> ParseResult<()> {
+    if let Some((venial::FnParam::Receiver(recv), _)) = signature.params.first()
+        && recv.tk_ref.is_none()
+    {
+        return bail!(
+            &recv.tk_self,
+            "#[func] does not support `self` receiver (by-value); use `&self` or `&mut self`"
+        );
+    }
+
+    Ok(())
+}
+
+fn extract_gd_self(signature: &mut venial::Function, attr_name: &Ident) -> ParseResult<Ident> {
+    if signature.params.is_empty() {
+        return bail_attr(
+            attr_name,
+            "with attribute key `gd_self`, the method must have a first parameter of type Gd<Self>",
+            &signature.name,
+        );
+    }
+
+    // Remove Gd<Self> receiver from signature for further processing.
+    let param = signature.params.inner.remove(0);
+
+    let venial::FnParam::Typed(param) = param.0 else {
+        return bail_attr(
+            attr_name,
+            "with attribute key `gd_self`, the first parameter must be Gd<Self> (not a `self` receiver)",
+            &signature.name,
+        );
+    };
+
+    // Note: parameter is explicitly NOT renamed (maybe_rename_parameter).
+    Ok(param.name)
 }

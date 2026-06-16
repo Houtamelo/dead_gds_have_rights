@@ -5,7 +5,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use godot::init::{gdextension, ExtensionLibrary, InitLevel};
+use godot::init::{ExtensionLibrary, InitLevel, InitStage, gdextension};
 
 mod benchmarks;
 mod builtin_tests;
@@ -20,8 +20,20 @@ mod register_tests;
 
 #[gdextension(entry_symbol = itest_init)]
 unsafe impl ExtensionLibrary for framework::IntegrationTests {
-    fn on_level_init(level: InitLevel) {
-        // Testing that we can initialize and use `Object`-derived classes during `Servers` init level. See `object_tests::init_level_test`.
-        object_tests::initialize_init_level_test(level);
+    fn min_level() -> InitLevel {
+        InitLevel::Core
+    }
+
+    fn on_stage_init(stage: InitStage) {
+        object_tests::on_stage_init(stage);
+    }
+
+    fn on_stage_deinit(stage: InitStage) {
+        object_tests::on_stage_deinit(stage);
+    }
+
+    #[cfg(since_api = "4.5")]
+    fn on_main_loop_frame() {
+        object_tests::on_main_loop_frame();
     }
 }

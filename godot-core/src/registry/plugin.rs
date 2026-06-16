@@ -9,8 +9,11 @@ use std::any::Any;
 use std::{any, fmt};
 
 use crate::init::InitLevel;
-use crate::meta::ClassName;
-use crate::obj::{bounds, cap, Bounds, DynGd, Gd, GodotClass, Inherits, UserClass};
+use crate::meta::ClassId;
+use crate::obj::{
+    Bounds, DynGd, Gd, GodotClass, Inherits, NewAlloc, Singleton, UserClass, UserSingleton, bounds,
+    cap,
+};
 use crate::registry::callbacks;
 use crate::registry::class::GodotGetVirtual;
 use crate::{classes, sys};
@@ -30,7 +33,7 @@ pub struct ClassPlugin {
     ///
     /// This is used to group plugins so that all class properties for a single class can be registered at the same time.
     /// Incorrectly setting this value should not cause any UB but will likely cause errors during registration time.
-    pub class_name: ClassName,
+    pub class_name: ClassId,
 
     /// Which [`InitLevel`] this plugin should be registered at.
     ///
@@ -47,7 +50,7 @@ impl ClassPlugin {
     /// Creates a new `ClassPlugin`, automatically setting the `class_name` and `init_level` to the values defined in [`GodotClass`].
     pub fn new<T: GodotClass>(item: PluginItem) -> Self {
         Self {
-            class_name: T::class_name(),
+            class_name: T::class_id(),
             init_level: T::INIT_LEVEL,
             item,
         }
@@ -142,7 +145,7 @@ pub struct Struct {
     /// The name of the base class in Godot.
     ///
     /// This must match [`GodotClass::Base`]'s class name.
-    pub(crate) base_class_name: ClassName,
+    pub(crate) base_class_name: ClassId,
 
     /// Godot low-level `create` function, wired up to library-generated `init`.
     ///
@@ -166,6 +169,12 @@ pub struct Struct {
     /// Callback to library-generated function which registers properties in the `struct` definition.
     pub(crate) register_properties_fn: ErasedRegisterFn,
 
+    /// Callback on refc-increment. Only for `RefCounted` classes.
+    pub(crate) reference_fn: sys::GDExtensionClassReference,
+
+    /// Callback on refc-decrement. Only for `RefCounted` classes.
+    pub(crate) unreference_fn: sys::GDExtensionClassUnreference,
+
     /// Function called by Godot when an object of this class is freed.
     ///
     /// Always implemented as [`callbacks::free`].
@@ -173,6 +182,12 @@ pub struct Struct {
         _class_user_data: *mut std::ffi::c_void,
         instance: sys::GDExtensionClassInstancePtr,
     ),
+
+    /// `#[class(singleton)]`
+    pub(crate) register_singleton_fn: Option<fn()>,
+
+    /// `#[class(singleton)]`
+    pub(crate) unregister_singleton_fn: Option<fn()>,
 
     /// Calls `__before_ready()`, if there is at least one `OnReady` field. Used if there is no `#[godot_api] impl` block
     /// overriding ready.
@@ -193,26 +208,32 @@ pub struct Struct {
 
 impl Struct {
     pub fn new<T: GodotClass + cap::ImplementsGodotExports>() -> Self {
+        let refcounted = <T::Memory as bounds::Memory>::IS_REF_COUNTED;
+
         Self {
-            base_class_name: T::Base::class_name(),
+            base_class_name: T::Base::class_id(),
             generated_create_fn: None,
             generated_recreate_fn: None,
             register_properties_fn: ErasedRegisterFn {
                 raw: callbacks::register_user_properties::<T>,
             },
             free_fn: callbacks::free::<T>,
+            register_singleton_fn: None,
+            unregister_singleton_fn: None,
             default_get_virtual_fn: None,
             is_tool: false,
             is_editor_plugin: false,
             is_internal: false,
             is_instantiable: false,
+            // While Godot doesn't do anything with these callbacks for non-RefCounted classes, we can avoid instantiating them in Rust.
+            reference_fn: refcounted.then_some(callbacks::reference::<T>),
+            unreference_fn: refcounted.then_some(callbacks::unreference::<T>),
         }
     }
 
     pub fn with_generated<T: GodotClass + cap::GodotDefault>(mut self) -> Self {
         set(&mut self.generated_create_fn, callbacks::create::<T>);
 
-        #[cfg(since_api = "4.2")]
         set(&mut self.generated_recreate_fn, callbacks::recreate::<T>);
         self
     }
@@ -222,7 +243,6 @@ impl Struct {
     pub fn with_generated_no_default<T: GodotClass>(mut self) -> Self {
         set(&mut self.generated_create_fn, callbacks::create_null::<T>);
 
-        #[cfg(since_api = "4.2")]
         set(
             &mut self.generated_recreate_fn,
             callbacks::recreate_null::<T>,
@@ -248,6 +268,27 @@ impl Struct {
         self
     }
 
+    pub fn with_singleton<T>(mut self) -> Self
+    where
+        T: UserSingleton
+            + Bounds<Memory = bounds::MemManual<<T as GodotClass>::Base>, Declarer = bounds::DeclUser>
+            + NewAlloc
+            + Inherits<classes::Object>,
+    {
+        self.register_singleton_fn = Some(|| {
+            classes::Engine::singleton()
+                .register_singleton(&T::class_id().to_string_name(), &T::new_alloc());
+        });
+
+        self.unregister_singleton_fn = Some(|| {
+            let singleton = T::singleton();
+            classes::Engine::singleton().unregister_singleton(&T::class_id().to_string_name());
+            singleton.free();
+        });
+
+        self
+    }
+
     pub fn with_internal(mut self) -> Self {
         self.is_internal = true;
         self
@@ -267,10 +308,10 @@ pub struct InherentImpl {
     /// Always present since that's the entire point of this `impl` block.
     pub(crate) register_methods_constants_fn: ErasedRegisterFn,
 
-    /// Callback to library-generated function which calls [`Node::rpc_config`](crate::classes::Node::rpc_config) for each function annotated
+    /// Callback to library-generated function which calls [`Node::rpc_config`](classes::Node::rpc_config) for each function annotated
     /// with `#[rpc]` on the `impl` block.
     ///
-    /// This function is called in [`UserClass::__before_ready()`](crate::obj::UserClass::__before_ready) definitions generated by the
+    /// This function is called in [`UserClass::__before_ready()`](UserClass::__before_ready) definitions generated by the
     /// `#[derive(GodotClass)]` macro.
     // This field is only used during codegen-full.
     #[cfg_attr(not(feature = "codegen-full"), expect(dead_code))]
@@ -305,7 +346,7 @@ pub struct ITraitImpl {
     /// This is mutually exclusive with [`Struct::generated_recreate_fn`].
     pub(crate) user_recreate_fn: Option<
         unsafe extern "C" fn(
-            p_class_userdata: *mut ::std::os::raw::c_void,
+            p_class_userdata: *mut std::os::raw::c_void,
             p_object: sys::GDExtensionObjectPtr,
         ) -> sys::GDExtensionClassInstancePtr,
     >,
@@ -320,10 +361,6 @@ pub struct ITraitImpl {
     >,
 
     /// User-defined `on_notification` function.
-    #[cfg(before_api = "4.2")]
-    pub(crate) user_on_notification_fn:
-        Option<unsafe extern "C" fn(p_instance: sys::GDExtensionClassInstancePtr, p_what: i32)>,
-    #[cfg(since_api = "4.2")]
     pub(crate) user_on_notification_fn: Option<
         unsafe extern "C" fn(
             p_instance: sys::GDExtensionClassInstancePtr,
@@ -401,7 +438,6 @@ pub struct ITraitImpl {
             r_ret: sys::GDExtensionVariantPtr,
         ) -> sys::GDExtensionBool,
     >,
-    #[cfg(since_api = "4.2")]
     pub(crate) validate_property_fn: Option<
         unsafe extern "C" fn(
             p_instance: sys::GDExtensionClassInstancePtr,
@@ -486,7 +522,6 @@ impl ITraitImpl {
         self
     }
 
-    #[cfg(since_api = "4.2")]
     pub fn with_validate_property<T: GodotClass + cap::GodotValidateProperty>(mut self) -> Self {
         set(
             &mut self.validate_property_fn,
@@ -502,7 +537,7 @@ impl ITraitImpl {
 #[derive(Clone, Debug)]
 pub struct DynTraitImpl {
     /// The class that this `dyn Trait` implementation corresponds to.
-    class_name: ClassName,
+    class_name: ClassId,
 
     /// Base inherited class required for `DynGd<T, D>` exports (i.e. one specified in `#[class(base = ...)]`).
     ///
@@ -511,8 +546,8 @@ pub struct DynTraitImpl {
     /// Only [`class_name`][DynTraitImpl::class_name] is available at the time of adding given `DynTraitImpl` to plugin registry with `#[godot_dyn]`;
     /// It is important to fill this information before registration.
     ///
-    /// See also [`get_dyn_property_hint_string`][crate::registry::class::get_dyn_property_hint_string].
-    pub(crate) parent_class_name: Option<ClassName>,
+    /// See also [`get_dyn_implementor_class_ids`][crate::registry::class::get_dyn_implementor_class_ids].
+    pub(crate) parent_class_name: Option<ClassId>,
 
     /// TypeId of the `dyn Trait` object.
     dyn_trait_typeid: any::TypeId,
@@ -535,15 +570,15 @@ impl DynTraitImpl {
         D: ?Sized + 'static,
     {
         Self {
-            class_name: T::class_name(),
+            class_name: T::class_id(),
             parent_class_name: None,
-            dyn_trait_typeid: std::any::TypeId::of::<D>(),
+            dyn_trait_typeid: any::TypeId::of::<D>(),
             erased_dynify_fn: callbacks::dynify_fn::<T, D>,
         }
     }
 
     /// The class that this `dyn Trait` implementation corresponds to.
-    pub fn class_name(&self) -> &ClassName {
+    pub fn class_name(&self) -> &ClassId {
         &self.class_name
     }
 
@@ -554,7 +589,7 @@ impl DynTraitImpl {
 
     /// Convert a [`Gd<T>`] to a [`DynGd<T, D>`] using `self`.
     ///
-    /// This will fail with `Err(object)` if the dynamic class of `object` does not match the [`ClassName`] stored in `self`.
+    /// This will fail with `Err(object)` if the dynamic class of `object` does not match the [`ClassId`] stored in `self`.
     pub fn get_dyn_gd<T: GodotClass, D: ?Sized + 'static>(
         &self,
         object: Gd<T>,

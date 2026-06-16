@@ -5,24 +5,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::collections::HashMap;
+
+use proc_macro2::Ident;
+
 use crate::context::Context;
 use crate::models::domain::{
     BuildConfiguration, BuiltinClass, BuiltinMethod, BuiltinSize, BuiltinVariant, Class,
     ClassCommons, ClassConstant, ClassConstantValue, ClassMethod, ClassSignal, Constructor, Enum,
-    Enumerator, EnumeratorValue, ExtensionApi, FnDirection, FnParam, FnQualifier, FnReturn,
-    FunctionCommon, GodotApiVersion, ModName, NativeStructure, Operator, RustTy, Singleton, TyName,
-    UtilityFunction,
+    EnumReplacements, Enumerator, EnumeratorValue, ExtensionApi, FlowDirection, FnDirection,
+    FnParam, FnQualifier, FnReturn, FunctionCommon, GodotApiVersion, ModName, NativeStructure,
+    Operator, RustTy, Singleton, TyName, UtilityFunction,
 };
 use crate::models::json::{
     JsonBuiltinClass, JsonBuiltinMethod, JsonBuiltinSizes, JsonClass, JsonClassConstant,
     JsonClassMethod, JsonConstructor, JsonEnum, JsonEnumConstant, JsonExtensionApi, JsonHeader,
-    JsonMethodReturn, JsonNativeStructure, JsonOperator, JsonSignal, JsonSingleton,
+    JsonMethodArg, JsonMethodReturn, JsonNativeStructure, JsonOperator, JsonSignal, JsonSingleton,
     JsonUtilityFunction,
 };
 use crate::util::{get_api_level, ident, option_as_slice};
 use crate::{conv, special_cases};
-use proc_macro2::Ident;
-use std::collections::HashMap;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Top-level
@@ -154,22 +156,23 @@ impl Class {
 
 impl BuiltinClass {
     pub fn from_json(json: &JsonBuiltinClass, ctx: &mut Context) -> Option<Self> {
-        let ty_name = TyName::from_godot(&json.name);
+        let ty_name = TyName::from_godot_builtin(json);
 
         if special_cases::is_builtin_type_deleted(&ty_name) {
             return None;
         }
 
+        let mod_name = ModName::from_godot_builtin(json);
         let inner_name = TyName::from_godot(&format!("Inner{}", ty_name.godot_ty));
-        let mod_name = ModName::from_godot(&ty_name.godot_ty);
 
         let operators = json.operators.iter().map(Operator::from_json).collect();
 
         let methods = option_as_slice(&json.methods)
             .iter()
             .filter_map(|m| {
-                let inner_class_name = &ty_name;
-                BuiltinMethod::from_json(m, &ty_name, inner_class_name, ctx)
+                // Pass inner_name "Inner*" as surrounding class. This is later overridden to the outer type (e.g. "GString")
+                // for methods exposed in the public API via is_builtin_method_exposed().
+                BuiltinMethod::from_json(m, &ty_name, &inner_name, ctx)
             })
             .collect();
 
@@ -364,20 +367,61 @@ impl BuiltinMethod {
             return None;
         }
 
-        let return_value = method
-            .return_type
-            .as_deref()
-            .map(JsonMethodReturn::from_type_no_meta);
+        let is_exposed_in_outer =
+            special_cases::is_builtin_method_exposed(builtin_name, &method.name);
+
+        let return_value = {
+            let return_value = &method
+                .return_type
+                .as_deref()
+                .map(JsonMethodReturn::from_type_no_meta);
+
+            // Builtin methods are always outbound (not virtual), thus flow for return type is Godot -> Rust.
+            // Exception: Inner{Array,Dictionary} methods return Any{Array,Dictionary} instead of Var{Array,Dictionary}. Reason is that
+            // arrays/dicts can be generic and store type info, thus typing returned collections differently. Thus use RustToGodot flow.
+            let flow = if !is_exposed_in_outer
+                && matches!(builtin_name.godot_ty.as_str(), "Array" | "Dictionary")
+                && matches!(method.return_type.as_deref(), Some("Array" | "Dictionary"))
+            {
+                FlowDirection::RustToGodot // AnyArray + AnyDictionary.
+            } else {
+                FlowDirection::GodotToRust
+            };
+
+            FnReturn::new(return_value, flow, ctx)
+        };
+
+        // For parameters in builtin methods, flow is always Rust -> Godot.
+        // Enable default parameters for builtin classes, generating _ex builders.
+        let parameters =
+            FnParam::builder().build_many(&method.arguments, FlowDirection::RustToGodot, ctx);
+
+        // Construct surrounding_class with correct type names:
+        // * godot_ty: Always the real Godot type (e.g. "String").
+        // * rust_ty: Rust struct where the method is declared ("GString" for exposed, "InnerString" for private one).
+        let surrounding_class = {
+            let rust_ty = if is_exposed_in_outer {
+                match conv::to_rust_type(&builtin_name.godot_ty, None, None, ctx) {
+                    RustTy::BuiltinIdent { ty, .. } => ty,
+                    _ => panic!("Builtin type should map to BuiltinIdent"),
+                }
+            } else {
+                inner_class_name.rust_ty.clone()
+            };
+
+            TyName {
+                godot_ty: builtin_name.godot_ty.clone(),
+                rust_ty,
+            }
+        };
 
         Some(Self {
             common: FunctionCommon {
                 // Fill in these fields
                 name: method.name.clone(),
                 godot_name: method.name.clone(),
-                // Disable default parameters for builtin classes.
-                // They are not public-facing and need more involved implementation (lifetimes etc.). Also reduces number of symbols in API.
-                parameters: FnParam::new_range_no_defaults(&method.arguments, ctx),
-                return_value: FnReturn::new(&return_value, ctx),
+                parameters,
+                return_value,
                 is_vararg: method.is_vararg,
                 is_private: false, // See 'exposed' below. Could be special_cases::is_method_private(builtin_name, &method.name),
                 is_virtual_required: false,
@@ -385,13 +429,11 @@ impl BuiltinMethod {
                 direction: FnDirection::Outbound {
                     hash: method.hash.expect("hash absent for builtin method"),
                 },
+                deprecation_msg: None, // Builtin methods are not deprecated yet.
             },
             qualifier: FnQualifier::from_const_static(method.is_const, method.is_static),
-            surrounding_class: inner_class_name.clone(),
-            is_exposed_in_outer: special_cases::is_builtin_method_exposed(
-                builtin_name,
-                &method.name,
-            ),
+            surrounding_class,
+            is_exposed_in_outer,
         })
     }
 }
@@ -429,7 +471,7 @@ impl ClassMethod {
 
         Self::from_json_inner(
             method,
-            rust_method_name,
+            rust_method_name.as_ref(),
             class_name,
             FnDirection::Outbound { hash },
             ctx,
@@ -516,8 +558,33 @@ impl ClassMethod {
             is_required_in_json
         };
 
-        let parameters = FnParam::new_range(&method.arguments, ctx);
-        let return_value = FnReturn::new(&method.return_value, ctx);
+        // Ensure that parameters/return types listed in the replacement truly exist in the method.
+        // The validation function now returns the validated replacement slice for reuse.
+        let enum_replacements = validate_enum_replacements(
+            class_name,
+            &method.name,
+            option_as_slice(&method.arguments),
+            method.return_value.is_some(),
+        );
+
+        let (param_flow, return_flow) = match &direction {
+            FnDirection::Outbound { .. } => {
+                (FlowDirection::RustToGodot, FlowDirection::GodotToRust)
+            }
+            FnDirection::Virtual { .. } => (FlowDirection::GodotToRust, FlowDirection::RustToGodot),
+        };
+
+        let parameters = FnParam::builder()
+            .enum_replacements(enum_replacements)
+            .build_many(&method.arguments, param_flow, ctx);
+
+        let return_value = FnReturn::with_enum_replacements(
+            &method.return_value,
+            enum_replacements,
+            return_flow,
+            ctx,
+        );
+
         let is_unsafe = Self::function_uses_pointers(&parameters, &return_value);
 
         // Future note: if further changes are made to the virtual method name, make sure to make it reversible so that #[godot_api]
@@ -528,6 +595,8 @@ impl ClassMethod {
         } else {
             rust_method_name.to_string()
         };
+
+        let deprecation_msg = special_cases::get_class_method_deprecation(class_name, method);
 
         Some(Self {
             common: FunctionCommon {
@@ -540,6 +609,7 @@ impl ClassMethod {
                 is_virtual_required,
                 is_unsafe,
                 direction,
+                deprecation_msg,
             },
             qualifier,
             surrounding_class: class_name.clone(),
@@ -582,9 +652,12 @@ impl ClassSignal {
             return None;
         }
 
+        // Signals only have parameters, no return type; emitted data always flows Rust -> Godot.
+        let flow = FlowDirection::RustToGodot;
+
         Some(Self {
             name: json_signal.name.clone(),
-            parameters: FnParam::new_range(&json_signal.arguments, ctx),
+            parameters: FnParam::builder().build_many(&json_signal.arguments, flow, ctx),
             surrounding_class: surrounding_class.clone(),
         })
     }
@@ -603,23 +676,25 @@ impl UtilityFunction {
         let parameters = if function.is_vararg && args.len() == 1 && args[0].name == "arg1" {
             vec![]
         } else {
-            FnParam::new_range(&function.arguments, ctx)
+            // Parameters in utility functions always flow Rust -> Godot.
+            FnParam::builder().build_many(&function.arguments, FlowDirection::RustToGodot, ctx)
         };
 
-        let godot_method_name = function.name.clone();
-        let rust_method_name = godot_method_name.clone(); // No change for now.
-
-        let return_value = function
+        let json_return = function
             .return_type
             .as_deref()
             .map(JsonMethodReturn::from_type_no_meta);
+        let return_value = FnReturn::new(&json_return, FlowDirection::GodotToRust, ctx);
+
+        let godot_method_name = function.name.clone();
+        let rust_method_name = godot_method_name.clone(); // No change for now.
 
         Some(Self {
             common: FunctionCommon {
                 name: rust_method_name,
                 godot_name: godot_method_name,
                 parameters,
-                return_value: FnReturn::new(&return_value, ctx),
+                return_value,
                 is_vararg: function.is_vararg,
                 is_private,
                 is_virtual_required: false,
@@ -627,6 +702,7 @@ impl UtilityFunction {
                 direction: FnDirection::Outbound {
                     hash: function.hash,
                 },
+                deprecation_msg: None, // Utility functions are not deprecated.
             },
         })
     }
@@ -736,13 +812,58 @@ impl ClassConstant {
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
+
+/// Validates that all parameters and non-unit return types declared in an enum replacement slices actually exist in the method.
+///
+/// This is a measure to prevent accidental typos or listing inexistent parameters, which would have no effect.
+fn validate_enum_replacements(
+    class_ty: &TyName,
+    godot_method_name: &str,
+    method_arguments: &[JsonMethodArg],
+    has_return_type: bool,
+) -> EnumReplacements {
+    let replacements =
+        special_cases::get_class_method_param_enum_replacement(class_ty, godot_method_name);
+
+    for (param_name, enum_name, _) in replacements {
+        if param_name.is_empty() {
+            assert!(
+                has_return_type,
+                "Method `{class}.{godot_method_name}` has no return type, but replacement with `{enum_name}` is declared",
+                class = class_ty.godot_ty
+            );
+        } else if !method_arguments.iter().any(|arg| arg.name == *param_name) {
+            let available_params = method_arguments
+                .iter()
+                .map(|arg| format!("  * {}: {}", arg.name, arg.type_))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            panic!(
+                "Method `{class}.{godot_method_name}` has no parameter `{param_name}`, but a replacement with `{enum_name}` is declared\n\
+                \n{count} parameters available:\n{available_params}\n",
+                class = class_ty.godot_ty,
+                count = method_arguments.len(),
+            );
+        }
+    }
+
+    replacements
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
 // Native structures
 
 impl NativeStructure {
     pub fn from_json(json: &JsonNativeStructure) -> Self {
+        // Some native-struct definitions are incorrect in earlier Godot versions; this backports corrections.
+        let format = special_cases::get_native_struct_definition(&json.name)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| json.format.clone());
+
         Self {
             name: json.name.clone(),
-            format: json.format.clone(),
+            format,
         }
     }
 }

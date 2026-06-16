@@ -47,12 +47,13 @@
 //!
 // Note that depending on if you want to exclude `Object`, you should use `DynMemory` instead of `Memory`.
 
+use godot_ffi::{GodotNullableFfi, interface_fn};
+use private::Sealed;
+
 use crate::obj::cap::GodotDefault;
 use crate::obj::{Bounds, Gd, GodotClass, InstanceId, RawGd};
 use crate::storage::{InstanceCache, Storage};
 use crate::{classes, out, sys};
-use godot_ffi::{interface_fn, GodotNullableFfi};
-use private::Sealed;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Sealed trait
@@ -115,15 +116,15 @@ pub(super) mod private {
     /// ```no_run
     /// use godot::prelude::*;
     /// use godot::obj::bounds::implement_godot_bounds;
-    /// use godot::meta::ClassName;
+    /// use godot::meta::ClassId;
     ///
     /// struct MyClass {}
     ///
     /// impl GodotClass for MyClass {
     ///     type Base = Node;
     ///
-    ///     fn class_name() -> ClassName {
-    ///         ClassName::new_cached::<MyClass>(|| "MyClass".to_string())
+    ///     fn class_id() -> ClassId {
+    ///         ClassId::new_cached::<MyClass>(|| "MyClass".to_string())
     ///     }
     /// }
     ///
@@ -154,7 +155,11 @@ use crate::private::ObjectRtti;
 // Memory bounds
 
 /// Specifies the memory strategy of the static type.
-pub trait Memory: Sealed {}
+pub trait Memory: Sealed {
+    /// True for everything inheriting `RefCounted`, false for `Object` and all other classes.
+    #[doc(hidden)]
+    const IS_REF_COUNTED: bool;
+}
 
 /// Specifies the memory strategy of the dynamic type.
 ///
@@ -211,7 +216,9 @@ impl<T: GodotClass> Clone for MemRefCounted<T> {
 }
 
 impl<T: GodotClass> Sealed for MemRefCounted<T> {}
-impl<T: GodotClass> Memory for MemRefCounted<T> {}
+impl<T: GodotClass> Memory for MemRefCounted<T> {
+    const IS_REF_COUNTED: bool = true;
+}
 impl<T: GodotClass> DynMemory for MemRefCounted<T> {
     type TSelf = T;
 
@@ -431,7 +438,9 @@ impl<T: GodotClass> Clone for MemManual<T> {
 impl<T: GodotClass> Copy for MemManual<T> {}
 
 impl<T: GodotClass> Sealed for MemManual<T> {}
-impl<T: GodotClass> Memory for MemManual<T> {}
+impl<T: GodotClass> Memory for MemManual<T> {
+    const IS_REF_COUNTED: bool = false;
+}
 impl<T: GodotClass> DynMemory for MemManual<T> {
     type TSelf = T;
 
@@ -506,10 +515,7 @@ impl Declarer for DeclEngine {
     where
         T: GodotDefault + Bounds<Declarer = Self>,
     {
-        unsafe {
-            let object_ptr = interface_fn!(classdb_construct_object)(T::class_name().string_sys());
-            Gd::from_obj_sys(object_ptr)
-        }
+        crate::classes::construct_engine_object()
     }
 }
 
@@ -524,7 +530,7 @@ impl Declarer for DeclUser {
     where
         T: GodotClass + Bounds<Declarer = Self>,
     {
-        obj.storage().unwrap_unchecked().is_bound()
+        unsafe { obj.storage().unwrap_unchecked().is_bound() }
     }
 
     fn create_gd<T>() -> Gd<T>
@@ -573,11 +579,13 @@ pub(crate) unsafe fn ffi_cast<T: GodotClass, U: GodotClass>(
     // a bug that must be solved by the user.
     check_rtti(obj, rtti, "ffi_cast");
 
-    let class_tag = interface_fn!(classdb_get_class_tag)(U::class_name().string_sys());
-    let cast_object_ptr = interface_fn!(object_cast_to)(obj_sys(obj), class_tag);
+    let class_tag = unsafe { interface_fn!(classdb_get_class_tag)(U::class_id().string_sys()) };
+    let cast_object_ptr = unsafe { interface_fn!(object_cast_to)(obj_sys(obj), class_tag) };
 
     // Create weak object, as ownership will be moved and reference-counter stays the same.
-    sys::ptr_then(cast_object_ptr, |ptr| RawGd::from_obj_sys_weak(ptr))
+    sys::ptr_then(cast_object_ptr, |ptr| unsafe {
+        RawGd::from_obj_sys_weak(ptr)
+    })
 }
 
 pub(crate) fn check_rtti<T: GodotClass>(
@@ -603,7 +611,8 @@ pub(crate) fn check_dynamic_type<T: GodotClass>(
 
     // SAFETY: code surrounding RawGd<T> ensures that `self` is non-null; above is just a sanity check against internal bugs.
     let rtti = unsafe { rtti.unwrap_unchecked() };
-    rtti.check_type::<T>()
+    rtti.check_type::<T>();
+    rtti.instance_id()
 }
 
 pub(crate) fn obj_sys<T: GodotClass>(obj: *mut T) -> sys::GDExtensionObjectPtr {

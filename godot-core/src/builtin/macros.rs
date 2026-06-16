@@ -103,7 +103,9 @@ macro_rules! impl_builtin_traits_inner {
     ( Hash for $Type:ty ) => {
         impl std::hash::Hash for $Type {
             fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-                self.hash().hash(state)
+                // The GDExtension interface only deals in `int64_t`, but the engine's own `hash()` function
+                // actually returns `uint32_t`.
+                self.hash_u32().hash(state)
             }
         }
     };
@@ -121,22 +123,4 @@ macro_rules! impl_builtin_traits {
             }
         )*
     )
-}
-
-macro_rules! impl_builtin_froms {
-    ($To:ty; $($From:ty => $from_fn:ident),* $(,)?) => {
-        $(impl From<&$From> for $To {
-            fn from(other: &$From) -> Self {
-                unsafe {
-                    // TODO should this be from_sys_init_default()?
-                    Self::new_with_uninit(|ptr| {
-                        let args = [other.sys()];
-                        ::godot_ffi::builtin_call! {
-                            $from_fn(ptr, args.as_ptr())
-                        }
-                    })
-                }
-            }
-        })*
-    };
 }

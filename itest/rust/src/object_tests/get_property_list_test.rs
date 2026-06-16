@@ -7,12 +7,11 @@
 
 use std::collections::HashMap;
 
-use godot::builtin::{Dictionary, GString, StringName, VariantType, Vector2, Vector3};
+use godot::builtin::{GString, StringName, VarDictionary, VariantType, Vector2, Vector3};
 use godot::classes::{IObject, Node};
-use godot::global::{PropertyHint, PropertyUsageFlags};
-use godot::meta::PropertyInfo;
 use godot::obj::{Gd, NewAlloc};
-use godot::register::{godot_api, GodotClass};
+use godot::register::info::{PropertyHint, PropertyInfo, PropertyUsageFlags};
+use godot::register::{GodotClass, godot_api};
 use godot::test::itest;
 
 #[derive(GodotClass)]
@@ -21,7 +20,7 @@ pub struct GetPropertyListTest {}
 
 #[godot_api]
 impl IObject for GetPropertyListTest {
-    fn get_property_list(&mut self) -> Vec<PropertyInfo> {
+    fn on_get_property_list(&mut self) -> Vec<PropertyInfo> {
         vec![
             PropertyInfo::new_var::<bool>("my_property"),
             PropertyInfo::new_export::<GString>("a_string_property"),
@@ -34,13 +33,13 @@ impl IObject for GetPropertyListTest {
     }
 }
 
-fn property_dict_eq_property_info(dict: &Dictionary, info: &PropertyInfo) -> bool {
-    dict.get("name").unwrap().to::<GString>().to_string() == info.property_name.to_string()
-        && dict.get("class_name").unwrap().to::<StringName>() == info.class_name.to_string_name()
-        && dict.get("type").unwrap().to::<VariantType>() == info.variant_type
-        && dict.get("hint").unwrap().to::<PropertyHint>() == info.hint_info.hint
-        && dict.get("hint_string").unwrap().to::<GString>() == info.hint_info.hint_string
-        && dict.get("usage").unwrap().to::<PropertyUsageFlags>() == info.usage
+fn property_dict_eq_property_info(dict: &VarDictionary, info: &PropertyInfo) -> bool {
+    dict.at("name").to::<GString>().to_string() == info.property_name.to_string()
+        && dict.at("class_name").to::<StringName>() == info.class_name
+        && dict.at("type").to::<VariantType>() == info.variant_type
+        && dict.at("hint").to::<PropertyHint>() == info.hint_info.hint
+        && dict.at("hint_string").to::<GString>() == info.hint_info.hint_string
+        && dict.at("usage").to::<PropertyUsageFlags>() == info.usage
 }
 
 #[itest]
@@ -53,7 +52,7 @@ fn get_property_list_returns() {
 
     properties_missing.extend(
         obj.bind_mut()
-            .get_property_list()
+            .on_get_property_list()
             .into_iter()
             .map(|prop| (prop.property_name.to_string(), prop)),
     );

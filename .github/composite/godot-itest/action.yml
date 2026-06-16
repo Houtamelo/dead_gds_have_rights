@@ -34,7 +34,7 @@ inputs:
   godot-prebuilt-patch:
     required: false
     default: ''
-    description: "If specified, sets the branch name of the godot4-prebuilt crate to this value"
+    description: "If specified, sets the branch name of the godot4-prebuilt crate to this value. Example '4.2' or '4.2.2' (latter being currently disabled, https://github.com/godot-rust/gdext/pull/1505)"
 
   rust-toolchain:
     required: false
@@ -51,10 +51,20 @@ inputs:
     default: ''
     description: "Extra values for the RUSTFLAGS env var"
 
+  rust-extra-env:
+    required: false
+    default: ''
+    description: "Extra env values to be passed during cargo build"
+
   rust-target:
     required: false
     default: ''
     description: "If provided, acts as an argument for '--target', and results in output files written to ./target/{target}"
+
+  rust-target-dir:
+    required: false
+    default: ''
+    description: "If provided, determines where to find the generated dylib. Example: 'release' if Godot editor build would look for debug otherwise."
 
   rust-cache-key:
     required: false
@@ -82,7 +92,7 @@ runs:
     # The `| xargs` pattern trims the output, since printed version may contain extra newline, which causes problems in env vars.
     - name: "Inspect Godot version"
       run: |
-        godotVer=$($GODOT4_BIN --version | xargs)
+        godotVer=$($GDRUST_GODOT_BIN --version | xargs)
         gitSha=$(echo $godotVer | sed -E "s/.+custom_build\.//")
         echo "GODOT_BUILT_FROM=_Built from [\`$godotVer\`](https://github.com/godotengine/godot/commit/$gitSha)._" >> $GITHUB_ENV
       shell: bash
@@ -117,10 +127,10 @@ runs:
           echo "Update compatibility_minimum in .gdextension files to '$apiVersion'..."
           dirs=("itest")
         
-          # Note that this is still hardcoded to 4.1, the start of GDExtension's compatibility promise. This makes it easier for users
-          # to use gdext with older Godot versions. There is anyway a runtime check in gdext that checks compatibility again.
+          # Note that this is still hardcoded to 4.2, the lowest supported API level by godot-rust. This makes it easier for users
+          # to use godot-rust with older Godot versions. There is anyway a runtime check in gdext that checks compatibility again.
           for dir in "${dirs[@]}"; do
-              find "$dir" -type f -name "*.gdextension" -exec sed -i'.bak' "s/compatibility_minimum = 4\.1/compatibility_minimum = $apiVersion/" {} +
+              find "$dir" -type f -name "*.gdextension" -exec sed -i'.bak' "s/compatibility_minimum = 4\.2/compatibility_minimum = $apiVersion/" {} +
           done
         
           echo "Example output: itest/godot/itest.gdextension"
@@ -135,9 +145,9 @@ runs:
     - name: "Dump extension api"
       if: inputs.godot-prebuilt-patch == '' && inputs.godot-indirect-json == 'true'
       run: |
-        $GODOT4_BIN --headless --dump-extension-api
+        $GDRUST_GODOT_BIN --headless --dump-extension-api
         mv extension_api.json $RUNNER_DIR/godot_bin/extension_api.json
-        echo "GODOT4_GDEXTENSION_JSON=$RUNNER_DIR/godot_bin/extension_api.json" >> $GITHUB_ENV
+        echo "GDRUST_GODOT_API_JSON=$RUNNER_DIR/godot_bin/extension_api.json" >> $GITHUB_ENV
       shell: bash
 
     # else
@@ -151,6 +161,7 @@ runs:
       env:
         RUSTFLAGS: ${{ inputs.rust-env-rustflags }}
         TARGET: ${{ inputs.rust-target }}
+        OUTPUT_DIR: ${{ inputs.rust-target-dir || 'debug' }}
       run: |
         targetArgs=""
         if [[ -n "$TARGET" ]]; then
@@ -158,12 +169,27 @@ runs:
         fi
         
         # Keep `--no-default-features` even if it's currently redundant. Features may change.
-        cargo build -p itest --no-default-features ${{ inputs.rust-extra-args }} $targetArgs
+        ${{ inputs.rust-extra-env }} cargo build -p itest --no-default-features ${{ inputs.rust-extra-args }} $targetArgs
         
         # Instead of modifying .gdextension, rename the output directory.
         if [[ -n "$TARGET" ]]; then
-          rm -rf target/debug
-          mv target/$TARGET/debug target
+          rm -rf target/debug target/release
+          echo "Build output (tree -L 2 target/$TARGET/$OUTPUT_DIR):"
+          tree -L 2 target/$TARGET/$OUTPUT_DIR || echo "(tree not installed)"
+          mv target/$TARGET/$OUTPUT_DIR target/ || {
+            echo "::error::Output dir $TARGET/$OUTPUT_DIR not found"
+            exit 1
+          }
+        #  echo "Intermediate dir (tree -L 2 target):"
+        #  tree -L 2 target || echo "(tree not installed)"
+          if [[ "$OUTPUT_DIR" != "debug" ]]; then
+            mv target/$OUTPUT_DIR target/debug
+          fi
+          echo "Resulting dir (tree -L 2 target):"
+          tree -L 2 target || echo "(tree not installed)"
+        #  echo "itest.gdextension contents:"
+        #  cat itest/godot/itest.gdextension
+        #  echo "----------------------------------------------------"
         fi
       shell: bash
 
@@ -180,9 +206,9 @@ runs:
       run: |
         cd itest/godot
         echo "OUTCOME=itest" >> $GITHUB_ENV
-        $GODOT4_BIN --headless -- --disallow-focus ${{ inputs.godot-args }} 2>&1 \
+        $GDRUST_GODOT_BIN --headless -- --disallow-focus ${{ inputs.godot-args }} 2>&1 \
         | tee "${{ runner.temp }}/log.txt" \
-        | tee >(grep -E "SCRIPT ERROR:|Can't open dynamic library" -q && {
+        | tee >(grep -E "SCRIPT ERROR:|Can't open dynamic library|Error loading extension" -q && {
           printf "\n::error::godot-itest: unrecoverable Godot error, abort...\n";
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             taskkill -f -im godot*

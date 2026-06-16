@@ -37,63 +37,57 @@
 //! ## Argument conversions
 //!
 //! Rust does not support implicit conversions, however it has something very close: the `impl Into<T>` idiom, which can be used to convert
-//! "T-compatible" arguments into `T`. This library specializes this idea with two traits:
+//! "T-compatible" arguments into `T`.
 //!
-//! - [`AsArg<T>`] allows argument conversions from arguments into `T`. This is most interesting in the context of strings (so you can pass
-//!   `&str` to a function expecting `GString`), but is generic to support e.g. array insertion.
-//! - [`AsObjectArg<T>`] is a more specialized version of `AsArg` that is used for object arguments, i.e. `Gd<T>`.
+//! This library specializes this idea with the trait [`AsArg<T>`]. `AsArg` allows argument conversions from arguments into `T`.
+//! This is most interesting in the context of strings (so you can pass `&str` to a function expecting `GString`) and objects (pass
+//! `&Gd<Node2D>` to a function expecting `Node2D` objects).
 
 mod args;
-mod array_type_info;
-mod class_name;
+mod class_id;
 mod godot_convert;
-mod method_info;
+mod object_to_owned;
 mod param_tuple;
-mod property_info;
+mod raw_ptr;
 mod signature;
 mod traits;
 mod uniform_object_deref;
 
 pub(crate) mod sealed;
 
+pub mod conv;
 pub mod error;
 pub mod inspect;
+pub mod shape;
+pub(crate) mod signed_range;
 
+// Public re-exports
 pub use args::*;
-pub use class_name::ClassName;
-pub use godot_convert::{FromGodot, GodotConvert, ToGodot};
-pub use param_tuple::{varcall_arg, InParamTuple, OutParamTuple, ParamTuple};
-pub use traits::{ArrayElement, GodotType, PackedArrayElement};
-pub use uniform_object_deref::UniformObjectDeref;
-
-pub(crate) use array_type_info::ArrayTypeInfo;
-pub(crate) use traits::{
-    element_godot_type_name, element_variant_type, ffi_variant_type, ExtVariantType,
-    GodotFfiVariant, GodotNullableFfi,
-};
-
-use crate::registry::method::MethodParamOrReturnInfo;
-
-pub(crate) use crate::{
-    arg_into_owned, arg_into_ref, declare_arg_method, impl_asarg_by_ref, impl_asarg_by_value,
-    impl_godot_as_self,
-};
-
-#[doc(hidden)]
-pub use signature::*;
-
+pub use class_id::ClassId;
+pub use godot_convert::{EngineFromGodot, EngineToGodot, FromGodot, GodotConvert, ToGodot};
+pub use object_to_owned::ObjectToOwned;
+pub use param_tuple::{InParamTuple, OutParamTuple, ParamTuple, TupleFromGodot, varcall_arg};
+pub use raw_ptr::{FfiRawPointer, RawPtr};
 #[cfg(feature = "trace")]
 pub use signature::trace;
+#[doc(hidden)]
+pub use signature::*;
+pub use signed_range::{SignedRange, wrapped};
+pub use traits::{Element, GodotImmutable, GodotType, PackedElement, element_variant_type};
+pub(crate) use traits::{ExtVariantType, GodotFfiVariant, GodotNullableFfi, ffi_variant_type};
+pub use uniform_object_deref::UniformObjectDeref;
 
-pub use method_info::MethodInfo;
-pub use property_info::{PropertyHintInfo, PropertyInfo};
+use crate::registry::method::MethodParamOrReturnInfo;
+pub use crate::{arg_into_owned, arg_into_ref, declare_arg_method, impl_godot_as_self};
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
 /// Clean up various resources at end of usage.
 ///
 /// # Safety
-/// Must not use meta facilities (e.g. `ClassName`) after this call.
+/// Must not use meta facilities (e.g. `ClassId`) after this call.
 pub(crate) unsafe fn cleanup() {
-    class_name::cleanup();
+    unsafe {
+        class_id::cleanup();
+    }
 }

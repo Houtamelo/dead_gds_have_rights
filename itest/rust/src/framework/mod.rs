@@ -5,27 +5,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use godot::classes::{Engine, Node, Os};
-use godot::obj::Gd;
-use godot::sys;
 use std::collections::HashSet;
 use std::panic;
+
+use godot::classes::{Engine, GDScript, Node, Os, SceneTree};
+use godot::obj::{Gd, NewGd, Singleton};
+use godot::sys;
 
 mod bencher;
 mod runner;
 
 pub use bencher::*;
-pub use runner::*;
-
 /// Allow re-import as `crate::framework::itest`.
 pub use godot::test::{bench, itest};
+pub use runner::*;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Plugin registration
 
 // Registers all the `#[itest]` tests and `#[bench]` benchmarks.
 sys::plugin_registry!(pub(crate) __GODOT_ITEST: RustTestCase);
-#[cfg(since_api = "4.2")]
 sys::plugin_registry!(pub(crate) __GODOT_ASYNC_ITEST: AsyncRustTestCase);
 sys::plugin_registry!(pub(crate) __GODOT_BENCH: RustBenchmark);
 
@@ -57,7 +56,6 @@ fn collect_rust_tests(filters: &[String]) -> (Vec<RustTestCase>, HashSet<&str>, 
 }
 
 /// Finds all `#[itest(async)]` tests.
-#[cfg(since_api = "4.2")]
 fn collect_async_rust_tests(
     filters: &[String],
     sync_focus_run: bool,
@@ -142,7 +140,6 @@ pub struct RustTestCase {
     pub function: fn(&TestContext),
 }
 
-#[cfg(since_api = "4.2")]
 #[derive(Copy, Clone)]
 pub struct AsyncRustTestCase {
     pub name: &'static str,
@@ -161,8 +158,7 @@ pub struct RustBenchmark {
     pub file: &'static str,
     #[allow(dead_code)]
     pub line: u32,
-    pub function: fn(),
-    pub repetitions: usize,
+    pub function: fn() -> BenchResult,
 }
 
 pub fn passes_filter(filters: &[String], test_name: &str) -> bool {
@@ -201,6 +197,25 @@ pub fn expect_panic(context: &str, code: impl FnOnce()) {
         panic.is_err(),
         "code should have panicked but did not: {context}",
     );
+}
+
+/// Run for code that should panic in *strict* and *balanced* safeguard levels, but cause UB in *disengaged* level.
+///
+/// The code is not executed for the latter.
+pub fn expect_panic_or_ub(_context: &str, _code: impl FnOnce()) {
+    #[cfg(safeguards_balanced)]
+    expect_panic(_context, _code);
+}
+
+/// Run for code that should panic in *strict* and *balanced* safeguard levels, but do nothing in *disengaged* level.
+///
+/// The code is executed either way, and must not cause UB.
+pub fn expect_panic_or_nothing(_context: &str, code: impl FnOnce()) {
+    #[cfg(safeguards_balanced)]
+    expect_panic(_context, code);
+
+    #[cfg(not(safeguards_balanced))]
+    code()
 }
 
 pin_project_lite::pin_project! {
@@ -246,12 +261,26 @@ pub fn expect_async_panic<T: std::future::Future>(
     ExpectPanicFuture { context, future }
 }
 
-pub fn expect_debug_panic_or_release_ok(_context: &str, code: impl FnOnce()) {
-    #[cfg(debug_assertions)]
-    expect_panic(_context, code);
+/// Run code asynchronously, at the very start of the next _process_ frame (before `INode::process()`).
+///
+/// If there is a custom `MainLoop` present, it will be run _before_ this.
+///
+/// Useful for assertions that run expect a `call_deferred()` or similar operation, and still want to check the result.
+#[must_use]
+#[allow(dead_code)] // not yet used.
+pub fn next_frame<F>(code: F) -> godot::task::TaskHandle
+where
+    F: FnOnce() + 'static,
+{
+    let tree = Engine::singleton()
+        .get_main_loop()
+        .unwrap()
+        .cast::<SceneTree>();
 
-    #[cfg(not(debug_assertions))]
-    code()
+    godot::task::spawn(async move {
+        let _: () = tree.signals().process_frame().to_future().await;
+        code();
+    })
 }
 
 /// Synchronously run a thread and return result. Panics are propagated to caller thread.
@@ -262,7 +291,6 @@ where
     R: Send + 'static,
 {
     let handle = std::thread::spawn(f);
-
     match handle.join() {
         Ok(result) => result,
         Err(panic_payload) => {
@@ -280,6 +308,9 @@ where
 /// Disable printing errors from Godot. Ideally we should catch and handle errors, ensuring they happen when
 /// expected. But that isn't possible, so for now we can just disable printing the error to avoid spamming
 /// the terminal when tests should error.
+///
+/// **Important:** Do not run this inside [`expect_panic()`], it will mute panic messages forever. Instead, make sure [`suppress_godot_print()`]
+/// is the outer function.
 pub fn suppress_godot_print(mut f: impl FnMut()) {
     Engine::singleton().set_print_error_messages(false);
     f();
@@ -292,6 +323,22 @@ pub fn runs_release() -> bool {
     !Os::singleton().is_debug_build()
 }
 
+/// Whether we are running in GitHub Actions CI.
+///
+/// Must not be used to influence test logic. Only for logging and diagnostics.
+#[allow(dead_code)]
+pub fn runs_github_ci() -> bool {
+    std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+}
+
+/// Create a `GDScript` script from code, compiles and returns it.
+pub fn create_gdscript(code: &str) -> Gd<GDScript> {
+    let mut script = GDScript::new_gd();
+    script.set_source_code(code);
+    script.reload(); // Necessary so compile is triggered.
+    script
+}
+
 /// Workaround for tests of the form `assert!(a == a)`.
 ///
 /// We can't always use `assert_eq!(a, a)` because of lacking `Debug` impl.
@@ -299,11 +346,51 @@ pub fn runs_release() -> bool {
 /// Clippy however complains, yet the suggested `#[allow(clippy::eq_op)]` cannot be used to suppress the Clippy warning (likely a bug).
 #[macro_export]
 macro_rules! assert_eq_self {
-    ($a:expr) => {{
+    ($a:expr_2021) => {{
         if !($a == $a) {
             panic!("assertion failed: `(a == a)`");
         }
     }};
 }
 
-pub use crate::assert_eq_self;
+pub use crate::{assert_eq_self, assert_match};
+
+/// Asserts that `$expr` matches `$pat` and introduces the bindings from `$pat` into the surrounding scope.
+/// On failure, panics with either a default message (showing the value via `Debug`) or a custom message.
+///
+/// # Examples
+/// ```
+/// # use crate::assert_match;
+/// struct Point { x: i32, y: i32 }
+/// let point = Some(Point { x: 1, y: 2 });
+/// assert_match!(point, Some(Point { x, y }), "expected Point");
+/// assert_eq!(x, 1);
+/// assert_eq!(y, 2);
+/// ```
+/// ```should_panic
+/// # use crate::assert_match;
+/// // This will panic.
+/// let value = None::<i32>;
+/// assert_match!(value, Some(_));
+/// ```
+#[macro_export]
+macro_rules! assert_match {
+    // Default message, show the unexpected value (requires Debug).
+    ($expr:expr_2021, $pat:pat $(,)?) => {
+        let __expr = $expr;
+        let $pat = __expr else {
+            panic!(
+                "assert_match! failed: expected {}, got {__expr:?}",
+                stringify!($pat),
+            );
+        };
+    };
+
+    // Custom panic message (format args supported).
+    ($expr:expr_2021, $pat:pat, $($arg:tt)+) => {
+        let __expr = $expr;
+        let $pat = __expr else {
+            panic!($($arg)+);
+        };
+    };
+}

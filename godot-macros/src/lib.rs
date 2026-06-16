@@ -14,7 +14,6 @@ mod bench;
 mod class;
 mod derive;
 mod docs;
-mod ffi_macros;
 mod gdextension;
 mod itest;
 mod util;
@@ -22,7 +21,7 @@ mod util;
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 
-use crate::util::{bail, ident, KvParser};
+use crate::util::{KvParser, bail, ident};
 
 // Below intra-doc link to the trait only works as HTML, not as symbol link.
 /// Derive macro for [`GodotClass`](../obj/trait.GodotClass.html) on structs.
@@ -43,7 +42,7 @@ use crate::util::{bail, ident, KvParser};
 /// This constructor is made available to Godot and lets you call `MyStruct.new()` from GDScript. To enable it, annotate your
 /// struct with `#[class(init)]`:
 ///
-/// ```
+/// ```no_run
 /// # use godot_macros::GodotClass;
 /// #[derive(GodotClass)]
 /// #[class(init)]
@@ -55,7 +54,7 @@ use crate::util::{bail, ident, KvParser};
 /// The generated `init` function will initialize each struct field (except the field of type `Base<T>`, if any)
 /// using `Default::default()`. To assign some other value, annotate the field with `#[init(val = ...)]`:
 ///
-/// ```
+/// ```no_run
 /// # use godot_macros::GodotClass;
 /// #[derive(GodotClass)]
 /// #[class(init)]
@@ -71,7 +70,7 @@ use crate::util::{bail, ident, KvParser};
 /// inside any pair of `(...)`, `[...]` or `{...}` (even if it is, for example, inside `<...>` or
 /// `|...|`). A contrived example:
 ///
-/// ```
+/// ```no_run
 /// # use godot_macros::GodotClass;
 /// # use std::collections::HashMap;
 /// # #[derive(GodotClass)]
@@ -86,7 +85,7 @@ use crate::util::{bail, ident, KvParser};
 /// You can also _disable_ construction from GDScript. This needs to be explicit via `#[class(no_init)]`.
 /// Simply omitting the `init`/`no_init` keys and not overriding your own constructor will cause a compile error.
 ///
-/// ```
+/// ```no_run
 /// # use godot_macros::GodotClass;
 /// #[derive(GodotClass)]
 /// #[class(no_init)]
@@ -100,12 +99,12 @@ use crate::util::{bail, ident, KvParser};
 /// Unlike C++, Rust doesn't really have inheritance, but the GDExtension API lets us "inherit"
 /// from a Godot-provided engine class.
 ///
-/// By default, classes created with this library inherit from `RefCounted`, like GDScript.
+/// By default, non-singleton classes created with this library inherit from `RefCounted`, like GDScript.
 ///
 /// To specify a different class to inherit from, add `#[class(base = Base)]` as an annotation on
 /// your `struct`:
 ///
-/// ```
+/// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// #[class(init, base=Node2D)]
@@ -117,7 +116,7 @@ use crate::util::{bail, ident, KvParser};
 /// If you need a reference to the base class, you can add a field of type `Base<T>`. The derive macro will pick this up and wire
 /// your object accordingly. You can access it through `self.base()` and `self.base_mut()` methods.
 ///
-/// ```
+/// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// #[class(init, base=Node2D)]
@@ -142,7 +141,7 @@ use crate::util::{bail, ident, KvParser};
 ///
 /// To create a property, you can use the `#[var]` annotation, which supports types implementing [`Var`](../register/property/trait.Var.html).
 ///
-/// ```
+/// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// # #[class(init)]
@@ -152,72 +151,103 @@ use crate::util::{bail, ident, KvParser};
 /// }
 /// ```
 ///
-/// This makes the field accessible in GDScript using `my_struct.my_field` syntax. Additionally, it
-/// generates a trivial getter and setter named `get_my_field` and `set_my_field`, respectively.
-/// These are `pub` in Rust, since they're exposed from GDScript anyway.
+/// This makes the field accessible in GDScript using `obj.my_field` syntax. In addition to direct property access, GDScript can use
+/// explicit getter and setter notation: `obj.get_my_field()` and `obj.set_my_field()`.
 ///
-/// If you want to implement your own getter and/or setter, write those as a function on your Rust
-/// type, expose it using `#[func]`, and annotate the field with
-/// `#[var(get = ..., set = ...)]`:
+/// If you want to access those getters/setters from Rust, you can use `#[var(pub)]`:
 ///
-/// ```
+/// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// #[class(init)]
 /// struct MyStruct {
-///     #[var(get = get_my_field, set = set_my_field)]
+///     #[var(pub)]
 ///     my_field: i64,
+/// }
+///
+/// fn use_accessors(obj: &MyStruct) {
+///     let f: i64 = obj.get_my_field();
+/// }
+/// ```
+///
+/// You can also customize getters and setters.
+/// The `get` and `set` options are **orthogonal** as of godot-rust v0.5: specifying one does not affect the other.
+/// By default, both a getter and setter are generated, but you can customize either independently:
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init)]
+/// struct MyStruct {
+///     // Auto-generated getter and setter.
+///     #[var]
+///     a: i64,
+///
+///     // Looks for setter `set_b` defined by user. Name is derived from field name.
+///     #[var(set)]
+///     b: i64,
+///
+///     // Looks for custom-named setter `my_set_c` defined by user.
+///     #[var(set = my_set_c)]
+///     c: i64,
+///
+///     // No setter, default getter (read-only).
+///     #[var(no_set)]
+///     d: i64,
+///
+///     // Same principle for getters.
 /// }
 ///
 /// #[godot_api]
 /// impl MyStruct {
-///     #[func]
-///     pub fn get_my_field(&self) -> i64 {
-///         self.my_field
+///     #[func] // #[func] is needed to make function visible to Godot.
+///     pub fn set_b(&mut self, value: i64) {
+///         if value % 3 == 0 {  // Example: perform validation.
+///             self.b = value;
+///         }
 ///     }
 ///
 ///     #[func]
-///     pub fn set_my_field(&mut self, value: i64) {
-///         self.my_field = value;
+///     pub fn my_set_c(&mut self, value: i64) {
+///         self.c = value.max(0);  // Example: clamp to non-negative.
 ///     }
 /// }
 /// ```
 ///
-/// If you specify only `get`, no setter is generated, making the field read-only. If you specify
-/// only `set`, no getter is generated, making the field write-only (rarely useful). To add a
-/// generated getter or setter in these cases anyway, use `get` or `set` without a value:
+/// If you want the field to have a different name in Godot and Rust, you can use `rename`:
 ///
-/// ```
+/// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// # #[class(init)]
 /// struct MyStruct {
-///     // Default getter, custom setter.
-///     #[var(get, set = set_my_field)]
-///     my_field: i64,
-/// }
-///
-/// #[godot_api]
-/// impl MyStruct {
-///     #[func]
-///     pub fn set_my_field(&mut self, value: i64) {
-///         self.my_field = value;
-///     }
+///     #[var(rename = my_godot_field)]
+///     my_rust_field: i64,
 /// }
 /// ```
+///
+/// With this, you can access this field as `my_rust_field` in Rust code, however when accessing it from Godot you have to
+/// use `my_godot_field` instead (including when using methods such as [`Object::get`](../classes/struct.Object.html#method.get)).
+/// The generated getters and setters will also be named `get/set_my_godot_field`, instead of `get/set_my_rust_field`.
+///
+/// To create a property without a backing field to store data, you can use [`PhantomVar`](../prelude/struct.PhantomVar.html).
+/// This disables autogenerated getters and setters for that field.
 ///
 /// ## Export properties -- `#[export]`
 ///
 /// To export properties to the editor, you can use the `#[export]` attribute, which supports types implementing
 /// [`Export`](../register/property/trait.Export.html):
 ///
-/// ```
-/// # use godot::prelude::*;
+/// ```no_run
+/// # use godot::prelude::{GodotClass, Node3D, Gd, OnEditor};
 /// #[derive(GodotClass)]
 /// # #[class(init)]
 /// struct MyStruct {
 ///     #[export]
 ///     my_field: i64,
+///
+///     #[export]
+///     child: OnEditor<Gd<Node3D>>,
 /// }
 /// ```
 ///
@@ -237,7 +267,7 @@ use crate::util::{bail, ident, KvParser};
 ///
 /// As an example of different export attributes:
 ///
-/// ```
+/// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// # #[class(init)]
@@ -284,7 +314,7 @@ use crate::util::{bail, ident, KvParser};
 /// Most values in syntax such as `key = value` can be arbitrary expressions. For example, you can use constants, function calls or
 /// other Rust expressions that are valid in that context.
 ///
-/// ```
+/// ```no_run
 /// # use godot::prelude::*;
 /// const MAX_HEALTH: f64 = 100.0;
 ///
@@ -313,7 +343,7 @@ use crate::util::{bail, ident, KvParser};
 /// See also in Godot docs:
 /// [Grouping Exports](https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/gdscript_exports.html#grouping-exports)
 ///
-///```
+///```no_run
 /// # use godot::prelude::*;
 /// const MAX_HEALTH: f64 = 100.0;
 ///
@@ -363,8 +393,8 @@ use crate::util::{bail, ident, KvParser};
 /// while hint strings are dependent on the hint, property type and context. Using these low-level keys is rarely necessary, as most common
 /// combinations are covered by `#[var]` and `#[export]` already.
 ///
-/// [`PropertyHint`]: ../global/struct.PropertyHint.html
-/// [`PropertyUsageFlags`]: ../global/struct.PropertyUsageFlags.html
+/// [`PropertyHint`]: ../register/info/struct.PropertyHint.html
+/// [`PropertyUsageFlags`]: ../register/info/struct.PropertyUsageFlags.html
 ///
 /// ```no_run
 /// # use godot::prelude::*;
@@ -397,6 +427,134 @@ use crate::util::{bail, ident, KvParser};
 /// This behaves similarly to [GDScript's `@tool` feature](https://docs.godotengine.org/en/stable/tutorials/plugins/running_code_in_the_editor.html).
 ///
 /// **Note**: As in GDScript, the class must be marked as a `tool` to be accessible in the editor (e.g., for use by editor plugins and inspectors).
+///
+/// ## Export tool button
+///
+/// If you need a clickable inspector button on a tool class, use [`PhantomVar<Callable>`](../register/property/struct.PhantomVar.html) with
+/// the `#[export_tool_button]` attribute. This exports a `Callable` property as a clickable button. When the button is pressed, the callable
+/// is invoked.
+///
+/// The `#[export_tool_button]` attribute accepts the following arguments:
+/// - **`fn`** (required): a Rust expression that evaluates to a function. This can be a path to a method (`Self::my_method`) or global function
+///   (`my_function`). The expression receives a `&mut Self` reference when the button is clicked.
+/// - **`name`** (optional): a string literal used as the button label in the inspector. If not provided, it is derived from the field name, with
+///   underscores replaced by spaces.
+/// - **`icon`** (optional): a string literal naming an editor icon to display on the button. Must match one of the icon file names from the
+///   [editor/icons] folder of the Godot source repository, without the `.svg` extension (case-sensitive, e.g. `"Node2D"` for `Node2D.svg`).
+///   You can browse available icons on the [Godot editor icons website]. Only built-in editor icons can be used; custom icons from the project
+///   folder are not supported.
+///
+/// ```no_run
+/// use godot::prelude::*;
+/// use godot::obj::WithBaseField;
+///
+/// #[derive(GodotClass)]
+/// #[class(init, tool, base = Node)]
+/// struct MyStruct {
+///     #[export_tool_button(fn = Self::my_method, icon = "2DNodes")]
+///     tool_button: PhantomVar<Callable>,
+///
+///     #[export_tool_button(fn = generic_fn, name = "My custom name for tool button")]
+///     my_other_tool_button: PhantomVar<Callable>,
+///
+///     base: Base<Node>,
+/// }
+///
+/// #[godot_api]
+/// impl MyStruct {
+///     fn my_method(&mut self) { /* ... */ }
+/// }
+///
+/// fn generic_fn<T: GodotClass<Base=Node> + WithBaseField>(this: &mut T) {
+///     let mut node = Node::new_alloc();
+///     this.base_mut().add_child(&node);
+/// }
+/// ```
+///
+/// A class with `#[export_tool_button]` fields must have `#[class(tool)]` and a `Base<T>` field.  \
+/// `#[export_tool_button]` cannot be combined with `#[var]` or `#[export]` on the same field.  \
+/// The following examples will fail to compile:
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// // Not a tool.
+/// #[class(init, base = Node)]
+/// struct MyStruct {
+///     #[export_tool_button(fn = Self::my_method)]
+///     tool_button: PhantomVar<Callable>,
+///     base: Base<Node>
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base = Node)]
+/// struct MyStruct {
+///     #[export_tool_button(fn = Self::my_method)]
+///     tool_button: PhantomVar<Callable>,
+///     // Base field is absent.
+/// }
+/// ```
+///
+/// Callables generated by `#[export_tool_button]` become invalid after hot reload; keeping references to them is unsound
+/// and will crash the editor.
+///
+/// `#[export_tool_button(fn = ...)]` is a shortcut for `#[var(...)]` that automatically generates a getter returning a
+/// Callable that executes the specified function. The following section provides such an example.
+///
+/// <details>
+/// <summary><i>Expand...</i></summary>
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(tool, init, base=Node)]
+/// struct Caller {
+///     // This declaration...
+///     #[var(
+///         no_set,
+///         get = get_my_callable,
+///         usage_flags = [EDITOR],
+///         hint = TOOL_BUTTON,
+///         hint_string = "My tool button!,2DNodes"
+///     )]
+///     my_first_tool_button: PhantomVar<Callable>,
+///
+///     // ...is equivalent to:
+///     #[export_tool_button(
+///         fn = Self::my_method,
+///         name = "My tool button!",
+///         icon = "2DNodes"
+///     )]
+///     my_second_tool_button: PhantomVar<Callable>,
+///
+///     // Base is required.
+///     base: Base<Node>
+/// }
+///
+/// #[godot_api]
+/// impl Caller {
+///     #[func]
+///     fn get_my_callable(&self) -> Callable {
+///         let mut obj = self.to_gd();
+///         Callable::from_fn("my tool button callable", move |_args| Self::my_method(&mut *obj.bind_mut()))
+///     }
+///
+///     fn my_method(&mut self) {
+///         godot_print!("Hello from my fn!");
+///     }
+/// }
+/// ```
+///
+/// </details>
+///
+/// The GDScript equivalent of `#[export_tool_button]` is [`@export_tool_button`]. This feature requires at least Godot 4.4.
+///
+/// [`@export_tool_button`]: https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/gdscript_exports.html#export-tool-button
+/// [editor/icons]: https://github.com/godotengine/godot/tree/master/editor/icons
+/// [Godot editor icons website]: https://godotengine.github.io/editor-icons
 ///
 /// ## Editor plugins
 ///
@@ -448,7 +606,9 @@ use crate::util::{bail, ident, KvParser};
 ///
 /// ## Class hiding
 ///
-/// If you want to register a class with Godot, but not have it show up in the editor then you can use `#[class(internal)]`.
+/// If you want to register a class with Godot, but not display in the editor (e.g. when creating a new node), you can use `#[class(internal)]`.
+///
+/// Classes starting with "Editor" are auto-hidden by Godot. They *must* be marked as internal in godot-rust.
 ///
 /// ```
 /// # use godot::prelude::*;
@@ -459,6 +619,43 @@ use crate::util::{bail, ident, KvParser};
 ///
 /// Even though this class is a `Node` and it has an init function, it still won't show up in the editor as a node you can add to a scene
 /// because we have added a `hidden` key to the class. This will also prevent it from showing up in documentation.
+///
+/// ## User-defined Singletons
+///
+/// Non-refcounted classes can be registered as an engine singleton with `#[class(singleton)]`.
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// # use godot::classes::Object;
+/// #[derive(GodotClass)]
+/// #[class(init, singleton)]
+/// struct MySingleton {
+///     my_field: i32,
+///     // For `#[class(singleton)]`, the default base is Object, not RefCounted.
+///     base: Base<Object>,
+/// }
+///
+/// // Can be accessed like any other engine singleton from the main thread.
+/// let val = MySingleton::singleton().bind().my_field;
+/// ```
+///
+/// By default, engine singletons inherit from `Object` and always run in the editor (implied `#[class(tool)]`).
+/// During hot reload, user-defined singletons are not being recreated like other tool classes. Instead, they are freed while unloading the
+/// library, and then freshly instantiated after other classes have been registered.
+///
+/// GDScript will be prohibited from creating new instances of said class.
+///
+/// User-defined singletons must have an `init` constructor:
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(no_init, singleton)]
+/// struct MySingleton {
+///     my_field: i32,
+/// }
+/// ```
+///
 ///
 /// # Further field customization
 ///
@@ -533,14 +730,26 @@ use crate::util::{bail, ident, KvParser};
     alias = "base",
     alias = "init",
     alias = "no_init",
+    alias = "singleton",
     alias = "var",
     alias = "export",
     alias = "tool",
-    alias = "rename"
+    alias = "rename",
+    alias = "internal"
 )]
 #[proc_macro_derive(
     GodotClass,
-    attributes(class, base, hint, var, export, export_group, export_subgroup, init)
+    attributes(
+        class,
+        base,
+        hint,
+        var,
+        export,
+        export_group,
+        export_tool_button,
+        export_subgroup,
+        init
+    )
 )]
 pub fn derive_godot_class(input: TokenStream) -> TokenStream {
     translate(input, class::derive_godot_class)
@@ -697,6 +906,37 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
+/// ## Default parameters
+///
+/// Functions can have default parameters using the `#[opt]` attribute. When a caller provides fewer arguments than the function
+/// signature defines, the default values are used for the missing parameters.
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init)]
+/// struct MyStruct {}
+///
+/// #[godot_api]
+/// impl MyStruct {
+///     #[func]
+///     fn greet(&self, #[opt(default = "World")] name: GString) {
+///         godot_print!("Hello, {name}!");
+///     }
+/// }
+/// ```
+/// ```gdscript
+/// // Can be called from GDScript as:
+/// obj.greet()        # prints "Hello, World!"
+/// obj.greet("Rust")  # prints "Hello, Rust!"
+/// ```
+///
+/// **Important notes:**
+/// - Optional parameters must come at the end of the parameter list.
+/// - The expression given in `default = ...` must implement [`AsArg<T>`](../meta/trait.AsArg.html) for the parameter type `T`.
+/// - Default expressions are evaluated on each function call (not cached). **This may change**, see
+///   [PR #1396](https://github.com/godot-rust/gdext/pull/1396).
+///
 /// ## Virtual methods
 ///
 /// Functions with the `#[func(virtual)]` attribute are virtual functions, meaning attached scripts can override them.
@@ -816,6 +1056,58 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// [`TransferMode`]: ../classes/multiplayer_peer/struct.TransferMode.html
 /// [`RpcConfig`]: ../register/struct.RpcConfig.html
 ///
+/// # Lifecycle functions with custom receivers
+///
+/// Functions inside I* interface impls, similarly to user-defined `#[func]`s, can be annotated with `#[func(gd_self)]` to use `Gd<Self>` receiver and
+/// avoid binding the instance.
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base=Node)]
+/// pub struct MyNode;
+///
+/// #[godot_api]
+/// impl INode for MyNode {
+///     #[func(gd_self)]
+///     fn ready(this: Gd<Self>) {
+///         godot_print!("I'm ready!");
+///     }
+/// }
+/// ```
+///
+/// Only methods with `self` receiver can be used with `#[func(gd_self)]`:
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base=Node)]
+/// pub struct MyNode;
+///
+/// #[godot_api]
+/// impl INode for MyNode {
+///     #[func(gd_self)]
+///     fn init(this: Gd<Self>) -> Self {
+///         todo!()
+///     }
+/// }
+/// ```
+///
+/// Currently, `on_notification` can't be used with `[func(gd_self)]`, either:
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base=Node)]
+/// pub struct MyNode;
+///
+/// #[godot_api]
+/// impl INode for MyNode {
+///     #[func(gd_self)]
+///     fn on_notification(this: Gd<Self>, what: ObjectNotification) {
+///         todo!()
+///     }
+/// }
+/// ```
 ///
 /// # Signals
 ///
@@ -827,7 +1119,7 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// #[derive(GodotClass)]
 /// #[class(init)]
 /// struct MyClass {
-///     base: Base<RefCounted>, // necessary for #[signal].
+///     base: Base<RefCounted>, // Base<...> necessary for #[signal].
 /// }
 ///
 /// #[godot_api]
@@ -873,8 +1165,42 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 ///     pub fn two(&self) { }
 /// }
 /// ```
+///
+/// `#[signal]` and `#[rpc]` attributes are not currently supported in secondary `impl` blocks.
+/// Additionally, `#[var(get = ..., set = ...)]` on fields cannot reference `#[func]` methods defined in secondary blocks.
+///
+///```compile_fail
+/// # use godot::prelude::*;
+/// # #[derive(GodotClass)]
+/// # #[class(init, base=Node)]
+/// # pub struct MyNode { base: Base<Node> }
+/// # // Without primary `impl` block the compilation will always fail (no matter if #[signal] attribute is present or not)
+/// # #[godot_api]
+/// # impl MyNode {}
+/// #[godot_api(secondary)]
+/// impl MyNode {
+///     #[signal]
+///     fn my_signal();
+/// }
+/// ```
+///
+///```compile_fail
+/// # use godot::prelude::*;
+/// # #[derive(GodotClass)]
+/// # #[class(init, base=Node)]
+/// # pub struct MyNode { base: Base<Node> }
+/// # // Without primary `impl` block the compilation will always fail (no matter if #[rpc] attribute is present or not).
+/// # #[godot_api]
+/// # impl MyNode {}
+/// #[godot_api(secondary)]
+/// impl MyNode {
+///     #[rpc]
+///     fn foo(&mut self) {}
+/// }
+/// ```
 #[doc(
     alias = "func",
+    alias = "default",
     alias = "rpc",
     alias = "virtual",
     alias = "signal",
@@ -976,7 +1302,8 @@ pub fn godot_dyn(_meta: TokenStream, input: TokenStream) -> TokenStream {
 /// let obj = MyNewtype {
 ///     string: "hello!".into(),
 /// };
-/// assert_eq!(obj.to_godot(), GString::from("hello!"));
+///
+/// assert_eq!(obj.to_godot(), &GString::from("hello!"));
 /// ```
 ///
 /// However, it will not work for structs with more than one field, even if that field is zero sized:
@@ -1114,16 +1441,6 @@ pub fn gdextension(meta: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
-// Used by godot-ffi
-
-/// Creates an initialization block for Wasm.
-#[proc_macro]
-#[cfg(feature = "experimental-wasm")]
-pub fn wasm_declare_init_fn(input: TokenStream) -> TokenStream {
-    translate_functional(input, ffi_macros::wasm_declare_init_fn)
-}
-
-// ----------------------------------------------------------------------------------------------------------------------------------------------
 // Implementation
 
 type ParseResult<T> = Result<T, venial::Error>;
@@ -1164,7 +1481,7 @@ where
 }
 
 /// For `#[proc_macro]` function-style macros.
-#[cfg(feature = "experimental-wasm")]
+#[expect(dead_code)]
 fn translate_functional<F>(input: TokenStream, transform: F) -> TokenStream
 where
     F: FnOnce(TokenStream2) -> ParseResult<TokenStream2>,

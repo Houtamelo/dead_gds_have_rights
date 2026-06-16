@@ -5,11 +5,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::path::Path;
+
+use quote::quote;
+
+use crate::SubmitFn;
 use crate::context::Context;
 use crate::models::domain::{ClassCodegenLevel, ExtensionApi};
-use crate::SubmitFn;
-use quote::quote;
-use std::path::Path;
 
 pub mod builtins;
 pub mod central_files;
@@ -27,7 +29,7 @@ pub mod native_structures;
 pub mod notifications;
 pub mod signals;
 pub mod utility_functions;
-pub mod virtual_definition_consts;
+pub mod virtual_definitions;
 pub mod virtual_traits;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -45,6 +47,7 @@ pub fn generate_sys_module_file(sys_gen_path: &Path, submit_fn: &mut SubmitFn) {
     let code = quote! {
         pub mod table_builtins;
         pub mod table_builtins_lifecycle;
+        pub mod table_core_classes;
         pub mod table_servers_classes;
         pub mod table_scene_classes;
         pub mod table_editor_classes;
@@ -53,7 +56,6 @@ pub fn generate_sys_module_file(sys_gen_path: &Path, submit_fn: &mut SubmitFn) {
         pub mod central;
         pub mod gdextension_interface;
         pub mod interface;
-        pub mod virtual_consts;
     };
 
     submit_fn(sys_gen_path.join("mod.rs"), code);
@@ -83,12 +85,6 @@ pub fn generate_sys_classes_file(
         submit_fn(sys_gen_path.join(filename), code);
         watch.record(format!("generate_classes_{}_file", api_level.lower()));
     }
-
-    // From 4.4 onward, generate table that maps all virtual methods to their known hashes.
-    // This allows Godot to fall back to an older compatibility function if one is not supported.
-    let code = virtual_definition_consts::make_virtual_consts_file(api, ctx);
-    submit_fn(sys_gen_path.join("virtual_consts.rs"), code);
-    watch.record("generate_virtual_consts_file");
 }
 
 pub fn generate_sys_utilities_file(
@@ -128,6 +124,7 @@ pub fn generate_core_mod_file(gen_path: &Path, submit_fn: &mut SubmitFn) {
         pub mod builtin_classes;
         pub mod utilities;
         pub mod native;
+        pub mod virtuals;
     };
 
     submit_fn(gen_path.join("mod.rs"), code);

@@ -5,14 +5,16 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::path::Path;
+
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
+
 use crate::context::Context;
 use crate::generator::builtins;
 use crate::models::domain::{ExtensionApi, ModName, NativeStructure, TyName};
 use crate::util::ident;
-use crate::{conv, special_cases, util, SubmitFn};
-use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
-use std::path::Path;
+use crate::{SubmitFn, conv, special_cases, util};
 
 pub fn generate_native_structures_files(
     api: &ExtensionApi,
@@ -41,8 +43,10 @@ pub fn generate_native_structures_files(
         submit_fn(out_path, file_contents);
 
         modules.push(builtins::GeneratedBuiltinModule {
-            symbol_ident: class_name.rust_ty.clone(),
+            outer_builtin: class_name.rust_ty.clone(),
+            inner_builtin: class_name.rust_ty.clone(),
             module_name,
+            is_pub_sidecar: false, // Native structures don't have default extenders.
         });
     }
 
@@ -84,17 +88,14 @@ fn make_native_structure(
 
     let imports = util::make_imports();
     let (fields, methods) = make_native_structure_fields_and_methods(structure, ctx);
-    let doc = format!("[`ToGodot`] and [`FromGodot`] are implemented for `*mut {class_name}` and `*const {class_name}`.");
 
     // mod re_export needed, because class should not appear inside the file module, and we can't re-export private struct as pub
     let tokens = quote! {
         #imports
         use std::ffi::c_void; // for opaque object pointer fields
-        use crate::meta::{GodotConvert, FromGodot, ToGodot};
 
         /// Native structure; can be passed via pointer in APIs that are not exposed to GDScript.
         ///
-        #[doc = #doc]
         #[derive(Clone, PartialEq, Debug)]
         #[repr(C)]
         pub struct #class_name {
@@ -105,45 +106,14 @@ fn make_native_structure(
             #methods
         }
 
-        impl GodotConvert for *mut #class_name {
-            type Via = i64;
-        }
-
-        impl ToGodot for *mut #class_name {
-            type ToVia<'v> = i64;
-
-            fn to_godot(&self) -> Self::ToVia<'_> {
-                *self as i64
-            }
-        }
-
-        impl FromGodot for *mut #class_name {
-            fn try_from_godot(via: Self::Via) -> Result<Self, crate::meta::error::ConvertError> {
-                Ok(via as Self)
-            }
-        }
-
-        impl GodotConvert for *const #class_name {
-            type Via = i64;
-        }
-
-        impl ToGodot for *const #class_name {
-            type ToVia<'v> = i64;
-
-            fn to_godot(&self) -> Self::ToVia<'_> {
-                *self as i64
-            }
-        }
-
-        impl FromGodot for *const #class_name {
-            fn try_from_godot(via: Self::Via) -> Result<Self, crate::meta::error::ConvertError> {
-                Ok(via as Self)
-            }
-        }
+        // Pointer conversions are now handled by RawPtr<P>, no direct ToGodot/FromGodot impls.
     };
     // note: TypePtr -> ObjectPtr conversion OK?
 
-    builtins::GeneratedBuiltin { code: tokens }
+    builtins::GeneratedBuiltin {
+        code: tokens,
+        has_sidecar_module: false,
+    }
 }
 
 fn make_native_structure_fields_and_methods(
@@ -211,19 +181,26 @@ fn make_native_structure_field_and_accessor(
             }
 
             /// Sets the object from a `Gd` pointer holding `Node` or a derived class.
-            pub fn #setter_name<T>(&mut self, #snake_field_name: Gd<T>)
+            ///
+            /// # Safety
+            /// You must ensure that the provided object remains alive while Godot accesses it.
+            /// See also [`RawPtr::new()`][crate::meta::RawPtr::new].
+            pub unsafe fn #setter_name<T>(&mut self, #snake_field_name: Gd<T>)
             where T: crate::obj::Inherits<Object> {
                 use crate::meta::GodotType as _;
 
                 let obj = #snake_field_name.upcast();
 
-                #[cfg(debug_assertions)]
+                #[cfg(safeguards_balanced)]
                 assert!(obj.is_instance_valid(), "provided node is dead");
 
                 let id = obj.instance_id().to_u64();
 
                 self.#id_field_name = ObjectId { id };
-                self.#field_name = obj.obj_sys() as *mut std::ffi::c_void;
+
+                // SAFETY: provided by method safety contract.
+                // Godot declares void* but expects GDExtensionObjectPtr.
+                self.#field_name = unsafe { RawPtr::new(obj.obj_sys().cast::<std::ffi::c_void>()) };
             }
         });
     } else {

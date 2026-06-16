@@ -5,16 +5,22 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::fmt;
+
+use godot_ffi::{ExtVariantType, GodotFfi, GodotNullableFfi, PtrcallType};
+
 use crate::builtin::Variant;
 use crate::meta::error::ConvertError;
+use crate::meta::shape::GodotShape;
 use crate::meta::{FromGodot, GodotConvert, GodotFfiVariant, ToGodot};
 use crate::sys;
-use godot_ffi::{ExtVariantType, GodotFfi, GodotNullableFfi, PtrcallType};
-use std::fmt;
 
 /// Simple reference wrapper, used when passing arguments by-ref to Godot APIs.
 ///
-/// This type is often used as the result of [`ToGodot::to_godot()`], if `Self` is not a `Copy` type.
+/// This type is exclusively used at the FFI boundary, to avoid unnecessary cloning of values.
+///
+/// Private type. Cannot be `pub(crate)` because it's used in `#[doc(hidden)]` associate type `GodotType::ToFfi<'f>`, and `GodotType` is public.
+#[doc(hidden)]
 pub struct RefArg<'r, T> {
     /// Only `None` if `T: GodotNullableFfi` and `T::is_null()` is true.
     shared_ref: Option<&'r T>,
@@ -78,23 +84,38 @@ where
     T: GodotConvert,
 {
     type Via = T::Via;
+
+    fn godot_shape() -> GodotShape {
+        T::godot_shape()
+    }
 }
 
 impl<T> ToGodot for RefArg<'_, T>
 where
     T: ToGodot,
 {
-    type ToVia<'v>
-        = T::ToVia<'v>
-    where
-        Self: 'v;
+    type Pass = T::Pass;
 
-    fn to_godot(&self) -> Self::ToVia<'_> {
+    fn to_godot(&self) -> crate::meta::ToArg<'_, Self::Via, Self::Pass> {
         let shared_ref = self
             .shared_ref
             .expect("Objects are currently mapped through ObjectArg; RefArg shouldn't be null");
 
         shared_ref.to_godot()
+    }
+
+    fn to_godot_owned(&self) -> Self::Via
+    where
+        Self::Via: Clone,
+    {
+        // Default implementation calls underlying T::to_godot().clone(), which is wrong.
+        // Some to_godot_owned() calls are specialized/overridden, we need to honor that.
+
+        let shared_ref = self
+            .shared_ref
+            .expect("Objects are currently mapped through ObjectArg; RefArg shouldn't be null");
+
+        shared_ref.to_godot_owned()
     }
 }
 
@@ -144,7 +165,9 @@ where
     }
 
     fn sys_mut(&mut self) -> sys::GDExtensionTypePtr {
-        unreachable!("RefArg::sys_mut() currently not used by FFI marshalling layer, but only by specific functions");
+        unreachable!(
+            "RefArg::sys_mut() currently not used by FFI marshalling layer, but only by specific functions"
+        );
     }
 
     // This function must be overridden; the default delegating to sys() is wrong for e.g. RawGd<T>.
@@ -162,7 +185,9 @@ where
 
     unsafe fn move_return_ptr(self, _dst: sys::GDExtensionTypePtr, _call_type: PtrcallType) {
         // This one is implemented, because it's used for return types implementing ToGodot.
-        unreachable!("Calling RefArg::move_return_ptr is a mistake, as RefArg is intended only for arguments. Use the underlying value type.");
+        unreachable!(
+            "Calling RefArg::move_return_ptr is a mistake, as RefArg is intended only for arguments. Use the underlying value type."
+        );
     }
 }
 

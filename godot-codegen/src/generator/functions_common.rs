@@ -5,19 +5,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use proc_macro2::{Ident, TokenStream};
+use quote::{format_ident, quote};
+
 use crate::generator::default_parameters;
 use crate::models::domain::{ArgPassing, FnParam, FnQualifier, Function, RustTy};
 use crate::special_cases;
 use crate::util::lifetime;
-use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote};
 
 pub struct FnReceiver {
     /// `&self`, `&mut self`, (none)
     pub param: TokenStream,
 
-    /// `&'a self`, `&'a mut self`, (none)
-    pub param_lifetime_a: TokenStream,
+    /// `&'ex self`, `&'ex mut self`, (none)
+    pub param_lifetime_ex: TokenStream,
 
     /// `ptr::null_mut()`, `self.object_ptr`, `self.sys_ptr`, (none)
     pub ffi_arg: TokenStream,
@@ -31,7 +32,7 @@ impl FnReceiver {
     pub fn global_function() -> FnReceiver {
         FnReceiver {
             param: TokenStream::new(),
-            param_lifetime_a: TokenStream::new(),
+            param_lifetime_ex: TokenStream::new(),
             ffi_arg: TokenStream::new(),
             self_prefix: TokenStream::new(),
         }
@@ -97,13 +98,11 @@ pub struct FnParamTokens {
     /// Generic argument list `<'a0, 'a1, ...>` after `type CallSig`, if available.
     pub callsig_lifetime_args: Option<TokenStream>,
     pub arg_exprs: Vec<TokenStream>,
-    pub func_general_lifetime: Option<TokenStream>,
 }
 
 pub fn make_function_definition(
     sig: &dyn Function,
     code: &FnCode,
-    safety_doc: Option<TokenStream>,
     cfg_attributes: &TokenStream,
 ) -> FnDefinition {
     let has_default_params = default_parameters::function_uses_default_params(sig);
@@ -120,20 +119,18 @@ pub fn make_function_definition(
     // to only use `unsafe` for pointers in parameters (for outbound calls), and in return values (for virtual calls). Or technically more
     // correct, make the entire trait unsafe as soon as one function can return pointers, but that's very unergonomic and non-local.
     // Thus, let's keep things simple and more conservative.
-    let (maybe_unsafe, maybe_safety_doc) = if let Some(safety_doc) = safety_doc {
-        (quote! { unsafe }, safety_doc)
-    } else if sig.common().is_unsafe {
-        (
-            quote! { unsafe },
-            quote! {
-                /// # Safety
-                ///
-                /// This method has automatically been marked `unsafe` because it accepts raw pointers as parameters.
-                /// If Godot does not document any safety requirements, make sure you understand the underlying semantics.
-            },
-        )
+    let (maybe_unsafe, maybe_safety_doc);
+    if sig.common().is_unsafe {
+        maybe_unsafe = quote! { unsafe };
+        maybe_safety_doc = quote! {
+            /// # Safety
+            ///
+            /// This method has automatically been marked `unsafe` because it accepts raw pointers as parameters.
+            /// If Godot does not document any safety requirements, make sure you understand the underlying semantics.
+        };
     } else {
-        (TokenStream::new(), TokenStream::new())
+        maybe_unsafe = TokenStream::new();
+        maybe_safety_doc = TokenStream::new();
     };
 
     let FnParamTokens {
@@ -141,7 +138,6 @@ pub fn make_function_definition(
         callsig_param_types: param_types,
         callsig_lifetime_args,
         arg_exprs: arg_names,
-        func_general_lifetime: fn_lifetime,
     } = if sig.is_virtual() {
         make_params_exprs_virtual(sig.params().iter(), sig)
     } else {
@@ -174,6 +170,8 @@ pub fn make_function_definition(
         default_structs_code = TokenStream::new();
     };
 
+    let (maybe_deprecated, _maybe_expect_deprecated) = make_deprecation_attribute(sig);
+
     let call_sig_decl = {
         let return_ty = &sig.return_value().type_tokens();
 
@@ -192,9 +190,10 @@ pub fn make_function_definition(
 
     let receiver_param = &code.receiver.param;
     let primary_function = if sig.is_virtual() {
-        // Virtual functions
+        // Virtual functions.
 
         quote! {
+            #maybe_deprecated
             #maybe_safety_doc
             #maybe_unsafe fn #primary_fn_name (
                 #receiver_param
@@ -202,14 +201,15 @@ pub fn make_function_definition(
             ) #return_decl #fn_body
         }
     } else if sig.is_vararg() {
-        // Varargs (usually varcall, but not necessarily -- utilities use ptrcall)
+        // Varargs (usually varcall, but not necessarily -- utilities use ptrcall).
 
-        // If the return type is not Variant, then convert to concrete target type
+        // If the return type is not Variant, then convert to concrete target type.
         let varcall_invocation = &code.varcall_invocation;
 
         // TODO Utility functions: update as well.
         if !code.is_varcall_fallible {
             quote! {
+                #maybe_deprecated
                 #maybe_safety_doc
                 #vis #maybe_unsafe fn #primary_fn_name (
                     #receiver_param
@@ -239,6 +239,7 @@ pub fn make_function_definition(
             } = make_params_exprs(sig.params().iter(), FnKind::DelegateTry);
 
             quote! {
+                #maybe_deprecated
                 /// # Panics
                 /// This is a _varcall_ method, meaning parameters and return values are passed as `Variant`.
                 /// It can detect call failures and will panic in such a case.
@@ -252,6 +253,7 @@ pub fn make_function_definition(
                         .unwrap_or_else(|e| panic!("{e}"))
                 }
 
+                #maybe_deprecated
                 /// # Return type
                 /// This is a _varcall_ method, meaning parameters and return values are passed as `Variant`.
                 /// It can detect call failures and will return `Err` in such a case.
@@ -277,11 +279,13 @@ pub fn make_function_definition(
         let ptrcall_invocation = &code.ptrcall_invocation;
 
         quote! {
+            #maybe_deprecated
             #maybe_safety_doc
-            #vis #maybe_unsafe fn #primary_fn_name #fn_lifetime (
+            #vis #maybe_unsafe fn #primary_fn_name  (
                 #receiver_param
                 #( #params, )*
-            ) #return_decl {
+            ) #return_decl
+            {
                 #call_sig_decl
 
                 let args = (#( #arg_names, )*);
@@ -305,9 +309,9 @@ pub fn make_function_definition(
 pub fn make_receiver(qualifier: FnQualifier, ffi_arg_in: TokenStream) -> FnReceiver {
     assert_ne!(qualifier, FnQualifier::Global, "expected class");
 
-    let (param, param_lifetime_a) = match qualifier {
-        FnQualifier::Const => (quote! { &self, }, quote! { &'a self, }),
-        FnQualifier::Mut => (quote! { &mut self, }, quote! { &'a mut self, }),
+    let (param, param_lifetime_ex) = match qualifier {
+        FnQualifier::Const => (quote! { &self, }, quote! { &'ex self, }),
+        FnQualifier::Mut => (quote! { &mut self, }, quote! { &'ex mut self, }),
         FnQualifier::Static => (quote! {}, quote! {}),
         FnQualifier::Global => (quote! {}, quote! {}),
     };
@@ -323,17 +327,32 @@ pub fn make_receiver(qualifier: FnQualifier, ffi_arg_in: TokenStream) -> FnRecei
 
     FnReceiver {
         param,
-        param_lifetime_a,
+        param_lifetime_ex,
         ffi_arg,
         self_prefix,
     }
 }
+
 pub fn make_vis(is_private: bool) -> TokenStream {
     if is_private {
         quote! { pub(crate) }
     } else {
         quote! { pub }
     }
+}
+
+pub fn make_deprecation_attribute(sig: &dyn Function) -> (Option<TokenStream>, TokenStream) {
+    let deprecated = sig.common().deprecation_msg.map(|msg| {
+        quote! { #[deprecated = #msg] }
+    });
+
+    let expect_deprecated = if deprecated.is_some() {
+        quote! { #[expect(deprecated)] }
+    } else {
+        quote! {}
+    };
+
+    (deprecated, expect_deprecated)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -356,10 +375,7 @@ pub(crate) enum FnKind {
     /// `call()` forwarding to `try_call()`.
     DelegateTry,
 
-    /// Default extender `new()` associated function -- optional receiver and required parameters.
-    ExBuilderConstructor,
-
-    /// Same as [`ExBuilderConstructor`], but for a builder with an explicit lifetime.
+    /// Default extender `new()` associated function -- optional receiver and required parameters. Has an explicit lifetime.
     ExBuilderConstructorLifetimed,
 
     /// Default extender `new()` associated function -- only default parameters.
@@ -388,19 +404,19 @@ pub(crate) enum FnArgExpr {
     StoreInDefaultField,
 }
 
-/// How parameters are declared in a function signature.
+/// Whether parameters need to be declared in a special way (e.g. with `impl AsArg`).
 #[derive(Copy, Clone)]
 pub(crate) enum FnParamDecl {
-    /// Public-facing, i.e. `T`, `&T`, `impl AsArg<T>` or `impl AsObjectArg<T>`.
+    /// Public-facing, i.e. `T`, `&T`, `impl AsArg<T>`.
     FnPublic,
 
-    /// Public-facing with explicit lifetime, e.g. `&'a T`. Used in `Ex` builder methods.
+    /// Public-facing with explicit lifetime, e.g. `&'ex T`. Used in `Ex` builder methods.
     FnPublicLifetime,
 
     /// Parameters in internal methods, used for delegation.
     FnInternal,
 
-    /// Store in a field, i.e. `v`, `CowArg<T>` or `ObjectCow<T>`.
+    /// Store in a field, i.e. `v` or `CowArg<T>`.
     Field,
 }
 
@@ -445,20 +461,24 @@ pub(crate) fn make_param_or_field_type(
     let mut special_ty = None;
 
     let param_ty = match ty {
-        // Objects: impl AsObjectArg<T>
+        // Objects: impl AsArg<Gd<T>> or impl AsArg<Option<Gd<T>>>.
         RustTy::EngineClass {
-            object_arg,
-            impl_as_object_arg,
-            inner_class,
-            ..
+            impl_as_object_arg, ..
         } => {
-            special_ty = Some(quote! { #object_arg });
+            let lft = lifetimes.next();
+
+            // #ty is already Gd<...> or Option<Gd<...>> depending on nullability.
+            special_ty = Some(quote! { CowArg<#lft, #ty> });
 
             match decl {
                 FnParamDecl::FnPublic => quote! { #impl_as_object_arg },
-                FnParamDecl::FnPublicLifetime => quote! { #impl_as_object_arg },
-                FnParamDecl::FnInternal => quote! { #object_arg },
-                FnParamDecl::Field => quote! { ObjectCow<crate::classes::#inner_class> },
+                FnParamDecl::FnPublicLifetime => quote! { #impl_as_object_arg + 'ex },
+                FnParamDecl::FnInternal => {
+                    quote! { CowArg<#ty> }
+                }
+                FnParamDecl::Field => {
+                    quote! { CowArg<'ex, #ty> }
+                }
             }
         }
 
@@ -472,9 +492,9 @@ pub(crate) fn make_param_or_field_type(
 
             match decl {
                 FnParamDecl::FnPublic => quote! { impl AsArg<#ty> },
-                FnParamDecl::FnPublicLifetime => quote! { impl AsArg<#ty> + 'a },
+                FnParamDecl::FnPublicLifetime => quote! { impl AsArg<#ty> + 'ex },
                 FnParamDecl::FnInternal => quote! { CowArg<#ty> },
-                FnParamDecl::Field => quote! { CowArg<'a, #ty> },
+                FnParamDecl::Field => quote! { CowArg<'ex, #ty> },
             }
         }
 
@@ -483,16 +503,21 @@ pub(crate) fn make_param_or_field_type(
             arg_passing: ArgPassing::ByRef,
             ..
         }
-        | RustTy::BuiltinArray { .. }
-        | RustTy::EngineArray { .. } => {
+        | RustTy::TypedArray { .. }
+        | RustTy::TypedDictionary { .. } => {
             let lft = lifetimes.next();
             special_ty = Some(quote! { RefArg<#lft, #ty> });
 
+            // Transform VariantArray -> AnyArray for outbound parameters.
+            // FIXME virtual params
+            // let ty = if matches!(decl, FnParamDecl::)
+            //     ty.try_to_any_array().unwrap_or_else(|| ty.clone());
+
             match decl {
                 FnParamDecl::FnPublic => quote! { & #ty },
-                FnParamDecl::FnPublicLifetime => quote! { &'a #ty },
+                FnParamDecl::FnPublicLifetime => quote! { &'ex #ty },
                 FnParamDecl::FnInternal => quote! { RefArg<#ty> },
-                FnParamDecl::Field => quote! { CowArg<'a, #ty>  },
+                FnParamDecl::Field => quote! { CowArg<'ex, #ty>  },
             }
         }
 
@@ -512,11 +537,11 @@ pub(crate) fn make_arg_expr(name: &Ident, ty: &RustTy, expr: FnArgExpr) -> Token
     match ty {
         // Objects.
         RustTy::EngineClass { .. } => match expr {
-            FnArgExpr::PassToFfi => quote! { #name.as_object_arg() },
-            FnArgExpr::PassToFfiFromEx => quote! { #name.cow_as_object_arg() },
+            FnArgExpr::PassToFfi => quote! { #name.into_arg() },
+            FnArgExpr::PassToFfiFromEx => quote! { #name },
             FnArgExpr::Forward => quote! { #name },
-            FnArgExpr::StoreInField => quote! { #name.consume_arg() },
-            FnArgExpr::StoreInDefaultField => quote! { #name.consume_arg() },
+            FnArgExpr::StoreInField => quote! { #name.into_arg() },
+            FnArgExpr::StoreInDefaultField => quote! { #name.into_arg() },
         },
 
         // Strings.
@@ -536,8 +561,8 @@ pub(crate) fn make_arg_expr(name: &Ident, ty: &RustTy, expr: FnArgExpr) -> Token
             arg_passing: ArgPassing::ByRef,
             ..
         }
-        | RustTy::BuiltinArray { .. }
-        | RustTy::EngineArray { .. } => match expr {
+        | RustTy::TypedArray { .. }
+        | RustTy::TypedDictionary { .. } => match expr {
             FnArgExpr::PassToFfi => quote! { RefArg::new(#name) },
             FnArgExpr::PassToFfiFromEx => quote! { #name.cow_as_arg() },
             FnArgExpr::Forward => quote! { #name },
@@ -567,7 +592,6 @@ pub(crate) fn make_params_exprs<'a>(
         // Methods relevant in the context of default parameters. Flow in this order.
         // Note that for builder methods of Ex* structs, there's a direct call in default_parameters.rs to the parameter manipulation methods,
         // bypassing this method. So one case is missing here.
-        FnKind::ExBuilderConstructor => (FnParamDecl::FnPublic, FnArgExpr::StoreInField),
         FnKind::ExBuilderConstructorLifetimed => {
             (FnParamDecl::FnPublicLifetime, FnArgExpr::StoreInField)
         }
@@ -598,6 +622,36 @@ pub(crate) fn make_params_exprs<'a>(
     ret
 }
 
+/// Returns the type for a virtual method parameter.
+///
+/// Generates `Option<Gd<T>>` instead of `Gd<T>` for object parameters (which are currently all nullable).
+///
+/// Used for consistency between virtual trait definitions and `type Sig = ...` type-safety declarations
+/// (which are used to improve compile-time errors on mismatch).
+pub(crate) fn make_virtual_param_type(
+    param_ty: &RustTy,
+    param_name: &Ident,
+    function_sig: &dyn Function,
+) -> TokenStream {
+    match param_ty {
+        RustTy::EngineClass { gd_tokens, .. } => {
+            if special_cases::is_class_method_param_required(
+                function_sig.surrounding_class().unwrap(),
+                function_sig.godot_name(),
+                param_name,
+            ) {
+                // For special-cased EngineClass params, use Gd<T> without Option.
+                gd_tokens.clone()
+            } else {
+                // In general, virtual methods accept Option<Gd<T>>, since we don't know whether objects are nullable or required.
+                quote! { Option<#gd_tokens> }
+            }
+        }
+
+        _ => quote! { #param_ty },
+    }
+}
+
 /// For virtual functions, returns the parameter declarations, type tokens, and names.
 pub(crate) fn make_params_exprs_virtual<'a>(
     method_args: impl Iterator<Item = &'a FnParam>,
@@ -609,30 +663,13 @@ pub(crate) fn make_params_exprs_virtual<'a>(
         let param_name = &param.name;
         let param_ty = &param.type_;
 
-        match &param.type_ {
-            // Virtual methods accept Option<Gd<T>>, since we don't know whether objects are nullable or required.
-            RustTy::EngineClass { .. }
-                if !special_cases::is_class_method_param_required(
-                    function_sig.surrounding_class().unwrap(),
-                    function_sig.godot_name(),
-                    param_name,
-                ) =>
-            {
-                ret.param_decls
-                    .push(quote! { #param_name: Option<#param_ty> });
-                ret.arg_exprs.push(quote! { #param_name });
-                ret.callsig_param_types.push(quote! { #param_ty });
-            }
+        // Map parameter types (e.g. virtual functions need Option<Gd> instead of Gd).
+        let param_ty_tokens = make_virtual_param_type(param_ty, param_name, function_sig);
 
-            // All other methods and parameter types: standard handling.
-            // For now, virtual methods always receive their parameter by value.
-            //_ => ret.push_regular(param_name, param_ty, true, false, false),
-            _ => {
-                ret.param_decls.push(quote! { #param_name: #param_ty });
-                ret.arg_exprs.push(quote! { #param_name });
-                ret.callsig_param_types.push(quote! { #param_ty });
-            }
-        }
+        ret.param_decls
+            .push(quote! { #param_name: #param_ty_tokens });
+        ret.arg_exprs.push(quote! { #param_name });
+        ret.callsig_param_types.push(quote! { #param_ty });
     }
 
     ret

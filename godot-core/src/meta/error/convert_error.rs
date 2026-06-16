@@ -5,12 +5,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use godot_ffi::VariantType;
 use std::error::Error;
 use std::fmt;
 
+use godot_ffi::VariantType;
+
 use crate::builtin::Variant;
-use crate::meta::{ArrayTypeInfo, ClassName, ToGodot};
+use crate::meta::inspect::ElementType;
+use crate::meta::{ClassId, ToGodot};
 
 type Cause = Box<dyn Error + Send + Sync>;
 
@@ -34,10 +36,11 @@ impl ConvertError {
         }
     }
 
-    // /// Create a new custom error for a conversion with the value that failed to convert.
-    // pub(crate) fn with_kind(kind: ErrorKind) -> Self {
-    //     Self { kind, value: None }
-    // }
+    /// Create a new custom error for a conversion, without associated value.
+    #[allow(dead_code)] // Needed a few times already, stays to prevent churn on refactorings.
+    pub(crate) fn with_kind(kind: ErrorKind) -> Self {
+        Self { kind, value: None }
+    }
 
     /// Create a new custom error for a conversion with the value that failed to convert.
     pub(crate) fn with_kind_value<V>(kind: ErrorKind, value: V) -> Self
@@ -161,6 +164,7 @@ pub enum ErrorKind {
     FromGodot(FromGodotError),
     FromFfi(FromFfiError),
     FromVariant(FromVariantError),
+    // FromAnyArray(ArrayMismatch), -- needed if AnyArray downcasts return ConvertError one day.
     Custom(Option<Cause>),
 }
 
@@ -170,7 +174,10 @@ impl fmt::Display for ErrorKind {
             Self::FromGodot(from_godot) => write!(f, "{from_godot}"),
             Self::FromVariant(from_variant) => write!(f, "{from_variant}"),
             Self::FromFfi(from_ffi) => write!(f, "{from_ffi}"),
-            Self::Custom(cause) => write!(f, "{cause:?}"),
+            Self::Custom(cause) => match cause {
+                Some(c) => write!(f, "{c}"),
+                None => write!(f, "custom error"),
+            },
         }
     }
 }
@@ -179,14 +186,18 @@ impl fmt::Display for ErrorKind {
 #[derive(Eq, PartialEq, Debug)]
 pub enum FromGodotError {
     /// Destination `Array<T>` has different type than source's runtime type.
-    BadArrayType {
-        expected: ArrayTypeInfo,
-        actual: ArrayTypeInfo,
-    },
+    BadArrayType(ArrayMismatch),
+
+    /// Destination `Dictionary<K, V>` has different types than source's runtime types.
+    #[cfg(since_api = "4.4")]
+    BadDictionaryType(DictionaryMismatch),
 
     /// Special case of `BadArrayType` where a custom int type such as `i8` cannot hold a dynamic `i64` value.
-    #[cfg(debug_assertions)]
-    BadArrayTypeInt { expected: ArrayTypeInfo, value: i64 },
+    #[cfg(safeguards_strict)]
+    BadArrayTypeInt {
+        expected_int_type: &'static str,
+        value: i64,
+    },
 
     /// InvalidEnum is also used by bitfields.
     InvalidEnum,
@@ -216,45 +227,26 @@ impl FromGodotError {
 impl fmt::Display for FromGodotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadArrayType { expected, actual } => {
-                if expected.variant_type() != actual.variant_type() {
-                    return if expected.is_typed() {
-                        write!(
-                            f,
-                            "expected array of type {:?}, got array of type {:?}",
-                            expected.variant_type(),
-                            actual.variant_type()
-                        )
-                    } else {
-                        write!(
-                            f,
-                            "expected untyped array, got array of type {:?}",
-                            actual.variant_type()
-                        )
-                    };
-                }
+            Self::BadArrayType(mismatch) => write!(f, "{mismatch}"),
 
-                let exp_class = expected.class_name().expect("lhs class name present");
-                let act_class = actual.class_name().expect("rhs class name present");
-                assert_ne!(
-                    exp_class, act_class,
-                    "BadArrayType with expected == got, this is a gdext bug"
-                );
+            #[cfg(since_api = "4.4")]
+            Self::BadDictionaryType(mismatch) => write!(f, "{mismatch}"),
 
+            #[cfg(safeguards_strict)]
+            Self::BadArrayTypeInt {
+                expected_int_type,
+                value,
+            } => {
                 write!(
                     f,
-                    "expected array of class {exp_class}, got array of class {act_class}"
+                    "integer value {value} does not fit into Array<{expected_int_type}>"
                 )
             }
-            #[cfg(debug_assertions)]
-            Self::BadArrayTypeInt { expected, value } => {
-                write!(
-                    f,
-                    "integer value {value} does not fit into Array of type {expected:?}"
-                )
-            }
+
             Self::InvalidEnum => write!(f, "invalid engine enum value"),
+
             Self::ZeroInstanceId => write!(f, "`InstanceId` cannot be 0"),
+
             Self::UnimplementedDynTrait {
                 trait_name,
                 class_name,
@@ -264,6 +256,7 @@ impl fmt::Display for FromGodotError {
                     "none of the classes derived from `{class_name}` have been linked to trait `{trait_name}` with #[godot_dyn]"
                 )
             }
+
             FromGodotError::UnregisteredDynTrait { trait_name } => {
                 write!(
                     f,
@@ -271,6 +264,53 @@ impl fmt::Display for FromGodotError {
                 )
             }
         }
+    }
+}
+
+#[derive(Eq, PartialEq, Debug)]
+pub struct ArrayMismatch {
+    pub expected: ElementType,
+    pub actual: ElementType,
+}
+
+impl fmt::Display for ArrayMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ArrayMismatch { expected, actual } = self;
+
+        if expected.variant_type() != actual.variant_type() {
+            return write!(f, "expected array of type {expected:?}, got {actual:?}");
+        }
+
+        let exp_class = format!("{expected:?}");
+        let act_class = format!("{actual:?}");
+
+        write!(f, "expected array of type {exp_class}, got {act_class}")
+    }
+}
+
+#[cfg(since_api = "4.4")]
+#[derive(Eq, PartialEq, Debug)]
+pub struct DictionaryMismatch {
+    pub expected_key: ElementType,
+    pub expected_value: ElementType,
+    pub actual_key: ElementType,
+    pub actual_value: ElementType,
+}
+
+#[cfg(since_api = "4.4")]
+impl fmt::Display for DictionaryMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let DictionaryMismatch {
+            expected_key,
+            expected_value,
+            actual_key,
+            actual_value,
+        } = self;
+
+        write!(
+            f,
+            "expected dictionary of type Dictionary<{expected_key:?}, {expected_value:?}>, got Dictionary<{actual_key:?}, {actual_value:?}>"
+        )
     }
 }
 
@@ -286,7 +326,6 @@ pub enum FromFfiError {
     U16,
     I32,
     U32,
-    U64,
 }
 
 impl FromFfiError {
@@ -303,7 +342,7 @@ impl fmt::Display for FromFfiError {
         let target = match self {
             Self::NullRawGd => return write!(f, "`Gd` cannot be null"),
             Self::WrongObjectType => {
-                return write!(f, "given object cannot be cast to target type")
+                return write!(f, "given object cannot be cast to target type");
             }
             Self::I8 => "i8",
             Self::U8 => "u8",
@@ -311,7 +350,6 @@ impl fmt::Display for FromFfiError {
             Self::U16 => "u16",
             Self::I32 => "i32",
             Self::U32 => "u32",
-            Self::U64 => "u64",
         };
 
         write!(f, "`{target}` cannot store the given value")
@@ -326,15 +364,15 @@ pub enum FromVariantError {
         actual: VariantType,
     },
 
-    /// Value cannot be represented in target type's domain.
-    BadValue,
-
     WrongClass {
-        expected: ClassName,
+        expected: ClassId,
     },
 
     /// Variant holds an object which is no longer alive.
     DeadObject,
+    //
+    // BadValue: Value cannot be represented in target type's domain.
+    // Used in the past for types like u64, with fallible FromVariant.
 }
 
 impl FromVariantError {
@@ -353,7 +391,6 @@ impl fmt::Display for FromVariantError {
                 // Note: wording is the same as in CallError::failed_param_conversion_engine()
                 write!(f, "cannot convert from {actual:?} to {expected:?}")
             }
-            Self::BadValue => write!(f, "value cannot be represented in target type's domain"),
             Self::WrongClass { expected } => {
                 write!(f, "cannot convert to class {expected}")
             }

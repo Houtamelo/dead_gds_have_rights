@@ -29,46 +29,36 @@ macro_rules! plugin_registry {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! plugin_execute_pre_main {
-    ($body:expr) => {
+    ($body:expr_2021) => {
         const _: () = {
             #[allow(non_upper_case_globals)]
             #[used]
             // Windows:
-            #[cfg_attr(target_os = "windows", link_section = ".CRT$XCU")]
+            #[cfg_attr(target_os = "windows", unsafe(link_section = ".CRT$XCU"))]
             // macOS + iOS:
-            #[cfg_attr(target_os = "ios", link_section = "__DATA,__mod_init_func")]
-            #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+            #[cfg_attr(target_os = "ios", unsafe(link_section = "__DATA,__mod_init_func"))]
+            #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
             // Linux, Android, BSD:
-            #[cfg_attr(target_os = "android", link_section = ".init_array")]
-            #[cfg_attr(target_os = "dragonfly", link_section = ".init_array")]
-            #[cfg_attr(target_os = "freebsd", link_section = ".init_array")]
-            #[cfg_attr(target_os = "linux", link_section = ".init_array")]
-            #[cfg_attr(target_os = "netbsd", link_section = ".init_array")]
-            #[cfg_attr(target_os = "openbsd", link_section = ".init_array")]
+            #[cfg_attr(target_os = "android", unsafe(link_section = ".init_array"))]
+            #[cfg_attr(target_os = "dragonfly", unsafe(link_section = ".init_array"))]
+            #[cfg_attr(target_os = "freebsd", unsafe(link_section = ".init_array"))]
+            #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+            #[cfg_attr(target_os = "netbsd", unsafe(link_section = ".init_array"))]
+            #[cfg_attr(target_os = "openbsd", unsafe(link_section = ".init_array"))]
+            // Emscripten
+            #[cfg_attr(
+                all(target_family = "wasm", target_os = "emscripten"),
+                unsafe(link_section = ".init_array")
+            )]
             static __init: extern "C" fn() = {
-                #[cfg_attr(target_os = "android", link_section = ".text.startup")]
-                #[cfg_attr(target_os = "linux", link_section = ".text.startup")]
+                #[cfg_attr(target_os = "android", unsafe(link_section = ".text.startup"))]
+                #[cfg_attr(target_os = "linux", unsafe(link_section = ".text.startup"))]
                 extern "C" fn __inner_init() {
                     $body
                 }
                 __inner_init
             };
-
-            $crate::wasm_declare_init_fn!();
         };
-    };
-}
-
-/// Register a plugin by executing code pre-main that adds the plugin to the registry.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! plugin_add_inner {
-    ($registry:path; $plugin:expr) => {
-        $crate::plugin_execute_pre_main!({
-            let mut guard = $registry.lock().unwrap();
-
-            guard.push($plugin);
-        });
     };
 }
 
@@ -76,15 +66,17 @@ macro_rules! plugin_add_inner {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! plugin_add {
-    ( $registry:path; $plugin:expr ) => {
-		$crate::plugin_add_inner!($registry; $plugin);
-	};
+    ( $registry:path; $plugin:expr_2021 ) => {
+        $crate::plugin_execute_pre_main!({
+            $registry.lock().unwrap().push($plugin);
+        });
+    };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! plugin_foreach_inner {
-    ( $registry:ident; $closure:expr; $( $path_tt:tt )* ) => {
+    ( $registry:ident; $closure:expr_2021; $( $path_tt:tt )* ) => {
         let guard = $( $path_tt )* $registry
             .lock()
             .unwrap();
@@ -100,11 +92,11 @@ macro_rules! plugin_foreach_inner {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! plugin_foreach {
-    ( $registry:ident; $closure:expr ) => {
+    ( $registry:ident; $closure:expr_2021 ) => {
 		$crate::plugin_foreach_inner!($registry; $closure; );
 	};
 
-    ( $registry:ident in $path:path; $closure:expr ) => {
+    ( $registry:ident in $path:path; $closure:expr_2021 ) => {
 		$crate::plugin_foreach_inner!($registry; $closure; $path ::);
 	};
 }
@@ -121,7 +113,12 @@ mod tests {
     plugin_add!(V; "one");
     plugin_add!(V; "two");
 
+    // TODO(v0.6): unignore this test once plugins are added for Wasm
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "Requires a plugin implementation for Wasm"
+    )]
     fn plugin_registry() {
         let expected = HashSet::from(["one", "two", "three", "four"]);
         let mut actual = HashSet::new();

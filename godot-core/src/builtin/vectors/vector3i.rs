@@ -9,10 +9,10 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use godot_ffi as sys;
-use sys::{ffi_methods, ExtVariantType, GodotFfi};
+use sys::{ExtVariantType, GodotFfi, ffi_methods};
 
 use crate::builtin::math::{GlamConv, GlamType};
-use crate::builtin::{inner, real, RVec3, Vector3, Vector3Axis};
+use crate::builtin::{RVec3, Vector3, Vector3Axis, inner, real};
 
 /// Vector used for 3D math using integer coordinates.
 ///
@@ -107,7 +107,7 @@ unsafe impl GodotFfi for Vector3i {
     ffi_methods! { type sys::GDExtensionTypePtr = *mut Self; .. }
 }
 
-crate::meta::impl_godot_as_self!(Vector3i);
+crate::meta::impl_godot_as_self!(Vector3i: ByValue);
 
 impl GlamType for glam::IVec3 {
     type Mapped = Vector3i;

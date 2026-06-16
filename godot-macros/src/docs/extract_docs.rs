@@ -4,9 +4,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-
 use proc_macro2::{Ident, TokenStream};
-use quote::{quote, ToTokens};
+use quote::{ToTokens, quote};
 
 use crate::class::{ConstDefinition, Field, FuncDefinition, SignalDefinition};
 use crate::docs::markdown_converter;
@@ -35,27 +34,28 @@ pub fn document_struct(
     description: &[venial::Attribute],
     fields: &[Field],
 ) -> TokenStream {
-    let base_escaped = xml_escape(base);
     let XmlParagraphs {
         description_content,
         deprecated_attr,
         experimental_attr,
     } = attribute_docs_to_xml_paragraphs(description).unwrap_or_default();
 
-    let members = fields
+    let properties = fields
         .iter()
         .filter(|field| field.var.is_some() || field.export.is_some())
         .filter_map(format_member_xml)
         .collect::<String>();
 
+    let base_escaped = xml_escape(base);
+
     quote! {
-            ::godot::docs::StructDocs {
-                base: #base_escaped,
-                description: #description_content,
-                experimental: #experimental_attr,
-                deprecated: #deprecated_attr,
-                members: #members,
-            }
+        ::godot::docs::StructDocs {
+            base: #base_escaped,
+            description: #description_content,
+            experimental: #experimental_attr,
+            deprecated: #deprecated_attr,
+            properties: #properties,
+        }
     }
 }
 
@@ -116,9 +116,8 @@ fn extract_docs_from_attributes(doc: &[venial::Attribute]) -> impl Iterator<Item
         })
         .flat_map(|doc| {
             doc.iter().map(|token_tree| {
-                let str = token_tree.to_string();
-                litrs::StringLit::parse(str.clone())
-                    .map_or(str, |parsed| parsed.value().to_string())
+                litrs::StringLit::try_from(token_tree)
+                    .map_or_else(|_| token_tree.to_string(), |parsed| parsed.into_value())
             })
         })
 }
@@ -359,7 +358,7 @@ fn format_method_xml(method: &FuncDefinition) -> Option<String> {
     let return_ty = signature.return_type.to_token_stream().to_string();
     let return_ty = xml_escape(return_ty);
 
-    let param_names_and_types = signature.param_idents().zip(signature.param_types());
+    let param_names_and_types = signature.param_idents.iter().zip(&signature.param_types);
     let params = format_params_xml(param_names_and_types);
 
     Some(format!(
