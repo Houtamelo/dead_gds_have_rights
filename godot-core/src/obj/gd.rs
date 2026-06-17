@@ -116,6 +116,9 @@ pub struct Gd<T: GodotClass> {
     pub(crate) raw: RawGd<T>,
 }
 
+unsafe impl<T: Inherits<crate::classes::Resource>> Send for Gd<T> {}
+unsafe impl<T: Inherits<crate::classes::Resource>> Sync for Gd<T> {}
+
 // Size equality check (should additionally be covered by mem::transmute())
 static_assert_eq_size_align!(
     sys::GDExtensionObjectPtr,
