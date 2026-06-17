@@ -116,8 +116,6 @@ pub struct Gd<T: GodotClass> {
     pub(crate) raw: RawGd<T>,
 }
 
-impl<T: GodotClass> Copy for Gd<T> where RawGd<T>: Copy {}
-
 // Size equality check (should additionally be covered by mem::transmute())
 static_assert_eq_size_align!(
     sys::GDExtensionObjectPtr,
@@ -884,9 +882,9 @@ impl<T: GodotClass> Gd<T> {
 
 /// _The methods in this impl block are only available for objects `T` that are manually managed,
 /// i.e. anything that is not `RefCounted` or inherited from it._ <br><br>
-impl<T, B: GodotClass> Gd<T>
+impl<T> Gd<T>
 where
-    T: GodotClass + Bounds<Memory = bounds::MemManual<B>>,
+    T: GodotClass + Bounds<Memory = bounds::MemManual>,
 {
     /// Destroy the manually-managed Godot object.
     ///
@@ -931,8 +929,7 @@ where
 
         // Runtime check in case of T=Object, no-op otherwise
         let ref_counted =
-            <<T as Bounds>::DynMemory as bounds::DynMemory>::is_ref_counted(self.raw.cached_rtti());
-
+            <<T as Bounds>::DynMemory as bounds::DynMemory>::is_ref_counted(&self.raw);
         if ref_counted == Some(true) {
             return error_or_panic(format!(
                 "Called free() on Gd<Object> which points to a RefCounted dynamic type; free() only supported for manually managed types\n\
@@ -957,7 +954,7 @@ where
         #[cfg(safeguards_strict)]
         if !is_panic_unwind {
             self.raw
-                .check_dynamic_type(&meta::CallContext::gd::<T>("free"));
+                .check_dynamic_type(&crate::meta::CallContext::gd::<T>("free"));
         }
 
         // SAFETY: object must be alive, which was just checked above. No multithreading here.
@@ -983,9 +980,9 @@ where
 
 /// _The methods in this impl block are only available for objects `T` that are reference-counted,
 /// i.e. anything that inherits `RefCounted`._ <br><br>
-impl<T, B: GodotClass> Gd<T>
+impl<T> Gd<T>
 where
-    T: GodotClass + Bounds<Memory = bounds::MemRefCounted<B>>,
+    T: GodotClass + Bounds<Memory = bounds::MemRefCounted>,
 {
     /// Makes sure that `self` does not share references with other `Gd` instances.
     ///
@@ -1011,7 +1008,7 @@ where
     pub fn try_to_unique(self) -> Result<Self, (Self, usize)> {
         use crate::obj::bounds::DynMemory as _;
 
-        match <T as Bounds>::DynMemory::get_ref_count(self.raw.obj(), self.raw.cached_rtti()) {
+        match <T as Bounds>::DynMemory::get_ref_count(&self.raw) {
             Some(1) => Ok(self),
             Some(ref_count) => Err((self, ref_count)),
             None => unreachable!(),
@@ -1239,9 +1236,9 @@ impl<T: GodotClass> GodotNullableType for Gd<T> {
 
 impl<T: GodotClass> Element for Option<Gd<T>> {}
 
-impl<T, B: GodotClass> Default for Gd<T>
+impl<T> Default for Gd<T>
 where
-    T: cap::GodotDefault + Bounds<Memory = bounds::MemRefCounted<B>>,
+    T: cap::GodotDefault + Bounds<Memory = bounds::MemRefCounted>,
 {
     /// Creates a default-constructed `T` inside a smart pointer.
     ///
@@ -1335,11 +1332,11 @@ where
 impl<T: GodotClass> PartialEq for Gd<T> {
     /// Returns whether two `Gd` pointers have the same instanced id (dead or alive).
     fn eq(&self, other: &Self) -> bool {
-        let Some(a) = self.raw.cached_rtti() else {
+        let Some(a) = &self.raw.cached_rtti else {
             return false;
         };
 
-        let Some(b) = other.raw.cached_rtti() else {
+        let Some(b) = &other.raw.cached_rtti else {
             return false;
         };
 

@@ -776,9 +776,9 @@ pub type ToArg<'r, Via, Pass> = <Pass as ArgPassing>::Output<'r, Via>;
 ///         // Directly:
 ///         self.signals().signal_optional_user_obj().emit(&arg);
 ///         // Via Some:
-///         self.signals().signal_optional_user_obj().emit(Some(arg));
+///         self.signals().signal_optional_user_obj().emit(Some(&arg));
 ///         // With None (Note: Gd::null_arg() is restricted to engine classes):
-///         self.signals().signal_optional_user_obj().emit(None::<Gd<MyClass>>);
+///         self.signals().signal_optional_user_obj().emit(None::<Gd<MyClass>>.as_ref());
 ///     }
 /// }
 /// ```

@@ -79,8 +79,8 @@ impl GodotClass for NoBase {
 }
 
 unsafe impl Bounds for NoBase {
-    type Memory = bounds::MemManual<Self>;
-    type DynMemory = bounds::MemManual<Self>;
+    type Memory = bounds::MemManual;
+    type DynMemory = bounds::MemManual;
     type Declarer = bounds::DeclEngine;
     type Exportable = bounds::No;
 }
@@ -687,9 +687,9 @@ pub trait NewGd: GodotClass {
     fn new_gd() -> Gd<Self>;
 }
 
-impl<T, B: GodotClass> NewGd for T
+impl<T> NewGd for T
 where
-    T: cap::GodotDefault + Bounds<Memory = bounds::MemRefCounted<B>>,
+    T: cap::GodotDefault + Bounds<Memory = bounds::MemRefCounted>,
 {
     fn new_gd() -> Gd<Self> {
         Gd::default()
@@ -778,8 +778,7 @@ pub trait Singleton: GodotClass {
 /// ```
 // For now exists mostly as a marker trait and a way to provide blanket implementation for `Singleton` trait.
 pub trait UserSingleton:
-    GodotClass
-    + Bounds<Declarer = bounds::DeclUser, Memory = bounds::MemManual<<Self as GodotClass>::Base>>
+    GodotClass + Bounds<Declarer = bounds::DeclUser, Memory = bounds::MemManual>
 {
 }
 
@@ -797,9 +796,9 @@ where
     }
 }
 
-impl<T, B: GodotClass> NewAlloc for T
+impl<T> NewAlloc for T
 where
-    T: cap::GodotDefault + Bounds<Memory = bounds::MemManual<B>>,
+    T: cap::GodotDefault + Bounds<Memory = bounds::MemManual>,
 {
     fn new_alloc() -> Gd<Self> {
         use crate::obj::bounds::Declarer as _;

@@ -16,7 +16,7 @@ use crate::meta::CallContext;
 use crate::meta::error::{ConvertError, FromVariantError};
 use crate::meta::shape::GodotShape;
 use crate::meta::{ClassId, FromGodot, GodotConvert, GodotFfiVariant, GodotType, RefArg, ToGodot};
-use crate::obj::bounds::{Declarer, DynMemory as _, Memory, gd_is_null};
+use crate::obj::bounds::{Declarer, DynMemory as _, Memory};
 use crate::obj::rtti::ObjectRtti;
 use crate::obj::{Bounds, Gd, GdDerefTarget, GdMut, GdRef, GodotClass, InstanceId, bounds};
 use crate::storage::{InstanceCache, InstanceStorage, Storage};
@@ -24,33 +24,22 @@ use crate::{classes, meta, out};
 
 /// Low-level bindings for object pointers in Godot.
 ///
-/// This should not be used directly, you should either use [`Gd<T>`](Gd) or [`Option<Gd<T>>`]
+/// This should not be used directly, you should either use [`Gd<T>`](super::Gd) or [`Option<Gd<T>>`]
 /// depending on whether you need a nullable object pointer or not.
 #[repr(C)]
 #[doc(hidden)]
 pub struct RawGd<T: GodotClass> {
-    pub(super) memory: <T as Bounds>::DynMemory,
+    pub(super) obj: *mut T,
+
+    // Must not be changed after initialization.
+    pub(super) cached_rtti: Option<ObjectRtti>,
+
     // Direct access to InstanceStorage -- initially null.
     // Only set for user-defined types; ZST otherwise.
-    pub(super) cached_storage_ptr: <<T as Bounds>::Declarer as Declarer>::InstanceCache,
-}
-
-impl<T: GodotClass> Copy for RawGd<T>
-where
-    <T as Bounds>::DynMemory: Copy,
-    <<T as Bounds>::Declarer as Declarer>::InstanceCache: Copy,
-{
+    cached_storage_ptr: <<T as Bounds>::Declarer as Declarer>::InstanceCache,
 }
 
 impl<T: GodotClass> RawGd<T> {
-    pub(in super::super) fn obj(&self) -> *mut <<T as Bounds>::DynMemory as bounds::DynMemory>::TSelf {
-        self.memory.obj()
-    }
-
-    pub(in super::super) fn cached_rtti(&self) -> Option<ObjectRtti> {
-        self.memory.cached_rtti()
-    }
-
     /// Initializes this `RawGd<T>` from the object pointer as a **weak ref**, meaning it does not
     /// initialize/increment the reference counter.
     ///
@@ -76,7 +65,8 @@ impl<T: GodotClass> RawGd<T> {
         };
 
         Self {
-            memory: T::DynMemory::new(obj.cast(), rtti),
+            obj: obj.cast::<T>(),
+            cached_rtti: rtti,
             cached_storage_ptr: InstanceCache::null(),
         }
     }
@@ -95,11 +85,11 @@ impl<T: GodotClass> RawGd<T> {
     }
 
     /// Returns `self` but with initialized ref-count.
-    fn with_inc_refcount(self) -> Self {
+    fn with_inc_refcount(mut self) -> Self {
         // Note: use init_ref and not inc_ref, since this might be the first reference increment.
         // Godot expects RefCounted::init_ref to be called instead of RefCounted::reference in that case.
         // init_ref also doesn't hurt (except 1 possibly unnecessary check).
-        <T as Bounds>::DynMemory::maybe_init_ref(self.memory.obj(), self.memory.cached_rtti());
+        T::DynMemory::maybe_init_ref(&mut self);
         self
     }
 
@@ -107,23 +97,25 @@ impl<T: GodotClass> RawGd<T> {
     ///
     /// This does not check if the object is dead. For that, use [`is_instance_valid()`](Self::is_instance_valid).
     pub(crate) fn is_null(&self) -> bool {
-        gd_is_null(self.memory.obj(), self.memory.cached_rtti())
+        self.obj.is_null() || self.cached_rtti.is_none()
     }
 
     /// Creates a null object pointer.
     pub(crate) fn null() -> Self {
         Self {
-            memory: <T as Bounds>::DynMemory::new(ptr::null_mut(), None),
+            obj: ptr::null_mut(),
+            cached_rtti: None,
             cached_storage_ptr: InstanceCache::null(),
         }
     }
 
     pub(crate) fn instance_id_unchecked(&self) -> Option<InstanceId> {
-        self.cached_rtti().map(|rtti| rtti.instance_id())
+        self.cached_rtti.as_ref().map(|rtti| rtti.instance_id())
     }
 
     pub(crate) fn is_instance_valid(&self) -> bool {
-        self.cached_rtti()
+        self.cached_rtti
+            .as_ref()
             .is_some_and(|rtti| rtti.instance_id().lookup_validity())
     }
 
@@ -174,14 +166,15 @@ impl<T: GodotClass> RawGd<T> {
     unsafe fn into_reinterpreted<U: GodotClass>(self) -> RawGd<U> {
         let this = std::mem::ManuallyDrop::new(self);
         let cached_rtti = this
-            .cached_rtti()
+            .cached_rtti
+            .as_ref()
             .map(|rtti| ObjectRtti::of::<U>(rtti.instance_id()));
 
         // SAFETY: caller guarantees object is a valid `U`; `ManuallyDrop` suppresses Drop on the source,
         // so the returned `RawGd<U>` takes sole ownership without a refcount change.
-        
         RawGd {
-            memory: <U as Bounds>::DynMemory::new(this.memory.obj().cast(), cached_rtti), 
+            obj: this.obj.cast::<U>(),
+            cached_rtti,
             cached_storage_ptr: InstanceCache::null(),
         }
     }
@@ -227,7 +220,8 @@ impl<T: GodotClass> RawGd<T> {
     ) -> Result<R, ()> {
         // `InstanceId` carries a bit indicating ref-countedness — no FFI roundtrip needed.
         let is_ref_counted = self
-            .cached_rtti()
+            .cached_rtti
+            .as_ref()
             .is_some_and(|rtti| rtti.instance_id().is_ref_counted());
 
         if !is_ref_counted {
@@ -251,7 +245,20 @@ impl<T: GodotClass> RawGd<T> {
         &self,
         apply: impl FnOnce(&mut classes::RefCounted) -> R,
     ) -> R {
-        unsafe { bounds::with_ref_counted_unchecked(self.obj(), self.cached_rtti(), apply) }
+        let cached_rtti = self
+            .cached_rtti
+            .as_ref()
+            .map(|rtti| ObjectRtti::of::<classes::RefCounted>(rtti.instance_id()));
+
+        // Note: caller guarantees T: Inherits<RefCounted>. `ManuallyDrop` keeps the refcount balanced when `borrow` goes out of scope.
+        let raw = RawGd::<classes::RefCounted> {
+            obj: self.obj.cast(),
+            cached_rtti,
+            cached_storage_ptr: InstanceCache::null(),
+        };
+
+        let mut borrow = std::mem::ManuallyDrop::new(raw);
+        apply(borrow.as_target_mut())
     }
 
     /// Enables outer `Gd` APIs or bypasses additional null checks, in cases where `RawGd` is guaranteed non-null.
@@ -406,7 +413,8 @@ impl<T: GodotClass> RawGd<T> {
             !self.is_null(),
             "internal bug: {call_ctx}: cannot call method on null object",
         );
-        let rtti = self.cached_rtti();
+
+        let rtti = self.cached_rtti.as_ref();
 
         // SAFETY: RawGd non-null (checked above).
         let rtti = unsafe { rtti.unwrap_unchecked() };
@@ -424,14 +432,14 @@ impl<T: GodotClass> RawGd<T> {
 
     // Not pub(super) because used by godot::meta::args::ObjectArg.
     pub(crate) fn obj_sys(&self) -> sys::GDExtensionObjectPtr {
-        bounds::obj_sys(self.memory.obj())
+        self.obj as sys::GDExtensionObjectPtr
     }
 
     pub(super) fn script_sys(&self) -> sys::GDExtensionScriptLanguagePtr
     where
-        T: super::Inherits<classes::ScriptLanguage>,
+        T: super::Inherits<crate::classes::ScriptLanguage>,
     {
-        self.memory.obj().cast()
+        self.obj.cast()
     }
 }
 
@@ -538,7 +546,7 @@ where
         let ptr: sys::GDExtensionClassInstancePtr = binding.cast();
 
         #[cfg(safeguards_strict)]
-        classes::ensure_binding_not_null::<T>(ptr);
+        crate::classes::ensure_binding_not_null::<T>(ptr);
 
         self.cached_storage_ptr.set(ptr);
         ptr
@@ -559,7 +567,7 @@ where
 {
     // If anything changes here, keep in sync with ObjectArg impl.
 
-    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(VariantType::OBJECT);
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::OBJECT);
 
     #[allow(unsafe_op_in_unsafe_fn)] // Safety preconditions forwarded 1:1.
     unsafe fn new_from_sys(ptr: sys::GDExtensionConstTypePtr) -> Self {
@@ -579,11 +587,11 @@ where
     }
 
     fn sys(&self) -> sys::GDExtensionConstTypePtr {
-        self.memory.obj().cast()
+        self.obj.cast()
     }
 
     fn sys_mut(&mut self) -> sys::GDExtensionTypePtr {
-        self.memory.obj().cast()
+        self.obj.cast()
     }
 
     // For more context around `ref_get_object` and `ref_set_object`, see:
@@ -592,10 +600,9 @@ where
     fn as_arg_ptr(&self) -> sys::GDExtensionConstTypePtr {
         // Even though ObjectArg exists, this function is still relevant, e.g. in Callable.
 
-        object_as_arg_ptr(&self.memory.obj())
+        object_as_arg_ptr(&self.obj)
     }
 
-    //noinspection RsUnnecessaryQualifications
     unsafe fn from_arg_ptr(ptr: sys::GDExtensionTypePtr, call_type: PtrcallType) -> Self {
         if ptr.is_null() {
             return Self::null();
@@ -614,14 +621,13 @@ where
         unsafe { Self::from_obj_sys(obj_ptr) }
     }
 
-    //noinspection RsUnnecessaryQualifications
     unsafe fn move_return_ptr(self, ptr: sys::GDExtensionTypePtr, call_type: PtrcallType) {
         if T::DynMemory::pass_as_ref(call_type) {
             // ref_set_object creates a new Ref<T> in the engine and increments the reference count. We have to drop our Gd<T> to decrement
             // the reference count again.
             unsafe { interface_fn!(ref_set_object)(ptr as sys::GDExtensionRefPtr, self.obj_sys()) };
         } else {
-            unsafe { ptr::write(ptr as *mut *mut T, self.memory.obj().cast()) };
+            unsafe { ptr::write(ptr as *mut *mut T, self.obj) };
             // We've passed ownership to caller.
             std::mem::forget(self);
         }
@@ -631,7 +637,7 @@ where
         // Static type not ref-counted -> is Object, Node etc -> possibly needs incrementing refcount.
         // maybe_inc_ref() is a no-op for Node etc.
         if !<T::Memory as Memory>::IS_REF_COUNTED {
-            T::DynMemory::maybe_inc_ref(self.obj(), self.cached_rtti()); 
+            T::DynMemory::maybe_inc_ref(self);
         }
     }
 }
@@ -721,6 +727,30 @@ impl<T: GodotClass> GodotFfiVariant for RawGd<T> {
     }
 }
 
+/// Destructor with semantics depending on memory strategy.
+///
+/// * If this `RawGd` smart pointer holds a reference-counted type, this will decrement the reference counter.
+///   If this was the last remaining reference, dropping it will invoke `T`'s destructor.
+///
+/// * If the held object is manually-managed, **nothing happens**.
+///   To destroy manually-managed `RawGd` pointers, you need to call [`crate::obj::Gd::free()`].
+impl<T: GodotClass> Drop for RawGd<T> {
+    fn drop(&mut self) {
+        // No-op for manually managed objects
+
+        out!("RawGd::drop:      {self:?}");
+
+        // SAFETY: This `Gd` won't be dropped again after this.
+        // If destruction is triggered by Godot, Storage already knows about it, no need to notify it
+        let is_last = unsafe { T::DynMemory::maybe_dec_ref(self) }; // may drop
+        if is_last {
+            unsafe {
+                interface_fn!(object_destroy)(self.obj_sys());
+            }
+        }
+    }
+}
+
 impl<T: GodotClass> Clone for RawGd<T> {
     fn clone(&self) -> Self {
         out!("RawGd::clone:     {self:?}  (before clone)");
@@ -732,7 +762,8 @@ impl<T: GodotClass> Clone for RawGd<T> {
 
             // Create new object, adopt cached fields.
             let copy = Self {
-                memory: self.memory.clone(),
+                obj: self.obj,
+                cached_rtti: self.cached_rtti.clone(),
                 cached_storage_ptr: self.cached_storage_ptr.clone(),
             };
             copy.with_inc_refcount()

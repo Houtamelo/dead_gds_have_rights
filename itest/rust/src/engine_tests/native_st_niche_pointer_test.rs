@@ -153,11 +153,11 @@ fn native_structure_object_pointers() {
     assert_eq!(retrieved, None);
 
     let object = Node3D::new_alloc();
-    unsafe { result.set_collider(object) };
+    unsafe { result.set_collider(object.clone()) };
     assert_eq!(result.collider_id.id, object.instance_id().to_i64() as u64);
 
     let retrieved = result.get_collider();
-    assert_eq!(retrieved, Some(object.upcast()));
+    assert_eq!(retrieved, Some(object.clone().upcast()));
 
     object.free();
     assert_eq!(result.get_collider(), None);

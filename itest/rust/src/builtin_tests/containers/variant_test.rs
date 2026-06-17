@@ -87,7 +87,7 @@ fn variant_relaxed_conversions() {
     convert_relaxed_to(-22i8, -22i8);
     convert_relaxed_to("some str", GString::from("some str"));
     convert_relaxed_to(TEST_BASIS, TEST_BASIS);
-    convert_relaxed_to(obj, obj);
+    convert_relaxed_to(obj.clone(), obj.clone());
 
     // int <-> float
     convert_relaxed_to(1234567890i64, 1234567890f64);
@@ -116,7 +116,7 @@ fn variant_relaxed_conversions() {
     // anything -> nil
     convert_relaxed_to(Variant::nil(), Variant::nil());
     convert_relaxed_to((), Variant::nil());
-    convert_relaxed_fail::<()>(obj);
+    convert_relaxed_fail::<()>(obj.clone());
     convert_relaxed_fail::<()>(123.45);
     convert_relaxed_fail::<()>(Vector3i::new(1, 2, 3));
 
@@ -148,7 +148,7 @@ fn variant_relaxed_conversions() {
     convert_relaxed_to(packed_strings, varray!["a", "bb"]);
 
     // Object|nil -> optional Object
-    convert_relaxed_to(obj, Some(obj));
+    convert_relaxed_to(obj.clone(), Some(obj.clone()));
     convert_relaxed_to(Variant::nil(), Option::<Gd<Node>>::None);
 
     // Object -> Rid
@@ -481,7 +481,7 @@ fn variant_equal() {
 #[itest]
 fn variant_call() {
     let node2d = Node2D::new_alloc();
-    let variant = Variant::from(node2d);
+    let variant = Variant::from(node2d.clone());
 
     // Object
     let position = Vector2::new(4.0, 5.0);

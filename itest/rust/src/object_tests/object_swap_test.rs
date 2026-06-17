@@ -95,7 +95,7 @@ fn object_subtype_swap_free() {
     let mut node: Gd<Node> = Node::new_alloc();
 
     let obj_copy = obj.clone();
-    let node_copy = node;
+    let node_copy = node.clone();
 
     std::mem::swap(&mut *obj, &mut *node);
 
@@ -117,7 +117,7 @@ fn object_subtype_swap_argument_passing(ctx: &TestContext) {
 
     std::mem::swap(&mut *obj, &mut *node);
 
-    let mut tree = ctx.scene_tree;
+    let mut tree = ctx.scene_tree.clone();
     expect_panic("pass badly typed Gd<T> to Godot engine API", || {
         tree.add_child(&node);
     });
@@ -161,9 +161,9 @@ fn object_subtype_swap_casts() {
     let mut obj: Gd<Object> = Object::new_alloc();
     let mut node3d: Gd<Node3D> = Node3D::new_alloc();
     let mut obj_v2: Gd<Object> = obj.clone();
-    let mut node3d_v2: Gd<Node3D> = node3d;
+    let mut node3d_v2: Gd<Node3D> = node3d.clone();
     let mut obj_v3: Gd<Object> = obj.clone();
-    let mut node3d_v3: Gd<Node3D> = node3d;
+    let mut node3d_v3: Gd<Node3D> = node3d.clone();
 
     // let obj_id = obj.instance_id();
     let node3d_id = node3d.instance_id();
@@ -191,7 +191,7 @@ fn object_subtype_swap_casts() {
 
     // Downcasting does not work if the dynamic type is wrong.
     expect_panic("cast() on Gd<T> with invalid runtime type", || {
-        let _ = node3d.cast::<Node3D>();
+        let _ = node3d.clone().cast::<Node3D>();
     });
 
     swapped_free!(obj, node3d);
@@ -243,7 +243,7 @@ impl SwapHolder {
         let mut object: Gd<Object> = Object::new_alloc();
         let mut node: Gd<Node> = Node::new_alloc();
         self.gc.push(object.clone());
-        self.gc.push(node.upcast());
+        self.gc.push(node.clone().upcast());
 
         std::mem::swap(&mut *object, &mut *node);
 

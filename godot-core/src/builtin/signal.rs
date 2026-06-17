@@ -140,7 +140,7 @@ impl Signal {
     ///
     /// _Godot equivalent: `get_object`_
     pub fn object(&self) -> Option<Gd<Object>> {
-        let object = self.as_inner().get_object()?;
+        let mut object = self.as_inner().get_object()?;
 
         // `get_object()` may hand out a pointer to an already-freed object (e.g. when the object was destroyed on another thread).
         // Validate liveness before touching the instance, honoring this method's contract to return `None` for dead objects. Without this,
@@ -149,7 +149,7 @@ impl Signal {
             return None;
         }
 
-        <Object as Bounds>::DynMemory::maybe_inc_ref(object.raw.obj(), object.raw.cached_rtti());
+        <Object as Bounds>::DynMemory::maybe_inc_ref(&mut object.raw);
         Some(object)
     }
 

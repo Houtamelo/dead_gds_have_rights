@@ -345,7 +345,7 @@ fn test_ready(test_context: &TestContext) {
     assert_eq!(obj.bind().implementation_value, 0);
 
     // Add to scene tree.
-    let mut test_node = test_context.scene_tree;
+    let mut test_node = test_context.scene_tree.clone();
     test_node.add_child(&obj);
 
     // _ready runs, increments implementation_value once.
@@ -360,7 +360,7 @@ fn test_ready_panic(test_context: &TestContext) {
     // Add to scene tree -- this panics.
     // NOTE: Current implementation catches panics, but does not propagate them to the user.
     // Godot has no mechanism to transport errors across ptrcalls (e.g. virtual function calls), so this would need to be emulated somehow.
-    let mut test_node = test_context.scene_tree;
+    let mut test_node = test_context.scene_tree.clone();
     // expect_panic("panic in ready() propagated to caller", || {
     test_node.add_child(&obj);
     // });
@@ -374,7 +374,7 @@ fn test_ready_dynamic_panic(test_context: &TestContext) {
     obj.bind_mut().panics = true;
 
     // Add to scene tree -- this panics.
-    let mut test_node = test_context.scene_tree;
+    let mut test_node = test_context.scene_tree.clone();
 
     // NOTE: Current implementation catches panics, but does not propagate them to the user.
     // Godot has no mechanism to transport errors across ptrcalls (e.g. virtual function calls), so this would need to be emulated somehow.
@@ -391,7 +391,7 @@ fn test_ready_multiple_fires(test_context: &TestContext) {
     let obj = VirtualReadyTest::new_alloc();
     assert_eq!(obj.bind().implementation_value, 0);
 
-    let mut test_node = test_context.scene_tree;
+    let mut test_node = test_context.scene_tree.clone();
 
     // Add to scene tree.
     test_node.add_child(&obj);
@@ -412,7 +412,7 @@ fn test_ready_request_ready(test_context: &TestContext) {
     let obj = VirtualReadyTest::new_alloc();
     assert_eq!(obj.bind().implementation_value, 0);
 
-    let mut test_node = test_context.scene_tree;
+    let mut test_node = test_context.scene_tree.clone();
 
     // Add to scene tree.
     test_node.add_child(&obj);
@@ -443,7 +443,7 @@ fn test_tree_enters_exits(test_context: &TestContext) {
     let obj = VirtualTreeTest::new_alloc();
     assert_eq!(obj.bind().tree_enters, 0);
     assert_eq!(obj.bind().tree_exits, 0);
-    let mut test_node = test_context.scene_tree;
+    let mut test_node = test_context.scene_tree.clone();
 
     // Add to scene tree.
     test_node.add_child(&obj);

@@ -122,7 +122,7 @@ where
     AUTOLOAD_CACHE.with(|cache| {
         cache
             .borrow_mut()
-            .insert(autoload_name.to_string(), autoload_node);
+            .insert(autoload_name.to_string(), autoload_node.clone());
     });
 
     // Cast to requested type.

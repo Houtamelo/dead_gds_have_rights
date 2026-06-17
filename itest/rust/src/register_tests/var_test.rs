@@ -288,11 +288,11 @@ fn var_pub_access_on_ready_gd() {
     let first = Node::new_alloc();
     let second = Node::new_alloc();
 
-    obj.bind_mut().on_ready_node.init(first);
+    obj.bind_mut().on_ready_node.init(first.clone());
     assert_eq!(obj.bind().get_on_ready_node(), first);
     assert_eq!(&*obj.bind().on_ready_node, &first);
 
-    obj.bind_mut().set_on_ready_node(second);
+    obj.bind_mut().set_on_ready_node(second.clone());
     assert_eq!(obj.bind().get_on_ready_node(), second);
 
     first.free();
@@ -312,7 +312,7 @@ fn var_pub_access_on_ready_panics() {
         obj.bind().get_on_ready_int();
     });
     expect_panic("set - OnReady<Gd<Node>>", || {
-        obj.bind_mut().set_on_ready_node(node);
+        obj.bind_mut().set_on_ready_node(node.clone());
     });
     expect_panic("set - OnReady<i32>", || {
         obj.bind_mut().set_on_ready_int(42);
@@ -344,7 +344,7 @@ fn var_pub_access_on_editor_gd() {
         obj.bind().get_on_editor_node();
     });
 
-    obj.bind_mut().set_on_editor_node(node);
+    obj.bind_mut().set_on_editor_node(node.clone());
     assert_eq!(obj.bind().get_on_editor_node(), node.clone());
     assert_eq!(&*obj.bind().on_editor_node, &node);
 

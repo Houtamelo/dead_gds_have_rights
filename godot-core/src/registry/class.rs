@@ -162,7 +162,7 @@ pub fn register_class<
 >() {
     // TODO: provide overloads with only some trait impls
 
-    out!("Manually register class {}", any::type_name::<T>());
+    out!("Manually register class {}", std::any::type_name::<T>());
 
     let godot_params = GodotCreationInfo {
         to_string_func: Some(callbacks::to_string::<T>),

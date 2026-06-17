@@ -271,18 +271,19 @@ impl Struct {
     pub fn with_singleton<T>(mut self) -> Self
     where
         T: UserSingleton
-            + Bounds<Memory = bounds::MemManual<<T as GodotClass>::Base>, Declarer = bounds::DeclUser>
+            + Bounds<Memory = bounds::MemManual, Declarer = bounds::DeclUser>
             + NewAlloc
             + Inherits<classes::Object>,
     {
         self.register_singleton_fn = Some(|| {
-            classes::Engine::singleton()
+            crate::classes::Engine::singleton()
                 .register_singleton(&T::class_id().to_string_name(), &T::new_alloc());
         });
 
         self.unregister_singleton_fn = Some(|| {
             let singleton = T::singleton();
-            classes::Engine::singleton().unregister_singleton(&T::class_id().to_string_name());
+            crate::classes::Engine::singleton()
+                .unregister_singleton(&T::class_id().to_string_name());
             singleton.free();
         });
 

@@ -100,7 +100,7 @@ impl IntegrationTests {
         };
 
         let clock = Instant::now();
-        self.run_rust_tests(rust_tests, scene_tree, property_tests);
+        self.run_rust_tests(rust_tests, scene_tree.clone(), property_tests.clone());
         let rust_time = clock.elapsed();
 
         let gdscript_time = if run_gdscript {

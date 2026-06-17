@@ -121,7 +121,6 @@ fn make_with_signals_impl(
 
             // During construction, C = Self.
             #[doc(hidden)]
-            #[allow(clippy::clone_on_copy)]
             fn __signals_from_external(gd_ref: & Gd<Self>) -> Self::SignalCollection<'_, Self> {
                 Self::SignalCollection {
                     __internal_obj: Some(gd_ref.clone()),

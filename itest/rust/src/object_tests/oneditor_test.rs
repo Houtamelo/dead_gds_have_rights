@@ -60,7 +60,7 @@ fn oneditor_no_panic_on_ready() {
     obj.bind_mut().some_primitive.init(64);
     obj.notify(NodeNotification::READY);
     assert!(obj.bind().was_ready_run);
-    obj.bind_mut().node_field.free();
+    obj.bind_mut().node_field.clone().free();
     obj.free();
 }
 
@@ -93,7 +93,7 @@ fn oneditor_debug() {
     assert_eq!(format!("{val:?}"), "OnEditor { state: UninitNull }");
 
     let obj = Node::new_alloc();
-    val.init(obj);
+    val.init(obj.clone());
 
     let id = obj.instance_id();
 

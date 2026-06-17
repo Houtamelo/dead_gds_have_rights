@@ -52,7 +52,7 @@ fn node_get_node_fail() {
 
 #[itest]
 fn node_path_from_str(ctx: &TestContext) {
-    let child = ctx.scene_tree;
+    let child = ctx.scene_tree.clone();
     assert_eq!(
         child.get_path().to_string(),
         NodePath::from_str("/root/TestRunner").unwrap().to_string()
@@ -63,7 +63,7 @@ fn node_path_from_str(ctx: &TestContext) {
 // https://github.com/godot-rust/gdext/commit/207c4e72ac0c24cfb83bab16f856dd09ebc8671c
 #[itest]
 fn node_call_group(ctx: &TestContext) {
-    let mut node = ctx.scene_tree;
+    let mut node = ctx.scene_tree.clone();
     let mut tree = node.get_tree();
 
     node.add_to_group("group");

@@ -176,7 +176,7 @@ fn object_dynamic_class() {
     assert_eq!(node.dynamic_class(), Node3D::class_id());
 
     // After upcast, dynamic class still reflects the actual type (not the static one).
-    let upcast = node.upcast::<Node>();
+    let upcast = node.clone().upcast::<Node>();
     assert_eq!(upcast.dynamic_class(), Node3D::class_id());
     assert_ne!(upcast.dynamic_class(), Node::class_id());
 
@@ -241,7 +241,7 @@ fn object_instance_id_when_freed() {
     let node: Gd<Node3D> = Node3D::new_alloc();
     assert!(node.is_instance_valid());
 
-    node.free(); // destroys object without moving out of reference
+    node.clone().free(); // destroys object without moving out of reference
     assert!(!node.is_instance_valid());
 }
 
@@ -340,8 +340,8 @@ fn object_user_free_during_bind() {
 fn object_engine_freed_argument_passing(ctx: &TestContext) {
     let node: Gd<Node> = Node::new_alloc();
 
-    let mut tree = ctx.scene_tree;
-    let node2 = node;
+    let mut tree = ctx.scene_tree.clone();
+    let node2 = node.clone();
 
     // Destroy object and then pass it to a Godot engine API.
     node.free();
@@ -422,7 +422,7 @@ fn object_user_call_after_free() {
 #[itest]
 fn object_engine_use_after_free() {
     let node: Gd<Node3D> = Node3D::new_alloc();
-    let copy = node;
+    let copy = node.clone();
     node.free();
 
     expect_panic_or_ub("call method on dead engine object", move || {
@@ -433,7 +433,7 @@ fn object_engine_use_after_free() {
 #[itest]
 fn object_engine_use_after_free_varcall() {
     let node: Gd<Node3D> = Node3D::new_alloc();
-    let mut copy = node;
+    let mut copy = node.clone();
     node.free();
 
     expect_panic_or_ub("call method on dead engine object", move || {
@@ -459,7 +459,7 @@ fn object_user_eq() {
 #[itest]
 fn object_engine_eq() {
     let a1 = Node3D::new_alloc();
-    let a2 = a1;
+    let a2 = a1.clone();
     let b1 = Node3D::new_alloc();
 
     assert_eq!(a1, a2);
@@ -474,13 +474,14 @@ fn object_engine_eq() {
 fn object_dead_eq() {
     let a = Node3D::new_alloc();
     let b = Node3D::new_alloc();
+    let b2 = b.clone();
 
     // Destroy b1 without consuming it
-    b.free();
+    b.clone().free();
 
     // `a` is alive and `b` isn't, they clearly should not be equal.
     assert_ne!(a, b);
-    a.free();
+    a.clone().free();
 
     // Both are dead, but their instance ids are still cached, they were never equal.
     assert_ne!(a, b);
@@ -785,10 +786,10 @@ fn object_engine_accept_polymorphic() {
     #[cfg(since_api = "4.5")]
     node.set_name(&expected_name);
 
-    let actual_name = accept_node(node);
+    let actual_name = accept_node(node.clone());
     assert_eq!(actual_name, expected_name);
 
-    let actual_class = accept_object(node);
+    let actual_class = accept_object(node.clone());
     assert_eq!(actual_class, expected_class);
 
     node.free();
@@ -891,7 +892,7 @@ fn object_engine_manual_free() {
     // Tests if no panic or memory leak
     {
         let node = Node3D::new_alloc();
-        let node2 = node;
+        let node2 = node.clone();
         node2.free();
     } // drop(node)
 }
@@ -901,7 +902,7 @@ fn object_engine_manual_free() {
 fn object_engine_shared_free() {
     {
         let node = Node::new_alloc();
-        let _object = node.upcast::<Object>();
+        let _object = node.clone().upcast::<Object>();
         node.free();
     } // drop(_object)
 }
@@ -909,7 +910,7 @@ fn object_engine_shared_free() {
 #[itest]
 fn object_engine_manual_double_free() {
     let node = Node3D::new_alloc();
-    let node2 = node;
+    let node2 = node.clone();
     node.free();
 
     // `free` performs checks and is safe to call even if object has already been freed.
@@ -957,7 +958,7 @@ fn object_user_share_drop() {
 fn object_get_scene_tree(ctx: &TestContext) {
     let node = Node3D::new_alloc();
 
-    let mut tree = ctx.scene_tree;
+    let mut tree = ctx.scene_tree.clone();
     tree.add_child(&node);
 
     let count = tree.get_child_count();

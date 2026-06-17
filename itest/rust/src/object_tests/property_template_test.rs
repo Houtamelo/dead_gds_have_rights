@@ -22,7 +22,7 @@ use crate::register_tests::gen_ffi::PropertyTestsRust;
 #[itest]
 fn property_template_test(ctx: &TestContext) {
     let rust_properties = PropertyTestsRust::new_alloc();
-    let gdscript_properties = ctx.property_tests;
+    let gdscript_properties = ctx.property_tests.clone();
 
     // Detect stale GenPropertyTests.gd left over from a build against a different godot-rust API version.
     let built_for = gdscript_properties.get("built_for_api_minor").to::<u32>();

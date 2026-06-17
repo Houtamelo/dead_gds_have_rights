@@ -797,8 +797,8 @@ fn test_duplicate_retains_properties() {
         original.int_export = 5;
         original.int_var = 7;
         original.int_ignored = 9; // Will not be copied.
-        original.optional_node = Some(optional_node);
-        original.oneditor_node.init(oneditor_node);
+        original.optional_node = Some(optional_node.clone());
+        original.oneditor_node.init(oneditor_node.clone());
     }
 
     // Create duplicate and verify all properties are copied correctly.

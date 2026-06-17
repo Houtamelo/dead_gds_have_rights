@@ -529,7 +529,7 @@ fn make_deref_impl(class_name: &TyName, base_ty: &TokenStream) -> TokenStream {
     }
 }
 
-fn make_bounds(class: &Class, ctx: &mut Context) -> (TokenStream, TokenStream, Ident) {
+fn make_bounds(class: &Class, ctx: &mut Context) -> (Ident, Ident, Ident) {
     let c = class.name();
 
     let assoc_dyn_memory = if c.rust_ty == "Object" {
@@ -553,11 +553,7 @@ fn make_bounds(class: &Class, ctx: &mut Context) -> (TokenStream, TokenStream, I
         ident("No")
     };
 
-    (
-        quote! { #assoc_memory<Self> },
-        quote! { #assoc_dyn_memory<Self> },
-        is_exportable,
-    )
+    (assoc_memory, assoc_dyn_memory, is_exportable)
 }
 
 fn make_class_methods(

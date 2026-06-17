@@ -223,7 +223,7 @@ where
     let manual = Node::new_alloc();
     let refc = user_refc_instance();
 
-    let manual2 = manual;
+    let manual2 = manual.clone();
     let refc2 = refc.clone();
 
     let (a, b) = f(manual, refc);

@@ -238,7 +238,7 @@ impl ScriptInstance for TestScriptInstance {
     }
 
     fn get_language(&self) -> Gd<ScriptLanguage> {
-        self.script_language
+        self.script_language.clone()
     }
 
     fn on_refcount_decremented(&self) -> bool {

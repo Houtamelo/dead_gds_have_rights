@@ -600,7 +600,7 @@ fn typed_array_try_from_untyped() {
 #[itest]
 fn untyped_array_try_from_typed() {
     let node = Node::new_alloc();
-    let array = Array::<Option<Gd<Node>>>::from(&[Some(node)]);
+    let array = Array::<Option<Gd<Node>>>::from(&[Some(node.clone())]);
 
     array
         .to_variant()

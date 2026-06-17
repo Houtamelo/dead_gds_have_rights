@@ -142,7 +142,7 @@ fn signal_symbols_complex_emit() {
     }
 
     // Allows upcasting.
-    sig.emit(&arg.upcast::<Object>(), "hello");
+    sig.emit(&arg, "hello");
 
     emitter.free();
 }
@@ -889,7 +889,7 @@ mod custom_callable {
     // Custom callables - helper functions
 
     fn add_remove_child(ctx: &TestContext, node: &mut Gd<Node>) {
-        let mut tree = ctx.scene_tree;
+        let mut tree = ctx.scene_tree.clone();
         tree.add_child(&*node);
         tree.remove_child(&*node);
     }
