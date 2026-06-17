@@ -5,16 +5,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use super::{make_callable_name, make_godot_fn};
 #[cfg(feature = "experimental-threads")]
 use crate::builtin::Callable;
 use crate::builtin::{CowStr, Variant};
 use crate::classes::object::ConnectFlags;
 use crate::meta;
 use crate::meta::{InParamTuple, ObjectToOwned};
-use crate::obj::signal::signal_receiver::{IndirectSignalReceiver, SignalReceiver};
-use crate::obj::signal::{ConnectHandle, TypedSignal};
 use crate::obj::{Bounds, Gd, GodotClass, WithSignals, bounds};
+use crate::signal::signal_receiver::{IndirectSignalReceiver, SignalReceiver};
+use crate::signal::{ConnectHandle, TypedSignal, make_callable_name, make_godot_fn};
 
 /// Builder for customizing signal connections.
 ///
@@ -185,9 +184,14 @@ impl<C: WithSignals, Ps: InParamTuple + 'static> ConnectBuilder<'_, '_, C, Ps> {
         for<'c_rcv> F: SignalReceiver<&'c_rcv mut C, Ps>,
         for<'c_rcv> IndirectSignalReceiver<'c_rcv, &'c_rcv mut C, Ps, F>: From<&'c_rcv mut F>,
     {
-        let mut gd = self.parent_sig.receiver_object();
+        // Weak capture via instance ID, to avoid a reference cycle keeping RefCounted objects alive. See TypedSignal::connect_self().
+        let instance_id = self.parent_sig.receiver_object().instance_id();
 
         let godot_fn = make_godot_fn(move |args| {
+            let Ok(mut gd) = Gd::<C>::try_from_instance_id(instance_id) else {
+                return;
+            };
+
             let mut guard = Gd::bind_mut(&mut gd);
             IndirectSignalReceiver::from(&mut function)
                 .function()
@@ -211,15 +215,20 @@ impl<C: WithSignals, Ps: InParamTuple + 'static> ConnectBuilder<'_, '_, C, Ps> {
         F: SignalReceiver<Gd<C>, Ps>,
         for<'c_rcv> IndirectSignalReceiver<'c_rcv, Gd<C>, Ps, F>: From<&'c_rcv mut F>,
     {
-        let gd = self.parent_sig.receiver_object();
-        let bound = gd.clone();
+        // Weak capture via instance ID, to avoid a reference cycle keeping RefCounted objects alive. See TypedSignal::connect_self().
+        let instance_id = self.parent_sig.receiver_object().instance_id();
 
         let godot_fn = make_godot_fn(move |args| {
+            let Ok(gd) = Gd::<C>::try_from_instance_id(instance_id) else {
+                return;
+            };
+
             IndirectSignalReceiver::from(&mut function)
                 .function()
-                .call(gd.clone(), args);
+                .call(gd, args);
         });
 
+        let bound = self.parent_sig.receiver_object();
         self.inner_connect_godot_fn::<F>(godot_fn, &bound)
     }
 
@@ -246,6 +255,7 @@ impl<C: WithSignals, Ps: InParamTuple + 'static> ConnectBuilder<'_, '_, C, Ps> {
         for<'c_rcv> F: SignalReceiver<&'c_rcv mut OtherC, Ps>,
         for<'c_rcv> IndirectSignalReceiver<'c_rcv, &'c_rcv mut OtherC, Ps, F>: From<&'c_rcv mut F>,
     {
+        // Strong capture: the connection keeps the receiver alive. Deliberate, see TypedSignal::connect_other().
         let mut gd = object.object_to_owned();
 
         let godot_fn = make_godot_fn(move |args| {
@@ -279,6 +289,7 @@ impl<C: WithSignals, Ps: InParamTuple + 'static> ConnectBuilder<'_, '_, C, Ps> {
         F: SignalReceiver<Gd<OtherC>, Ps>,
         for<'c_rcv> IndirectSignalReceiver<'c_rcv, Gd<OtherC>, Ps, F>: From<&'c_rcv mut F>,
     {
+        // Strong capture: the connection keeps the receiver alive. Deliberate, see TypedSignal::connect_other().
         let gd = object.object_to_owned();
 
         let godot_fn = make_godot_fn(move |args| {

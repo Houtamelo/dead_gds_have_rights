@@ -18,8 +18,8 @@ use crate::classes::object::ConnectFlags;
 use crate::global::godot_error;
 use crate::meta::InParamTuple;
 use crate::meta::sealed::Sealed;
-use crate::obj::signal::TypedSignal;
 use crate::obj::{Gd, GodotClass, WithSignals};
+use crate::signal::TypedSignal;
 use crate::sys;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -35,8 +35,16 @@ pub(crate) use crate::impl_dynamic_send;
 /// # Panics
 /// - If the signal object is freed before the signal has been emitted.
 /// - If one of the signal arguments is `!Send`, but the signal was emitted on a different thread.
-/// - The future's `Drop` implementation can cause a non-unwinding panic in rare cases, should the signal object be freed at the same time
-///   as the future is dropped. Make sure to keep signal objects alive until there are no pending futures anymore.
+///
+/// During engine shutdown, this does **not** panic: when the signal object is freed before emission as part of the main loop being torn down,
+/// the awaiting task stays suspended and is dropped silently instead. This keeps "fire-and-forget" tasks from spamming errors on application exit.
+///
+/// # Keeping the signal object alive
+/// If the signal object is freed *concurrently* while the future is being dropped, connection cleanup is skipped and the stale connection is
+/// leaked (Godot removes it once the object dies), rather than aborting the process. This is only reachable by moving a `Gd` across threads,
+/// which requires `unsafe` (`Gd` is `!Send`); in safe, single-threaded code it cannot happen. If you do bypass `!Send`, it is your
+/// responsibility to keep the object alive -- retain a strong `Gd` on the runtime thread, or `join()` the other thread -- until no pending
+/// future refers to it.
 pub struct SignalFuture<R: InParamTuple + IntoDynamicSend>(FallibleSignalFuture<R>);
 
 impl<R: InParamTuple + IntoDynamicSend> SignalFuture<R> {
@@ -150,6 +158,12 @@ impl<R: IntoDynamicSend> Drop for SignalFutureResolver<R> {
             return;
         }
 
+        // During teardown, leave the future `Pending` (runtime drops it in `cleanup()`) instead of marking it `Dead` and waking it -> that would
+        // cause "signal object freed" error, i.e. a panic for `SignalFuture`, spamming on every exit. See `async_runtime::is_engine_exiting()`.
+        if crate::task::is_engine_exiting() {
+            return;
+        }
+
         // We mark the future as dead, so the next time it gets polled we can react to it's inability to resolve.
         data.state = SignalFutureState::Dead;
 
@@ -188,8 +202,9 @@ impl<T> SignalFutureState<T> {
 ///
 /// # Panics
 /// - If one of the signal arguments is `!Send`, but the signal was emitted on a different thread.
-/// - The future's `Drop` implementation can cause a non-unwinding panic in rare cases, should the signal object be freed at the same time
-///   as the future is dropped. Make sure to keep signal objects alive until there are no pending futures anymore.
+///
+/// For behavior when the signal object is freed while a future is being dropped, see
+/// [_Keeping the signal object alive_](SignalFuture#keeping-the-signal-object-alive).
 pub struct FallibleSignalFuture<R: InParamTuple + IntoDynamicSend> {
     data: Arc<Mutex<SignalFutureData<R::Target>>>,
     callable: SignalFutureResolver<R>,
@@ -283,23 +298,44 @@ impl<R: InParamTuple + IntoDynamicSend> Drop for FallibleSignalFuture<R> {
 
         let mut data_lock = self.data.lock().unwrap();
 
-        data_lock.state = SignalFutureState::Dropped;
+        let prev_state = std::mem::replace(&mut data_lock.state, SignalFutureState::Dropped);
 
         drop(data_lock);
+
+        // Only the still-`Pending` future has a live connection that needs cleanup. Once the signal has fired (`Ready`) or the resolver was
+        // already dropped (`Dead`), the `ONE_SHOT` connection is gone, so there is nothing to disconnect. Skipping the object access in that
+        // case is also crucial for correctness: the signal's object may be freed concurrently (e.g. emitted from another thread that then
+        // drops the last reference), and touching it here -- inside `Drop` -- would panic and escalate to a fatal non-unwinding abort.
+        if !matches!(prev_state, SignalFutureState::Pending) {
+            return;
+        }
 
         // We create a new Godot Callable from our RustCallable so we get independent reference counting.
         let gd_callable = Callable::from_custom(self.callable.clone());
 
-        // is_connected will return true if the signal was never emited before the future is dropped.
+        // The future was dropped before the signal fired, so the ONE_SHOT connection is still live and must be disconnected.
+        // Signal::object() resolves the object over separate FFI calls (validate liveness, then inc-ref), which creates a TOCTOU race:
+        // another thread holding the last Gd -- only reachable via `unsafe` (e.g. cross-thread accessor) -- can free it in between.
+        // The inc-ref would then access freed memory and panic/UB. A panic escaping `Drop` aborts the process, so we contain it:
+        // the stale connection is not disconnected, but Godot later does so when the object dies.
+        // The common case (object alive) disconnects normally.
         //
-        // There is a TOCTOU issue here that can occur when the FallibleSignalFuture is dropped at the same time as the signal object is
-        // freed on a different thread.
-        // We check in the beginning if the signal object is still alive, and we check here again, but the signal object still can be freed
-        // between our check and our usage of the object in `is_connected` and `disconnect`. The race condition will manifest in a
-        // non-unwinding panic that is hard to track down.
-        if !self.signal.is_null() && self.signal.is_connected(&gd_callable) {
-            self.signal.disconnect(&gd_callable);
-        }
+        // Calling is_connected()/disconnect() on the Signal directly would re-resolve the object, reopening the TOCTOU window per call.
+        // Resolving once via Signal::object() avoids that: for RefCounted the handle is a strong reference, so it stays alive while used.
+        //
+        // is_connected() is true while the signal hasn't fired yet.
+        let cleanup = || {
+            if let Some(mut object) = self.signal.object() {
+                let signal_name = self.signal.name();
+
+                if object.is_connected(&signal_name, &gd_callable) {
+                    object.disconnect(&signal_name, &gd_callable);
+                }
+            }
+        };
+
+        let context = || "FallibleSignalFuture::drop: object freed concurrently".to_string();
+        let _ = crate::private::handle_panic(context, cleanup);
     }
 }
 

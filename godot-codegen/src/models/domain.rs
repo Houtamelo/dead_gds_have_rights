@@ -17,9 +17,9 @@ use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{ToTokens, format_ident, quote};
 
 use crate::context::Context;
-use crate::conv;
-use crate::models::json::{JsonBuiltinClass, JsonMethodArg, JsonMethodReturn};
-use crate::util::{ident, option_as_slice, safe_ident};
+use crate::models::api_json::{JsonBuiltinClass, JsonMethodArg, JsonMethodReturn};
+use crate::util::{ident, safe_ident};
+use crate::{conv, special_cases};
 
 mod enums;
 
@@ -53,19 +53,86 @@ impl ExtensionApi {
 
 pub struct ApiView<'a> {
     class_by_ty: HashMap<TyName, &'a Class>,
+
+    /// Maps Godot enumerator name -> (enum, enumerator) for global-scope enums.
+    ///
+    /// Global enumerator names are unique; they carry the enum name as prefix (e.g. `MIDI_MESSAGE_NOTE_ON` for `MidiMessage`).
+    /// Key is `godot_name` from [`Enumerator`], so lookup is O(1) without iterating all enums.
+    global_enum_constants: HashMap<&'a str, (&'a Enum, &'a Enumerator)>,
+
+    /// Maps a class type to its enum constants by Godot name.
+    class_enum_constants: HashMap<TyName, HashMap<&'a str, (&'a Enum, &'a Enumerator)>>,
 }
 
 impl<'a> ApiView<'a> {
     pub fn new(api: &'a ExtensionApi) -> ApiView<'a> {
         let class_by_ty = api.classes.iter().map(|c| (c.name().clone(), c)).collect();
 
-        Self { class_by_ty }
+        let global_enum_constants = api
+            .global_enums
+            .iter()
+            .flat_map(|e| {
+                e.enumerators
+                    .iter()
+                    .map(move |enumerator| (enumerator.godot_name.as_str(), (e, enumerator)))
+            })
+            .collect();
+
+        let class_enum_constants = api
+            .classes
+            .iter()
+            .map(|class| {
+                let enum_constants = class
+                    .enums
+                    .iter()
+                    .flat_map(|e| {
+                        e.enumerators.iter().map(move |enumerator| {
+                            (enumerator.godot_name.as_str(), (e, enumerator))
+                        })
+                    })
+                    .collect();
+
+                (class.name().clone(), enum_constants)
+            })
+            .collect();
+
+        Self {
+            class_by_ty,
+            global_enum_constants,
+            class_enum_constants,
+        }
     }
 
     pub fn get_engine_class(&self, ty: &TyName) -> &'a Class {
         self.class_by_ty
             .get(ty)
             .unwrap_or_else(|| panic!("specified type `{}` is not an engine class", ty.godot_ty))
+    }
+
+    pub fn find_engine_class(&self, ty: &TyName) -> Option<&'a Class> {
+        self.class_by_ty.get(ty).cloned()
+    }
+
+    /// Look up a global enum enumerator by its Godot name, e.g. `"MIDI_MESSAGE_NOTE_ON"`.
+    ///
+    /// Returns the containing [`Enum`] and the matching [`Enumerator`] (both carrying the already-renamed
+    /// Rust identifiers), or `None` if the name does not belong to any global enum.
+    pub fn find_global_enum_constant(
+        &self,
+        godot_name: &str,
+    ) -> Option<(&'a Enum, &'a Enumerator)> {
+        self.global_enum_constants.get(godot_name).copied()
+    }
+
+    pub fn find_class_enum_constant(
+        &self,
+        class: &TyName,
+        godot_name: &str,
+    ) -> Option<(&'a Enum, &'a Enumerator)> {
+        self.class_enum_constants
+            .get(class)
+            .and_then(|constants| constants.get(godot_name))
+            .copied()
     }
 }
 
@@ -169,6 +236,7 @@ pub struct Class {
     pub enums: Vec<Enum>,
     pub methods: Vec<ClassMethod>,
     pub signals: Vec<ClassSignal>,
+    pub description: Option<String>,
 }
 
 impl ClassLike for Class {
@@ -289,6 +357,7 @@ pub struct FunctionCommon {
     pub direction: FnDirection,
     /// Deprecation message, if the method is deprecated.
     pub deprecation_msg: Option<&'static str>,
+    pub description: Option<String>,
 }
 
 pub trait Function: fmt::Display {
@@ -328,6 +397,19 @@ pub trait Function: fmt::Display {
         self.common().is_private
     }
 
+    fn is_private_in_final_api(&self) -> bool {
+        let replaced_with_type_safe = self
+            .surrounding_class()
+            .map(|class_name| {
+                special_cases::is_class_method_replaced_with_type_safe(
+                    class_name,
+                    self.godot_name(),
+                )
+            })
+            .unwrap_or(false);
+        self.is_private() && !replaced_with_type_safe
+    }
+
     fn is_virtual(&self) -> bool {
         matches!(self.direction(), FnDirection::Virtual { .. })
     }
@@ -354,6 +436,9 @@ pub trait Function: fmt::Display {
 
 pub struct UtilityFunction {
     pub common: FunctionCommon,
+
+    /// True if manually approved as thread-safe. Routed through the thread-safe binding accessor in codegen.
+    pub is_thread_safe: bool,
 }
 
 impl UtilityFunction {
@@ -593,13 +678,14 @@ impl FnParamBuilder {
     /// Builds a vector of function parameters from the provided JSON method arguments.
     pub fn build_many(
         self,
-        method_args: &Option<Vec<JsonMethodArg>>,
+        method_args: Option<Vec<JsonMethodArg>>,
         flow: FlowDirection,
         ctx: &mut Context,
     ) -> Vec<FnParam> {
-        option_as_slice(method_args)
-            .iter()
-            .map(|arg| self.build_single_impl(arg, flow, ctx))
+        method_args
+            .unwrap_or_default()
+            .into_iter()
+            .map(|arg| self.build_single_impl(&arg, flow, ctx))
             .collect()
     }
 

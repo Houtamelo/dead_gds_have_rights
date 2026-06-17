@@ -219,6 +219,37 @@ fn signal_symbols_external_builder() {
     emitter.free();
 }
 
+/// Tests `#[signal(internal)]`: Rust accessor uses clean name, Godot registration uses `_` prefix.
+#[itest]
+fn signal_internal_attribute() {
+    let mut emitter = Emitter::new_alloc();
+
+    let tracker = Rc::new(Cell::new(0i64));
+    {
+        let tracker = tracker.clone();
+        // Rust accessor uses name `internal_sig` without underscore.
+        emitter.signals().internal_sig().connect(move |v| {
+            tracker.set(v);
+        });
+    }
+
+    // Godot-side name has `_` prefix -- verify signal is registered under that name.
+    assert!(
+        emitter.has_signal("_internal_sig"),
+        "internal signal should be registered as '_internal_sig' in Godot"
+    );
+
+    // Emit via typed API (uses Godot name internally).
+    emitter.signals().internal_sig().emit(42);
+    assert_eq!(tracker.get(), 42, "emit via typed API failed");
+
+    // Emit as untyped signal.
+    emitter.emit_signal("_internal_sig", &[99i64.to_variant()]);
+    assert_eq!(tracker.get(), 99, "emit via Object::emit_signal() failed");
+
+    emitter.free();
+}
+
 #[cfg(feature = "experimental-threads")]
 #[itest]
 fn signal_symbols_sync() {
@@ -540,6 +571,66 @@ fn enums_as_signal_args() {
     object.signals().game_event().emit(event);
 }
 
+#[itest]
+fn signal_engine_no_leak() {
+    let f = RefCounted::new_gd();
+
+    f.signals().script_changed().connect_self(|_this| {});
+}
+
+#[itest]
+fn signal_user_no_leak() {
+    #[derive(GodotClass)]
+    #[class(base = RefCounted, init)]
+    struct RefcountedSignaller {
+        base: Base<RefCounted>,
+    }
+
+    #[godot_api]
+    impl RefcountedSignaller {
+        #[signal]
+        fn game_event();
+    }
+
+    let f = RefcountedSignaller::new_gd();
+
+    // TODO game_event() should be #[must_use].
+    f.signals().game_event().connect_self(|_this| {});
+}
+
+// Ensures that despite the weak capture in connect_self() (instance ID instead of Gd, to avoid leaks), the receiver is still invoked on emit.
+#[itest]
+fn signal_self_weak_connection_invoked() {
+    #[derive(GodotClass)]
+    #[class(base = RefCounted, init)]
+    struct HitCounter {
+        hits: i32,
+        base: Base<RefCounted>,
+    }
+
+    #[godot_api]
+    impl HitCounter {
+        #[signal]
+        fn game_event();
+    }
+
+    let f = HitCounter::new_gd();
+    f.signals().game_event().connect_self(|this| this.hits += 1);
+    f.signals()
+        .game_event()
+        .builder()
+        .connect_self_mut(|this| this.hits += 10);
+    f.signals()
+        .game_event()
+        .builder()
+        .connect_self_gd(|mut this| this.bind_mut().hits += 100);
+
+    f.signals().game_event().emit();
+    f.signals().game_event().emit();
+
+    assert_eq!(f.bind().hits, 222);
+}
+
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Helper types
 
@@ -572,6 +663,9 @@ mod emitter {
 
         #[signal]
         pub(super) fn signal_obj(arg1: Gd<Object>, arg2: GString);
+
+        #[signal(internal)]
+        pub fn internal_sig(value: i64);
 
         #[func]
         pub fn self_receive(&mut self, arg1: i64) {
@@ -698,7 +792,7 @@ mod custom_callable {
     use godot::obj::{Gd, NewAlloc};
 
     use crate::builtin_tests::containers::callable_test::custom_callable::PanicCallable;
-    use crate::framework::{TestContext, itest};
+    use crate::framework::{TestContext, itest, suppress_godot_print};
 
     #[itest]
     fn signal_panic_user_from_fn() {
@@ -815,7 +909,7 @@ mod custom_callable {
         let callable = callable(received.clone());
         signal.connect(&callable);
 
-        emit(&mut node);
+        suppress_godot_print(|| emit(&mut node));
         assert_eq!(1, received.load(Ordering::SeqCst));
 
         node.free();

@@ -172,7 +172,7 @@ pub fn make_method_registration(
         let sig_ret_span = signature_info.params_span; // Alternative: sig_ret's span (first token).
 
         quote_spanned! { sig_ret_span=>
-            ::godot::meta::ensure_func_bounds::<CallParams, CallRet>();
+            ::godot::private::ensure_func_bounds::<CallParams, CallRet>();
         }
     };
 
@@ -688,7 +688,7 @@ fn make_ptrcall_invocation(wrapped_method: &TokenStream, is_virtual: bool) -> To
     };
 
     quote! {
-        ::godot::meta::Signature::<CallParams, CallRet>::in_ptrcall(
+        ::godot::private::Signature::<CallParams, CallRet>::in_ptrcall(
             instance_ptr,
             &call_ctx,
             args_ptr,
@@ -707,7 +707,7 @@ fn make_varcall_invocation(
     quote! {
         {
             let defaults = #default_parameters;
-            ::godot::meta::Signature::<CallParams, CallRet>::in_varcall(
+            ::godot::private::Signature::<CallParams, CallRet>::in_varcall(
                 instance_ptr,
                 &call_ctx,
                 args_ptr,
@@ -723,7 +723,7 @@ fn make_varcall_invocation(
 
 fn make_call_context(class_name_str: &str, method_name_str: &str) -> TokenStream {
     quote! {
-        ::godot::meta::CallContext::func(#class_name_str, #method_name_str)
+        ::godot::private::CallContext::func(#class_name_str, #method_name_str)
     }
 }
 

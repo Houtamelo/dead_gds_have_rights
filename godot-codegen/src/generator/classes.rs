@@ -11,7 +11,7 @@ use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::context::{Context, NotificationEnum};
-use crate::generator::functions_common::{FnCode, FnDefinition, FnDefinitions};
+use crate::generator::functions_common::{FnCode, FnDefinition, FnDefinitions, FnMeta};
 use crate::generator::method_tables::MethodTableKey;
 use crate::generator::{
     constants, docs, enums, functions_common, notifications, signals, virtual_traits,
@@ -110,6 +110,14 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
     let mut extended_class_doc = construct_doc.replace("Self", &class_name.rust_ty.to_string());
     extended_class_doc.push_str(final_doc.unwrap_or_default());
 
+    if let Some(description) = &class.description
+        && !description.is_empty()
+    {
+        extended_class_doc.push_str("\n# Godot docs\n");
+        let imported_doc = super::import_docs::import_docs(description, Some(class), ctx, view);
+        extended_class_doc.push_str(&imported_doc);
+    }
+
     let api_level = class.api_level;
     let init_level = api_level.to_init_level();
 
@@ -139,7 +147,7 @@ fn make_class(class: &Class, ctx: &mut Context, view: &ApiView) -> GeneratedClas
     let FnDefinitions {
         functions: methods,
         builders,
-    } = make_class_methods(class, &class.methods, &cfg_attributes, ctx);
+    } = make_class_methods(class, &class.methods, &cfg_attributes, view, ctx);
 
     let signals::SignalCodegen {
         signal_code,
@@ -556,12 +564,13 @@ fn make_class_methods(
     class: &Class,
     methods: &[ClassMethod],
     cfg_attributes: &TokenStream,
+    view: &ApiView,
     ctx: &mut Context,
 ) -> FnDefinitions {
     let get_method_table = class.api_level.table_global_getter();
 
     let definitions = methods.iter().map(|method| {
-        make_class_method_definition(class, method, &get_method_table, cfg_attributes, ctx)
+        make_class_method_definition(class, method, &get_method_table, cfg_attributes, view, ctx)
     });
 
     FnDefinitions::expand(definitions)
@@ -572,6 +581,7 @@ fn make_class_method_definition(
     method: &ClassMethod,
     get_method_table: &Ident,
     cfg_attributes: &TokenStream,
+    view: &ApiView,
     ctx: &mut Context,
 ) -> FnDefinition {
     let FnDirection::Outbound { hash } = method.direction() else {
@@ -630,6 +640,7 @@ fn make_class_method_definition(
         )
     };
 
+    let cfg_attributes1 = cfg_attributes.clone();
     functions_common::make_function_definition(
         method,
         &FnCode {
@@ -639,6 +650,11 @@ fn make_class_method_definition(
             is_virtual_required: false,
             is_varcall_fallible: true,
         },
-        cfg_attributes,
+        &FnMeta {
+            cfg_attributes: cfg_attributes1,
+            specific_docs: TokenStream::new(),
+        },
+        view,
+        ctx,
     )
 }

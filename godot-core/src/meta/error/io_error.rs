@@ -12,7 +12,12 @@ use crate::classes::FileAccess;
 use crate::global::Error as GodotError;
 use crate::obj::Gd;
 
-/// Error that can occur while using `gdext` IO utilities.
+/// Error that can occur while using godot-rust I/O utilities.
+///
+/// Some APIs using this:
+/// - [`tools::try_load()`][crate::tools::try_load]
+/// - [`tools::try_save()`][crate::tools::try_save]
+/// - [`tools::GFile::try_from_unique()`][crate::tools::GFile::try_from_unique]
 #[derive(Debug)]
 pub struct IoError {
     data: ErrorData,
@@ -70,6 +75,21 @@ impl IoError {
         }
     }
 
+    #[cfg(feature = "experimental-threads")]
+    pub(crate) fn loading_precondition(
+        class: String,
+        path: String,
+        precondition: &'static str,
+    ) -> Self {
+        Self {
+            data: ErrorData::Load(LoaderError {
+                kind: LoaderErrorKind::Precondition(precondition),
+                class,
+                path,
+            }),
+        }
+    }
+
     pub(crate) fn check_unique_open_file_access(
         file_access: Gd<FileAccess>,
     ) -> Result<Gd<FileAccess>, Self> {
@@ -118,6 +138,8 @@ struct LoaderError {
 enum LoaderErrorKind {
     Load,
     Cast,
+    #[cfg(feature = "experimental-threads")]
+    Precondition(&'static str),
 }
 
 impl Error for LoaderError {}
@@ -135,6 +157,11 @@ impl fmt::Display for LoaderError {
             LoaderErrorKind::Cast => write!(
                 f,
                 "can't cast loaded resource to class: '{class}' from path: '{path}'"
+            ),
+            #[cfg(feature = "experimental-threads")]
+            LoaderErrorKind::Precondition(condition) => write!(
+                f,
+                "can't load resource due to missing precondition: {condition}, class: '{path}', path: '{path}"
             ),
         }
     }

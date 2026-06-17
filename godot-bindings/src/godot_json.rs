@@ -14,24 +14,14 @@
 // Moving said types to `godot-bindings` would increase the cognitive overhead (since domain mapping is responsibility of `godot-codegen`, while godot-bindings is responsible for providing required resources & emitting the version).
 // In the future we might experiment with splitting said types into separate crates.
 
-use std::fs;
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Once;
+use std::{fs, panic};
 
 use nanoserde::DeJson;
 
-use crate::depend_on_custom_json::header_gen::generate_rust_binding;
-use crate::godot_version::validate_godot_version;
-use crate::{GodotVersion, StopWatch, env_var_or_deprecated};
-
-#[rustfmt::skip] // Do not reorder.
-// GDExtension headers are backward compatible (new incremental changes in general are exposed as additions to the existing API) while godot-rust simply ignores extra declarations in header file.
-// Therefore, latest headers should work fine for all the past and future Godot versions – as long as the engine remains unchanged.
-// [version-sync] [[
-//  [include] current.minor
-//  [line] use gdextension_api::version_$snakeVersion::load_gdextension_header_h as load_latest_gdextension_headers;
-use gdextension_api::version_4_6::load_gdextension_header_h as load_latest_gdextension_headers;
-// ]]
+use crate::{GodotVersion, LATEST_API_VERSION, StopWatch, env_var_or_deprecated};
 
 /// A minimal version of deserialized JsonExtensionApi that includes only the header.
 #[derive(DeJson)]
@@ -63,7 +53,20 @@ impl JsonHeader {
     }
 }
 
-pub fn load_custom_gdextension_json() -> String {
+pub fn load_gdextension_interface_json(watch: &mut StopWatch) -> Cow<'static, str> {
+    println!("cargo:rerun-if-env-changed=GDRUST_GODOT_INTERFACE_JSON");
+    watch.record("load_interface_json");
+
+    if let Ok(path) = std::env::var("GDRUST_GODOT_INTERFACE_JSON")
+        && let Ok(contents) = fs::read_to_string(&path)
+    {
+        Cow::Owned(contents)
+    } else {
+        gdextension_api::load_gdextension_interface_json()
+    }
+}
+
+pub fn load_custom_extension_api_json() -> String {
     static WARN_ONCE: Once = Once::new();
     let env_var = env_var_or_deprecated(
         &WARN_ONCE,
@@ -88,26 +91,31 @@ pub fn load_custom_gdextension_json() -> String {
     })
 }
 
+/// Returns the Godot version specified in `extension_api.json`, or the version of the used header if newer.
 pub(crate) fn read_godot_version() -> GodotVersion {
-    let extension_api: JsonExtensionApi = DeJson::deserialize_json(&load_custom_gdextension_json())
-        .expect("failed to deserialize JSON");
-    let version = extension_api.header.into_godot_version();
+    let extension_api: JsonExtensionApi =
+        DeJson::deserialize_json(&load_custom_extension_api_json())
+            .expect("failed to deserialize JSON");
 
-    validate_godot_version(&version);
+    let json_header_version = extension_api
+        .header
+        .into_godot_version()
+        .validate_or_panic();
 
-    version
-}
+    if json_header_version.is_newer_than_latest()
+        && std::env::var("GDRUST_GODOT_INTERFACE_JSON").is_err()
+    {
+        let (major, minor, patch) = LATEST_API_VERSION;
 
-pub(crate) fn write_gdextension_headers(
-    out_h_path: &Path,
-    out_rs_path: &Path,
-    watch: &mut StopWatch,
-) {
-    let h_contents = load_latest_gdextension_headers();
-    fs::write(out_h_path, h_contents.as_ref())
-        .unwrap_or_else(|e| panic!("failed to write gdextension_interface.h: {e}"));
-    watch.record("write_header_h");
+        // Note: this warning will be shown only with the extra verbose setting (`-vv`), on compilation error, or when compiling
+        // this very workspace (i.e. when it is a local dependency).
+        println!(
+            "cargo::warning=Using Godot version API {h_version} specified in `GDRUST_GODOT_API_JSON` with \
+            prebuilt Godot headers {major}.{minor}.{patch}.\
+            Consider providing custom `gdextension_interface.json` with `GDRUST_GODOT_INTERFACE_JSON` env variable instead.",
+            h_version = json_header_version.full_string,
+        );
+    }
 
-    generate_rust_binding(out_h_path, out_rs_path);
-    watch.record("generate_header_rs");
+    json_header_version
 }

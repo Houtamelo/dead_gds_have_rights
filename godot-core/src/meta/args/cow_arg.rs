@@ -8,7 +8,7 @@
 use std::fmt;
 use std::ops::Deref;
 
-use godot_ffi::{ExtVariantType, GodotFfi, GodotNullableFfi, PtrcallType};
+use godot_ffi::{ExtVariantType, GodotFfi, PtrcallType};
 
 use crate::builtin::Variant;
 use crate::meta::error::ConvertError;
@@ -90,10 +90,7 @@ where
         self.cow_as_ref().to_godot()
     }
 
-    fn to_godot_owned(&self) -> Self::Via
-    where
-        Self::Via: Clone,
-    {
+    fn to_godot_owned(&self) -> Self::Via {
         // Default implementation calls underlying T::to_godot().clone(), which is wrong.
         // Some to_godot_owned() calls are specialized/overridden, we need to honor that.
 
@@ -113,19 +110,6 @@ where
     }
 }
 
-impl<T> GodotNullableFfi for CowArg<'_, T>
-where
-    T: GodotNullableFfi,
-{
-    fn null() -> Self {
-        CowArg::Owned(T::null())
-    }
-
-    fn is_null(&self) -> bool {
-        self.cow_as_ref().is_null()
-    }
-}
-
 impl<T> Deref for CowArg<'_, T> {
     type Target = T;
 
@@ -139,22 +123,6 @@ impl<T> Deref for CowArg<'_, T> {
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // FfiArg implementations
-
-impl<T> GodotNullableFfi for FfiArg<'_, T>
-where
-    T: GodotNullableFfi,
-{
-    fn null() -> Self {
-        FfiArg::Cow(CowArg::Owned(T::null()))
-    }
-
-    fn is_null(&self) -> bool {
-        match self {
-            FfiArg::Cow(cow_arg) => cow_arg.is_null(),
-            FfiArg::FfiObject(obj_arg) => obj_arg.is_null(),
-        }
-    }
-}
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 

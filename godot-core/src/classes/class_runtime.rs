@@ -23,7 +23,7 @@ mod strict {
 
 #[cfg(safeguards_balanced)]
 mod balanced {
-    pub use crate::meta::CallContext;
+    pub(crate) use crate::meta::CallContext;
 }
 
 #[cfg(safeguards_balanced)]
@@ -244,7 +244,7 @@ where
 {
     let mut obj = unsafe {
         let object_ptr = sys::classdb_construct_object(T::class_id().string_sys());
-        Gd::<T>::from_obj_sys(object_ptr)
+        Gd::<T>::from_constructed_obj_sys(object_ptr)
     };
     #[cfg(since_api = "4.4")]
     obj.upcast_object_mut()
@@ -317,19 +317,31 @@ where
         return;
     }
 
-    // Non-tool classes can't be instantiated in the editor.
-    if crate::classes::Engine::singleton().is_editor_hint() {
+    // Behavior depending on editor state:
+    // * Editor (with `upcoming-editor-placeholders`): class substituted by PlaceholderExtensionInstance; null binding expected -> OK.
+    //   Accessing `bind()`/`bind_mut()` on placeholders would still panic, independently of this.
+    // * Runtime: null binding is a bug -> panic.
+    // * Unknown: Godot < 4.4 before InitLevel::Scene; no placeholders exist that early -> panic.
+    let placeholder_ok =
+        cfg!(feature = "upcoming-editor-placeholders") && sys::is_editor_or_unknown() == Some(true);
+    if !placeholder_ok {
         panic!(
-            "Class {} -- null instance; does the class have a Godot creator function? \
-            Ensure that the given class is a tool class with #[class(tool)], if it is being accessed in the editor.",
-            std::any::type_name::<T>()
-        )
-    } else {
-        panic!(
-            "Class {} -- null instance; does the class have a Godot creator function?",
+            "Class {} -- null instance; does the class have a Godot creator function?\n\
+            If used in the editor, make sure to use #[class(tool)].",
             std::any::type_name::<T>()
         );
     }
+}
+
+/// Panic emitted when `bind()` / `bind_mut()` is called on a placeholder instance (runtime class accessed in the editor).
+#[track_caller]
+pub(crate) fn panic_placeholder_bind<T>(method: &str) -> ! {
+    panic!(
+        "Gd::{method}() called on a placeholder instance of `{name}`.\n\
+        A non-tool class does not have a real instance in the editor.\n\
+        Use `#[class(tool)]`, or guard with `init::is_editor_hint()`.",
+        name = std::any::type_name::<T>(),
+    )
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------

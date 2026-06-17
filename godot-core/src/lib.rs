@@ -9,6 +9,7 @@
 //!
 //! Do not depend on this crate directly, instead use the `godot` crate.
 //! No SemVer or other guarantees are provided.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 // Note that a lot of those are public, but the godot crate still has the final say on what it wants to re-export.
 // Doing fine-grained visibility restrictions on every level is a useless maintenance chore.
@@ -27,6 +28,7 @@ pub mod init;
 pub mod meta;
 pub mod obj;
 pub mod registry;
+pub mod signal;
 pub mod task;
 pub mod tools;
 

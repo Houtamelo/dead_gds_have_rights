@@ -11,6 +11,7 @@ use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, LocalKey, ThreadId};
 
@@ -22,7 +23,8 @@ use crate::private::handle_panic;
 
 /// Create a new async background task.
 ///
-/// This function allows creating a new async task in which Godot signals can be awaited, like it is possible in GDScript. The
+/// This function allows creating a new async task in which Godot signals can be awaited, like it is possible in GDScript. If a reference to
+/// `Self` is not flexible enough regarding lifetimes, your function calling `spawn()` can capture the state in a `Gd<Self>` pointer instead. The
 /// [`TaskHandle`] that is returned provides synchronous introspection into the current state of the task.
 ///
 /// Signals can be converted to futures in the following ways:
@@ -34,15 +36,71 @@ use crate::private::handle_panic;
 ///
 /// [`Signal::to_future()`]: crate::builtin::Signal::to_future
 /// [`Signal::to_fallible_future()`]: crate::builtin::Signal::to_fallible_future
-/// [`TypedSignal::to_future()`]: crate::obj::signal::TypedSignal::to_future
-/// [`TypedSignal::to_fallible_future()`]: crate::obj::signal::TypedSignal::to_fallible_future
+/// [`TypedSignal::to_future()`]: crate::signal::TypedSignal::to_future
+/// [`TypedSignal::to_fallible_future()`]: crate::signal::TypedSignal::to_fallible_future
 ///
 /// # Panics
 /// If called from any other thread than the main thread.
 ///
-/// # Examples
-/// With typed signals:
+/// # Engine shutdown
+/// If the awaited signal's object is freed *before* the signal fires during engine teardown, the task does not resume: it stays suspended and is
+/// dropped when the runtime shuts down, without panicking. If the signal *does* fire (e.g. `tree_exiting`, emitted while the node is still alive),
+/// the task resumes as usual -- but by then the engine may have freed the node and any other captured `Gd<T>`, so accessing one follows the usual
+/// liveness rules (panic with safeguards, UB when disengaged).
 ///
+/// # Examples
+/// An example using timers:
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base=Node)]
+/// struct Game {
+///     base: Base<Node>,
+/// }
+///
+/// # // Trick to avoid adding SceneTreeTimer to minimal codegen. Return Gd<Game> -> timer.signals().timeout() resolves to Game's own signal.
+/// # trait Ct { fn create_timer(&self, duration: f64) -> Gd<Game>; }
+/// # impl Ct for Gd<godot::classes::SceneTree> { fn create_timer(&self, _d: f64) -> Gd<Game> { unreachable!() } }
+/// #[godot_api]
+/// impl Game {
+/// # fn do_something(&self) {}
+/// # #[signal] fn timeout();
+///     // Async sleep using Godot timers. Takes `Gd<Self>` by value, so no `&self`/`&mut self`
+///     // reference is held while the task is suspended at the await point.
+///     async fn sleep(this: Gd<Self>, duration: f64) {
+///         // To access object, use short-lived bind/bind_mut -> guard dropped after statement.
+///         this.bind().do_something();
+///
+///         // Godot APIs don't need to go through bind/bind_mut at all.
+///         let timer = this.get_tree().create_timer(duration);
+///
+///         // Await without holding any borrow on `this`. Keeping a bind()/bind_mut() guard
+///         // across an await point is problematic: while suspended, other access to the
+///         // object, for example through process(&mut self), will panic.
+///         timer.signals().timeout().to_future().await;
+///     }
+///
+///     fn show_messages(&mut self) {
+///         // Obtain Gd<Self>, since the closure cannot capture `&mut self` due to lifetimes.
+///         // If this method is linked to a signal, consider using a #[func(gd_self)] parameter.
+///         let this = self.to_gd();
+///
+///         // spawn() polls the future up to the first .await point, during which `&mut self` is
+///         // still held. base_mut() yields a guard that allows re-borrowing `self`, so the bind()
+///         // inside sleep() doesn't panic with "already bound".
+///         let _guard = self.base_mut();
+///
+///         godot::task::spawn(async move {
+///             godot_print!("Start!");
+///             Self::sleep(this, 1.0).await;
+///             godot_print!("One second later!");
+///         });
+///     }
+/// }
+/// ```
+///
+/// With typed signals:
 /// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
@@ -198,12 +256,71 @@ thread_local! {
 /// try to access engine resources, which leads to SEGFAULTs.
 pub(crate) fn cleanup() {
     ASYNC_RUNTIME.set(None);
+
+    // Reset the flag, so a subsequent re-initialization (e.g. hot-reload on Linux) starts in a clean state.
+    ENGINE_EXITING.store(false, Ordering::Relaxed);
+}
+
+static ENGINE_EXITING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn mark_engine_exiting() {
+    ENGINE_EXITING.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn is_engine_exiting() -> bool {
+    if ENGINE_EXITING.load(Ordering::Relaxed) {
+        return true;
+    }
+
+    // Godot < 4.5 has no `MainLoop` shutdown hook, so detect teardown heuristically: the `SceneTree`'s root window is freed during shutdown, but
+    // persists across scene changes otherwise.
+    #[cfg(before_api = "4.5")]
+    {
+        use crate::obj::Singleton as _;
+
+        match crate::classes::Engine::singleton().get_main_loop() {
+            // No main loop: the engine is shutting down (or has not started yet, in which case no signal future can be pending).
+            None => true,
+            Some(main_loop) => match main_loop.try_cast::<crate::classes::SceneTree>() {
+                Ok(tree) => tree.get_root().is_none(),
+                Err(_) => false,
+            },
+        }
+    }
+
+    #[cfg(since_api = "4.5")]
+    false
 }
 
 #[cfg(feature = "trace")]
-pub fn has_godot_task_panicked(task_handle: TaskHandle) -> bool {
-    ASYNC_RUNTIME.with_runtime(|rt| rt.panicked_tasks.contains(&task_handle.id))
+mod itest_only {
+    use super::*;
+
+    pub fn has_godot_task_panicked(task_handle: TaskHandle) -> bool {
+        ASYNC_RUNTIME.with_runtime(|rt| rt.panicked_tasks.contains(&task_handle.id))
+    }
+
+    /// Simulate engine teardown from integration tests, to test signal resolver's shutdown behavior.
+    ///
+    /// Sets the engine-exiting flag and restores it to `false` when the returned guard is dropped, so the flag never leaks into other tests
+    /// (even if the test panics).
+    #[must_use = "the engine-exiting flag is reset when the guard is dropped"]
+    pub fn simulate_engine_exiting() -> EngineExitingGuard {
+        ENGINE_EXITING.store(true, Ordering::Relaxed);
+        EngineExitingGuard { _private: () }
+    }
+
+    pub struct EngineExitingGuard {
+        _private: (), // needs field to be non-instantiable.
+    }
+    impl Drop for EngineExitingGuard {
+        fn drop(&mut self) {
+            ENGINE_EXITING.store(false, Ordering::Relaxed);
+        }
+    }
 }
+#[cfg(feature = "trace")]
+pub use itest_only::*;
 
 /// The current state of a future inside the async runtime.
 enum FutureSlotState<T> {
@@ -447,6 +564,11 @@ fn poll_future(godot_waker: Arc<GodotWaker>) {
     // thus any state that may not have been unwind-safe cannot be observed later.
     let mut future = AssertUnwindSafe(future);
 
+    // Snapshot the bind-guard count before polling. Any guards held by the caller of spawn() (not
+    // the future itself) are already counted here and must not be treated as a violation.
+    #[cfg(safeguards_strict)]
+    let bind_guard_baseline = await_point_read();
+
     let panic_result = handle_panic(error_context, move || {
         (future.as_mut().poll(&mut ctx), future)
     });
@@ -465,7 +587,22 @@ fn poll_future(godot_waker: Arc<GodotWaker>) {
     // Update the state of the Future in the runtime.
     ASYNC_RUNTIME.with_runtime_mut(|rt| match poll_result {
         // Future is still pending, so we park it again.
-        Poll::Pending => rt.park_task(godot_waker.runtime_index, future.0),
+        Poll::Pending => {
+            // A bind guard that outlives the suspension point will prevent any re-entrant access to
+            // the object (e.g. from process()), causing a panic or double-panic abort. Warn once so
+            // the developer sees it at the suspension site rather than at the conflicting access.
+            #[cfg(safeguards_strict)]
+            if await_point_read() > bind_guard_baseline {
+                crate::sys::defer_startup_warn!(
+                    once;
+                    id: "GdGuardAcrossAwait",
+                    "Guard from `Gd::bind()` or `Gd::bind_mut()` is held across an `.await` point in an async task.\n\
+                     While the task is suspended, the object can be re-entered (e.g. from `process()`), which panics.\n\
+                     Consider using Gd and binding on demand. See also `godot::task::spawn()` documentation.",
+                );
+            }
+            rt.park_task(godot_waker.runtime_index, future.0)
+        }
 
         // Future has resolved, so we remove it from the runtime.
         Poll::Ready(()) => rt.clear_task(godot_waker.runtime_index),
@@ -520,4 +657,33 @@ impl Wake for GodotWaker {
         // Schedule waker to poll the Future at the end of the frame.
         callable.call_deferred(&[]);
     }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Bind guard tracking for cross-await detection. No-op for safeguard level < strict.
+
+#[cfg(safeguards_strict)]
+thread_local! {
+    /// Counts live `GdRef`/`GdMut` bind guards on the current thread.
+    static AWAIT_POINT_GUARD_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the live bind-guard counter. Called from `GdRef`/`GdMut` constructors.
+pub(crate) fn await_point_inc() {
+    #[cfg(safeguards_strict)]
+    AWAIT_POINT_GUARD_COUNT.set(AWAIT_POINT_GUARD_COUNT.get() + 1);
+}
+
+/// Decrement the live bind-guard counter. Called from `GdRef`/`GdMut` `Drop` impls.
+pub(crate) fn await_point_dec() {
+    #[cfg(safeguards_strict)]
+    AWAIT_POINT_GUARD_COUNT.with(|c| {
+        debug_assert!(c.get() > 0, "bind guard count underflow");
+        c.set(c.get().saturating_sub(1));
+    });
+}
+
+#[cfg(safeguards_strict)]
+fn await_point_read() -> u32 {
+    AWAIT_POINT_GUARD_COUNT.get()
 }

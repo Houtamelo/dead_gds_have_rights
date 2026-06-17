@@ -26,7 +26,7 @@ env:
     godot
 
   # Used for integration test artifact, must be without patch version.
-  GODOT_ARTIFACT_VERSION: "4.5"
+  GODOT_ARTIFACT_VERSION: "4.6"
 
   # Note: used for test and clippy, not for publish. Test features are different from other CIs.
   CLIPPY_TEST_FEATURES: "--features godot/experimental-godot-api,godot/codegen-rustfmt,godot/serde"
@@ -47,11 +47,11 @@ defaults:
 
 jobs:
   validation:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       PUBLISHED_CRATE_VERSION: ${{ steps.parse-crate-version.outputs.PUBLISHED_CRATE_VERSION }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
 #      - name: "Parse crate version from Cargo.toml"
 #        id: parse-crate-version
@@ -112,10 +112,10 @@ jobs:
 
 
   rustfmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: validation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.ref }}
 
@@ -139,10 +139,10 @@ jobs:
 
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: validation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.ref }}
 
@@ -155,7 +155,7 @@ jobs:
 
 
   docs-and-commit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - validation
       - rustfmt
@@ -163,7 +163,7 @@ jobs:
     env:
       PUBLISHED_CRATE_VERSION: ${{ needs.validation.outputs.PUBLISHED_CRATE_VERSION }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: 'trigger-v${{ needs.validation.outputs.PUBLISHED_CRATE_VERSION }}'
 
@@ -210,12 +210,12 @@ jobs:
 
   # Keep all in sync with minimal-ci and full-ci.
   unit-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - validation # for outputs
       - docs-and-commit
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: 'v${{ needs.validation.outputs.PUBLISHED_CRATE_VERSION }}'
 
@@ -228,13 +228,13 @@ jobs:
 
   godot-itest:
     name: godot-itest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - validation # for outputs
       - docs-and-commit
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: 'v${{ needs.validation.outputs.PUBLISHED_CRATE_VERSION }}'
 
@@ -248,7 +248,7 @@ jobs:
 
 
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ github.event.inputs.skip-release != 'y' }}
     environment: 'Crates.io'
     needs:
@@ -258,7 +258,7 @@ jobs:
     steps:
       # Note: we cannot dry-run the publishing, since crates depend on each other, and dry-run will fail if they aren't yet on crates.io.
       # Sleep to leave crates.io and docs.rs some time to index the dependencies, before releasing dependents.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: 'v${{ needs.validation.outputs.PUBLISHED_CRATE_VERSION }}'
 

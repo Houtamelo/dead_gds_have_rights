@@ -12,8 +12,8 @@ use crate::builtin::GString;
 use crate::init::InitLevel;
 use crate::meta::ClassId;
 use crate::meta::inspect::EnumConstant;
-use crate::obj::signal::SignalObject;
-use crate::obj::{Base, BaseMut, BaseRef, Bounds, Gd, bounds};
+use crate::obj::{Base, BaseMut, BaseRef, BorrowedGd, Bounds, Gd, bounds};
+use crate::signal::SignalObject;
 use crate::storage::Storage;
 
 /// Makes `T` eligible to be managed by Godot and stored in [`Gd<T>`][crate::obj::Gd] pointers.
@@ -412,9 +412,7 @@ pub trait WithBaseField: GodotClass + Bounds<Declarer = bounds::DeclUser> {
     ///
     /// For this, use [`base_mut()`](WithBaseField::base_mut()) instead.
     fn base(&self) -> BaseRef<'_, Self> {
-        // SAFETY: lifetime is bound to self through BaseRef, ensuring the object remains valid.
-        let passive_gd = unsafe { self.base_field().constructed_passive() };
-        BaseRef::new(passive_gd, self)
+        BaseRef::new(self.base_field().constructed_borrowed())
     }
 
     /// Returns an exclusive reference guard, suitable for calling `&self`/`&mut self` engine methods on this object.
@@ -495,9 +493,9 @@ pub trait WithBaseField: GodotClass + Bounds<Declarer = bounds::DeclUser> {
     /// ```
     #[allow(clippy::let_unit_value)]
     fn base_mut(&mut self) -> BaseMut<'_, Self> {
-        // We need to construct this first, as the mut-borrow below will block all other access.
-        // SAFETY: lifetime is re-established at the bottom BaseMut construction, since return type of this fn has lifetime bound to instance.
-        let passive_gd = unsafe { self.base_field().constructed_passive() };
+        // We need to acquire this first, as the mut-borrow below will block all other access. A raw pointer (not a BorrowedGd tied to
+        // &self) is needed, since any shared borrow of self would conflict with that mut-borrow.
+        let base_ptr = self.base_field().constructed_obj_sys();
 
         let gd = self.to_gd();
 
@@ -519,8 +517,11 @@ pub trait WithBaseField: GodotClass + Bounds<Declarer = bounds::DeclUser> {
 
         let guard = storage.get_inaccessible(self);
 
-        // Narrows lifetime again from 'static to 'self.
-        BaseMut::new(passive_gd, guard)
+        // SAFETY: `base_ptr` is the base object of this instance, and BaseMut::new() unifies the BorrowedGd's lifetime with `guard`'s
+        // borrow of the instance -- which keeps the object alive for that entire lifetime.
+        let borrowed_gd = unsafe { BorrowedGd::from_obj_sys(base_ptr) };
+
+        BaseMut::new(borrowed_gd, guard)
     }
 
     /// Defers the given closure to run during [idle time](https://docs.godotengine.org/en/stable/classes/class_object.html#class-object-method-call-deferred).
@@ -607,7 +608,6 @@ pub trait WithUserSignals: WithSignals + WithBaseField {
     /// walkthrough.
     ///
     /// # Provided API
-    ///
     /// The returned collection provides a method for each signal, with the same name as the corresponding `#[signal]`.  \
     /// For example, if you have...
     /// ```ignore
@@ -629,8 +629,51 @@ pub trait WithUserSignals: WithSignals + WithBaseField {
     /// fn emit(amount: i32);
     /// ```
     ///
-    /// See [`TypedSignal`](crate::obj::signal::TypedSignal) for more information.
+    /// See [`TypedSignal`][crate::signal::TypedSignal] for more information.
     fn signals(&mut self) -> Self::SignalCollection<'_, Self>;
+}
+
+/// Implemented for user-defined classes with at least one `#[rpc]` declaration.
+///
+/// Allows accessing type-safe RPCs from within the class, as `self.rpcs()`. This requires a `Base<T>` field and a `Node`-derived class.
+/// To access RPCs from outside (given a `Gd` pointer), use [`Gd::rpcs()`] instead.
+// `Inherits<Node>` supertrait makes the up-casting to `Node` in the RPC implementation possible, and avoids repeating the bound in
+// generic user code. There is no scenario where user-defined RPCs can be used if the class isn't `Node`-based.
+pub trait WithUserRpcs: WithBaseField + Inherits<crate::classes::Node> {
+    /// The associated struct listing all RPCs of this class.
+    ///
+    /// `'c` denotes the lifetime during which the class instance is borrowed and its RPCs can be called.
+    type RpcCollection<'c>;
+
+    /// Access type-safe RPCs of the current object `self`.
+    ///
+    /// For classes that have at least one `#[rpc]` defined, returns a collection with one method per RPC. If you need to access RPCs from
+    /// outside (given a `Gd` pointer), use [`Gd::rpcs()`] instead.
+    ///
+    /// # Provided API
+    /// The returned collection provides a method for each RPC, with the same name as the corresponding `#[rpc]`.  \
+    /// For example, the following RPC:
+    ///
+    /// ```ignore
+    /// #[rpc]
+    /// fn say_hello_to(&mut self, to: String) {
+    ///     godot_print!("hello, {to}");
+    /// }
+    /// ```
+    ///
+    /// can be called with:
+    ///
+    /// ```ignore
+    /// my_node.rpcs().say_hello_to("world".to_string()).call();
+    /// my_node.rpcs().say_hello_to("world".to_string()).call_id(1); // call RPC on specific peer
+    /// ```
+    fn rpcs(&mut self) -> Self::RpcCollection<'_>;
+
+    /// Create from existing `Gd`, to enable [`Gd::rpcs()`].
+    ///
+    /// Only used for constructing from a concrete class, so `C = Self`. Takes by reference to retain the lifetime chain.
+    #[doc(hidden)]
+    fn __rpcs_from_external(external: &Gd<Self>) -> Self::RpcCollection<'_>;
 }
 
 /// Extension trait for all reference-counted classes.
@@ -678,7 +721,8 @@ pub trait Singleton: GodotClass {
     /// Returns the singleton instance.
     ///
     /// # Panics
-    /// If called during global init/deinit of godot-rust. Most singletons are only available after the first frame has run.
+    /// If called during global init/deinit of godot-rust, and the singleton in question is not yet available.
+    /// You can check this with [`init::is_singleton_available::<Self>()`][crate::init::is_singleton_available].
     /// See also [`ExtensionLibrary`](../init/trait.ExtensionLibrary.html#availability-of-godot-apis-during-init-and-deinit).
     fn singleton() -> Gd<Self>;
 }

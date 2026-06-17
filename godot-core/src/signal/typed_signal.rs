@@ -9,13 +9,12 @@ use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::DerefMut;
 
+use super::signal_receiver::{IndirectSignalReceiver, SignalReceiver};
 use super::{ConnectBuilder, ConnectHandle, SignalObject, make_callable_name, make_godot_fn};
 use crate::builtin::{Callable, CowStr, Variant};
 use crate::classes::object::ConnectFlags;
 use crate::meta;
 use crate::meta::{InParamTuple, ObjectToOwned, UniformObjectDeref};
-use crate::obj::signal::signal_connections_registry::store_signal_connection;
-use crate::obj::signal::signal_receiver::{IndirectSignalReceiver, SignalReceiver};
 use crate::obj::{Gd, GodotClass, WithSignals};
 
 /// Type-safe version of a Godot signal.
@@ -226,14 +225,13 @@ impl<'c, C: WithSignals, Ps: meta::ParamTuple> TypedSignal<'c, C, Ps> {
 
         let mut owned_object = self.object.to_owned_object();
         owned_object.with_object_mut(|obj| {
+            // `Object::connect*` now tracks the (always custom) callable in the hot-reload registry, so it is auto-disconnected before reload.
             if let Some(flags) = flags {
                 obj.connect_flags(signal_name, &callable, flags);
             } else {
                 obj.connect(signal_name, &callable);
             }
         });
-
-        store_signal_connection(&owned_object, &self.name, &callable);
 
         ConnectHandle::new(owned_object, self.name.clone(), callable)
     }
@@ -267,6 +265,9 @@ impl<C: WithSignals, Ps: InParamTuple + 'static> TypedSignal<'_, C, Ps> {
 
     /// Connect a method (member function) with `&mut self` as the first parameter.
     ///
+    /// The connection does not keep the object alive: if all other references are dropped, a `RefCounted` object is destroyed and the
+    /// connection is automatically disconnected (same behavior as GDScript method callables).
+    ///
     /// - To connect to methods on other objects, use [`connect_other()`][Self::connect_other].
     /// - If you need [`connect flags`](ConnectFlags) or cross-thread signals, use [`builder()`][Self::builder].
     pub fn connect_self<F, Declarer>(&self, mut function: F) -> ConnectHandle
@@ -275,8 +276,19 @@ impl<C: WithSignals, Ps: InParamTuple + 'static> TypedSignal<'_, C, Ps> {
         for<'c_rcv> IndirectSignalReceiver<'c_rcv, &'c_rcv mut C, Ps, F>: From<&'c_rcv mut F>,
         C: UniformObjectDeref<Declarer>,
     {
-        let mut gd = self.receiver_object();
+        // Weak capture (instance ID, not strong Gd) to avoid a reference cycle: object -> connection -> callable -> closure -> Gd -> object.
+        // Look up the object on each emission, matching Godot method-callable semantics.
+        let instance_id = self.receiver_object().instance_id();
         let godot_fn = make_godot_fn(move |args| {
+            // Lookup is infallible during normal and deferred emission (object alive by construction; dead deferred callables are skipped by
+            // Godot before reaching here). Only fails for a stale Callable clone invoked manually after the object died -> no-op, like Godot.
+            //
+            // Edge case: emission during object destruction (e.g. PREDELETE) -- ObjectDB lookup succeeds, but re-creating a Gd for a RefCounted
+            // at refcount 0 panics in maybe_init_ref(). Pre-existing limitation shared with Gd::from_instance_id().
+            let Ok(mut gd) = Gd::<C>::try_from_instance_id(instance_id) else {
+                return;
+            };
+
             let mut target = C::object_as_mut(&mut gd);
             let target_mut = target.deref_mut();
             IndirectSignalReceiver::from(&mut function)
@@ -296,6 +308,10 @@ impl<C: WithSignals, Ps: InParamTuple + 'static> TypedSignal<'_, C, Ps> {
     ///   [`WithBaseField`][crate::obj::WithBaseField] trait).
     /// ---
     ///
+    /// The connection keeps the receiver `object` alive: a `RefCounted` receiver lives at least as long as the emitter (or until
+    /// disconnected), even if all other references are dropped. Beware of reference cycles: if the receiver in turn stores a strong
+    /// reference back to the emitter, neither object is ever destroyed (memory leak).
+    ///
     /// - To connect to methods on the object that owns this signal, use [`connect_self()`][Self::connect_self].
     /// - If you need [`connect flags`](ConnectFlags) or cross-thread signals, use [`builder()`][Self::builder].
     pub fn connect_other<F, OtherC, Declarer>(
@@ -308,6 +324,9 @@ impl<C: WithSignals, Ps: InParamTuple + 'static> TypedSignal<'_, C, Ps> {
         for<'c_rcv> F: SignalReceiver<&'c_rcv mut OtherC, Ps> + 'static,
         for<'c_rcv> IndirectSignalReceiver<'c_rcv, &'c_rcv mut OtherC, Ps, F>: From<&'c_rcv mut F>,
     {
+        // Strong Gd capture (unlike connect_self), so the connection keeps the receiver alive: fire-and-forget receivers live as long as the
+        // emitter. Weak would silently drop a RefCounted receiver whose last reference falls out of scope after connecting. Diverges from
+        // GDScript (weak there); cost is a leak on receiver<->emitter cycles. connect_self uses weak since receiver == emitter is always such a cycle.
         let mut gd = object.object_to_owned();
 
         let godot_fn = make_godot_fn(move |args| {

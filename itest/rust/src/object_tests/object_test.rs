@@ -13,11 +13,14 @@ use std::rc::Rc;
 
 use godot::builtin::{Array, GString, StringName, Variant, Vector3};
 use godot::classes::{
-    Engine, FileAccess, IRefCounted, Node, Node2D, Node3D, Object, RefCounted, file_access,
+    Engine, FileAccess, IRefCounted, Node, Node2D, Node3D, Object, RefCounted, Resource,
+    file_access,
 };
 use godot::global::godot_str;
-use godot::meta::{FromGodot, GodotType, ToGodot};
-use godot::obj::{Base, Gd, Inherits, InstanceId, NewAlloc, NewGd, RawGd, Singleton};
+use godot::meta::{ClassId, FromGodot, GodotType, ToGodot};
+use godot::obj::{
+    Base, Gd, GodotClass as _, Inherits, InstanceId, NewAlloc, NewGd, RawGd, Singleton,
+};
 use godot::register::{GodotClass, godot_api};
 use godot::sys::{self, GodotFfi, interface_fn};
 
@@ -151,6 +154,77 @@ fn object_debug() {
 }
 
 #[itest]
+fn object_is_ref_counted() {
+    let refc_usr = Gd::from_object(RefcPayload { value: 8321 }).upcast::<Object>();
+    let refc_eng = Resource::new_gd().upcast::<Object>();
+    let man_usr = ObjPayload::new_alloc().upcast::<Object>();
+    let man_eng = Node3D::new_alloc().upcast::<Object>();
+
+    assert!(refc_usr.is_ref_counted());
+    assert!(refc_eng.is_ref_counted());
+    assert!(!man_usr.is_ref_counted());
+    assert!(!man_eng.is_ref_counted());
+
+    man_usr.free();
+    man_eng.free();
+}
+
+#[itest]
+fn object_dynamic_class() {
+    // Engine class: dynamic class matches static class.
+    let node = Node3D::new_alloc();
+    assert_eq!(node.dynamic_class(), Node3D::class_id());
+
+    // After upcast, dynamic class still reflects the actual type (not the static one).
+    let upcast = node.upcast::<Node>();
+    assert_eq!(upcast.dynamic_class(), Node3D::class_id());
+    assert_ne!(upcast.dynamic_class(), Node::class_id());
+
+    // User class: dynamic class is the user-declared name.
+    let user = ObjPayload::new_alloc().upcast::<Object>();
+    assert_eq!(user.dynamic_class(), ObjPayload::class_id());
+
+    node.free();
+    user.free();
+}
+
+#[itest]
+fn object_is_dynamic_class() {
+    let node = Node3D::new_alloc();
+
+    // Exact class + ancestors.
+    assert!(node.is_dynamic_class(Node3D::class_id()));
+    assert!(node.is_dynamic_class(Node::class_id()));
+    assert!(node.is_dynamic_class(Object::class_id()));
+
+    // Sibling / unrelated classes.
+    assert!(!node.is_dynamic_class(Node2D::class_id()));
+    assert!(!node.is_dynamic_class(Resource::class_id()));
+
+    // Dynamic class names (e.g. originating from GDScript / unknown-to-Rust classes).
+    assert!(node.is_dynamic_class(ClassId::new_dynamic("Node3D")));
+    assert!(!node.is_dynamic_class(ClassId::new_dynamic("NonExistentClass")));
+
+    node.free();
+}
+
+#[itest]
+fn object_is_dynamic_class_of() {
+    let node = Node3D::new_alloc();
+
+    // Exact class + ancestors.
+    assert!(node.is_dynamic_class_of::<Node3D>());
+    assert!(node.is_dynamic_class_of::<Node>());
+    assert!(node.is_dynamic_class_of::<Object>());
+
+    // Sibling / unrelated classes.
+    assert!(!node.is_dynamic_class_of::<Node2D>());
+    assert!(!node.is_dynamic_class_of::<Resource>());
+
+    node.free();
+}
+
+#[itest]
 fn object_instance_id() {
     let value: i16 = 17943;
     let user = RefcPayload { value };
@@ -181,6 +255,7 @@ fn object_instance_id_when_freed() {
 fn object_from_invalid_instance_id() {
     let id = InstanceId::try_from_i64(0xDEADBEEF).unwrap();
 
+    // TODO(v0.6): suppress "ERROR" print in API itself.
     Gd::<RefcPayload>::try_from_instance_id(id)
         .expect_err("invalid instance id should not return a valid object");
 }
@@ -479,6 +554,31 @@ fn check_convert_variant_refcount(obj: Gd<RefCounted>) {
 
     // `variant` destroyed -> decrement
     assert_eq!(obj.get_reference_count(), 1);
+}
+
+// Regression test for https://github.com/godot-rust/gdext/issues/1626. Class methods with static return type Object, but dynamic type
+// RefCounted need to be incremented by godot-rust.
+#[cfg(feature = "codegen-full")]
+#[itest]
+fn object_engine_get_object_but_dynamic_refcount() {
+    use godot::classes::Area2D;
+
+    let mut area = Area2D::new_alloc();
+
+    let owner = RefCounted::new_gd();
+    let owner_id = area.create_shape_owner(&owner);
+    let count_before = owner.get_reference_count();
+
+    // `shape_owner_get_owner()` returns `Gd<Object>`, but the instance is actually `RefCounted`.
+    let fetched: Gd<Object> = area
+        .shape_owner_get_owner(owner_id)
+        .expect("shape owner was just created");
+    assert_eq!(owner.get_reference_count(), count_before + 1);
+
+    drop(fetched);
+    area.free();
+
+    assert_eq!(owner.get_reference_count(), count_before);
 }
 
 #[itest]

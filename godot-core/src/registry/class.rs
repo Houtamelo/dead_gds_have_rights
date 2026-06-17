@@ -15,9 +15,9 @@ use crate::init::InitLevel;
 use crate::meta::ClassId;
 use crate::meta::error::FromGodotError;
 use crate::obj::{DynGd, Gd, GodotClass, Singleton, cap};
-use crate::private::{ClassPlugin, PluginItem};
+use crate::private::{ClassShard, ShardItem};
 use crate::registry::callbacks;
-use crate::registry::plugin::{DynTraitImpl, ErasedRegisterFn, ITraitImpl, InherentImpl, Struct};
+use crate::registry::shard::{DynTraitImpl, ErasedRegisterFn, ITraitImpl, InherentImpl, Struct};
 use crate::{godot_error, godot_warn, sys};
 
 /// Returns a lock to a global map of loaded classes, by initialization level.
@@ -45,6 +45,13 @@ fn global_loaded_classes_by_name() -> GlobalGuard<'static, HashMap<ClassId, Clas
     lock_or_panic(&LOADED_CLASSES_BY_NAME, "loaded classes (by name)")
 }
 
+/// Represents a class which is currently loaded and retained in memory -- including metadata.
+pub struct ClassMetadata {
+    // Only read on the legacy (feature-off) path via `is_class_tool`; under `upcoming-editor-placeholders` the field is set but unused.
+    #[cfg_attr(feature = "upcoming-editor-placeholders", allow(dead_code))]
+    pub is_tool: bool,
+}
+
 fn global_dyn_traits_by_typeid() -> GlobalGuard<'static, HashMap<any::TypeId, Vec<DynTraitImpl>>> {
     static DYN_TRAITS_BY_TYPEID: Global<HashMap<any::TypeId, Vec<DynTraitImpl>>> =
         Global::default();
@@ -63,10 +70,13 @@ pub struct LoadedClass {
     unregister_singleton_fn: Option<fn()>,
 }
 
-/// Represents a class which is currently loaded and retained in memory -- including metadata.
-//
-// Currently empty, but should already work for per-class queries.
-pub struct ClassMetadata {}
+/// Looks up whether a registered Rust class was declared with `#[class(tool)]`. Returns `None` for engine classes (not in our registry).
+#[cfg(not(feature = "upcoming-editor-placeholders"))]
+pub(crate) fn is_class_tool(class_id: ClassId) -> Option<bool> {
+    global_loaded_classes_by_name()
+        .get(&class_id)
+        .map(|m| m.is_tool)
+}
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -75,8 +85,10 @@ pub struct ClassMetadata {}
 type GodotCreationInfo = sys::GDExtensionClassCreationInfo2;
 #[cfg(all(since_api = "4.3", before_api = "4.4"))]
 type GodotCreationInfo = sys::GDExtensionClassCreationInfo3;
-#[cfg(since_api = "4.4")]
+#[cfg(all(since_api = "4.4", before_api = "4.7"))]
 type GodotCreationInfo = sys::GDExtensionClassCreationInfo4;
+#[cfg(since_api = "4.7")]
+type GodotCreationInfo = sys::GDExtensionClassCreationInfo6;
 
 #[cfg(before_api = "4.4")]
 pub(crate) type GodotGetVirtual = <sys::GDExtensionClassGetVirtual as sys::Inner>::FnPtr;
@@ -102,6 +114,7 @@ struct ClassRegistrationInfo {
     #[allow(dead_code)] // Currently unused; may be useful for diagnostics in the future.
     init_level: InitLevel,
     is_editor_plugin: bool,
+    is_tool: bool,
 
     /// One entry for each `dyn Trait` implemented (and registered) for this class.
     dynify_fns_by_trait: HashMap<any::TypeId, DynTraitImpl>,
@@ -111,18 +124,18 @@ struct ClassRegistrationInfo {
 }
 
 impl ClassRegistrationInfo {
-    fn validate_unique(&mut self, item: &PluginItem) {
+    fn validate_unique(&mut self, item: &ShardItem) {
         // We could use mem::Discriminant, but match will fail to compile when a new component is added.
 
         // Note: when changing this match, make sure the array has sufficient size.
         let index = match item {
-            PluginItem::Struct { .. } => 0,
-            PluginItem::InherentImpl(_) => 1,
-            PluginItem::ITraitImpl { .. } => 2,
+            ShardItem::Struct { .. } => 0,
+            ShardItem::InherentImpl(_) => 1,
+            ShardItem::ITraitImpl { .. } => 2,
 
             // Multiple dyn traits can be registered, thus don't validate for uniqueness.
             // (Still keep array size, so future additions don't have to regard this).
-            PluginItem::DynTraitImpl { .. } => return,
+            ShardItem::DynTraitImpl { .. } => return,
         };
 
         if self.component_already_filled[index] {
@@ -180,6 +193,7 @@ pub fn register_class<
         godot_params,
         init_level: T::INIT_LEVEL,
         is_editor_plugin: false,
+        is_tool: false,
         dynify_fns_by_trait: HashMap::new(),
         component_already_filled: Default::default(), // [false; N]
         register_singleton_fn: None,
@@ -187,7 +201,7 @@ pub fn register_class<
     });
 }
 
-/// Lets Godot know about all classes that have self-registered through the plugin system.
+/// Lets Godot know about all classes that have self-registered through the shard system.
 pub fn auto_register_classes(init_level: InitLevel) {
     out!("Auto-register classes at level `{init_level:?}`...");
 
@@ -197,13 +211,13 @@ pub fn auto_register_classes(init_level: InitLevel) {
     //
     let mut map = HashMap::<ClassId, ClassRegistrationInfo>::new();
 
-    crate::private::iterate_plugins(|elem: &ClassPlugin| {
-        // Filter per ClassPlugin and not PluginItem, because all components of all classes are mixed together in one huge list.
+    crate::private::iterate_shards(|elem: &ClassShard| {
+        // Filter per ClassShard and not ShardItem, because all components of all classes are mixed together in one huge list.
         if elem.init_level != init_level {
             return;
         }
 
-        //out!("* Plugin: {elem:#?}");
+        //out!("* Shard: {elem:#?}");
 
         let name = elem.class_name;
         let class_info = map
@@ -277,11 +291,13 @@ fn register_classes_and_dyn_traits(
             is_editor_plugin: info.is_editor_plugin,
             unregister_singleton_fn: info.unregister_singleton_fn,
         };
-        let metadata = ClassMetadata {};
+        let metadata = ClassMetadata {
+            is_tool: info.is_tool,
+        };
 
         // Transpose Class->Trait relations to Trait->Class relations.
         for (trait_type_id, mut dyn_trait_impl) in info.dynify_fns_by_trait.drain() {
-            // Note: Must be done after filling out the class info since plugins are being iterated in unspecified order.
+            // Note: Must be done after filling out the class info since shards are being iterated in unspecified order.
             dyn_trait_impl.parent_class_name = info.parent_class_name;
 
             dyn_traits_by_typeid
@@ -304,9 +320,17 @@ pub fn unregister_classes(init_level: InitLevel) {
     let mut loaded_classes_by_name = global_loaded_classes_by_name();
     // TODO clean up dyn traits
 
-    let loaded_classes_current_level = loaded_classes_by_level
+    let mut loaded_classes_current_level = loaded_classes_by_level
         .remove(&init_level)
         .unwrap_or_default();
+
+    // During unregistration, editor plugins are freed and run their lifecycle methods (for example the `exit_tree`).
+    // Since they might depend on other classes (for example `EditorDock` will always exist in tandem with the plugin), they MUST be
+    // unregistered first to avoid potential use-after-free (`EditorPlugin` tries to use some other, already unregistered class -> its
+    // user instance has been already freed -> UB).
+    if init_level == InitLevel::Editor {
+        loaded_classes_current_level.sort_by_key(|class| class.is_editor_plugin);
+    }
 
     out!("Unregister classes of level {init_level:?}...");
     for class in loaded_classes_current_level.into_iter().rev() {
@@ -417,13 +441,13 @@ where
 }
 
 /// Populate `c` with all the relevant data from `component` (depending on component type).
-fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
+fn fill_class_info(item: ShardItem, c: &mut ClassRegistrationInfo) {
     c.validate_unique(&item);
 
     // out!("|   reg (before):    {c:?}");
     // out!("|   comp:            {component:?}");
     match item {
-        PluginItem::Struct(Struct {
+        ShardItem::Struct(Struct {
             base_class_name,
             generated_create_fn,
             generated_recreate_fn,
@@ -443,6 +467,7 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             c.default_virtual_fn = default_get_virtual_fn;
             c.register_properties_fn = Some(register_properties_fn);
             c.is_editor_plugin = is_editor_plugin;
+            c.is_tool = is_tool;
             c.register_singleton_fn = register_singleton_fn;
             c.unregister_singleton_fn = unregister_singleton_fn;
 
@@ -482,14 +507,14 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
             }
         }
 
-        PluginItem::InherentImpl(InherentImpl {
+        ShardItem::InherentImpl(InherentImpl {
             register_methods_constants_fn,
             register_rpcs_fn: _,
         }) => {
             c.register_methods_constants_fn = Some(register_methods_constants_fn);
         }
 
-        PluginItem::ITraitImpl(ITraitImpl {
+        ShardItem::ITraitImpl(ITraitImpl {
             user_register_fn,
             user_create_fn,
             user_recreate_fn,
@@ -528,7 +553,7 @@ fn fill_class_info(item: PluginItem, c: &mut ClassRegistrationInfo) {
                 c.godot_params.validate_property_func = validate_property_fn;
             }
         }
-        PluginItem::DynTraitImpl(dyn_trait_impl) => {
+        ShardItem::DynTraitImpl(dyn_trait_impl) => {
             let type_id = dyn_trait_impl.dyn_trait_typeid();
 
             let prev = c.dynify_fns_by_trait.insert(type_id, dyn_trait_impl);
@@ -583,8 +608,11 @@ fn register_class_raw(mut info: ClassRegistrationInfo) {
         #[cfg(all(since_api = "4.3", before_api = "4.4"))]
         let register_fn = interface_fn!(classdb_register_extension_class3);
 
-        #[cfg(since_api = "4.4")]
+        #[cfg(all(since_api = "4.4", before_api = "4.7"))]
         let register_fn = interface_fn!(classdb_register_extension_class4);
+
+        #[cfg(since_api = "4.7")]
+        let register_fn = interface_fn!(classdb_register_extension_class6);
 
         let _: () = register_fn(
             sys::get_library(),
@@ -697,6 +725,7 @@ fn default_registration_info(class_name: ClassId) -> ClassRegistrationInfo {
         godot_params: default_creation_info(),
         init_level: InitLevel::Scene,
         is_editor_plugin: false,
+        is_tool: false,
         dynify_fns_by_trait: HashMap::new(),
         component_already_filled: Default::default(), // [false; N]
     }
@@ -759,11 +788,40 @@ fn default_creation_info() -> sys::GDExtensionClassCreationInfo3 {
     }
 }
 
-#[cfg(since_api = "4.4")]
+#[cfg(all(since_api = "4.4", before_api = "4.7"))]
 fn default_creation_info() -> sys::GDExtensionClassCreationInfo4 {
     sys::GDExtensionClassCreationInfo4 {
-        is_virtual: false as u8,
-        is_abstract: false as u8,
+        is_virtual: sys::conv::SYS_FALSE,
+        is_abstract: sys::conv::SYS_FALSE,
+        is_exposed: sys::conv::SYS_TRUE,
+        is_runtime: sys::conv::SYS_TRUE,
+        icon_path: ptr::null(),
+        set_func: None,
+        get_func: None,
+        get_property_list_func: None,
+        free_property_list_func: None,
+        property_can_revert_func: None,
+        property_get_revert_func: None,
+        validate_property_func: None,
+        notification_func: None,
+        to_string_func: None,
+        reference_func: None,
+        unreference_func: None,
+        create_instance_func: None,
+        free_instance_func: None,
+        recreate_instance_func: None,
+        get_virtual_func: None,
+        get_virtual_call_data_func: None,
+        call_virtual_with_data_func: None,
+        class_userdata: ptr::null_mut(),
+    }
+}
+
+#[cfg(since_api = "4.7")]
+fn default_creation_info() -> sys::GDExtensionClassCreationInfo6 {
+    sys::GDExtensionClassCreationInfo6 {
+        is_virtual: sys::conv::SYS_FALSE,
+        is_abstract: sys::conv::SYS_FALSE,
         is_exposed: sys::conv::SYS_TRUE,
         is_runtime: sys::conv::SYS_TRUE,
         icon_path: ptr::null(),

@@ -7,7 +7,7 @@
 
 use crate::builtin::{Callable, GString, NodePath, Signal, StringName, Variant};
 use crate::meta::sealed::Sealed;
-use crate::meta::traits::{Element, GodotFfiVariant, GodotNullableFfi, PackedElement};
+use crate::meta::traits::{Element, GodotFfiVariant, GodotNullableType, PackedElement};
 use crate::meta::{CowArg, EngineToGodot, FfiArg, GodotType, ObjectArg, ToGodot};
 use crate::obj::{DynGd, Gd, GodotClass, Inherits};
 
@@ -498,25 +498,6 @@ macro_rules! arg_into_owned {
     };
 }
 
-#[macro_export]
-macro_rules! declare_arg_method {
-    ($ ($docs:tt)+ ) => {
-        $( $docs )+
-        ///
-        /// # Generic bounds
-        /// The bounds are implementation-defined and may change at any time. Do not use this function in a generic context requiring `T`
-        /// -- use the `From` trait or [`AsArg`][crate::meta::AsArg] in that case.
-        pub fn arg<T>(&self) -> impl $crate::meta::AsArg<T> + use<T>
-        where
-            for<'a> T: From<&'a Self>
-                + $crate::meta::ToGodot
-                + 'a,
-        {
-            $crate::meta::CowArg::Owned(T::from(self))
-        }
-    };
-}
-
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // CowArg
 
@@ -580,15 +561,13 @@ pub trait ArgPassing: Sealed {
     #[doc(hidden)]
     fn ref_to_owned_via<T>(value: &T) -> T::Via
     where
-        T: EngineToGodot<Pass = Self>,
-        T::Via: Clone;
+        T: EngineToGodot<Pass = Self>;
 
     /// Convert to FFI repr in the most efficient way (move or borrow).
     #[doc(hidden)]
     fn ref_to_ffi<T>(value: &T) -> Self::FfiOutput<'_, T::Via>
     where
-        T: EngineToGodot<Pass = Self>,
-        T::Via: GodotType;
+        T: EngineToGodot<Pass = Self>;
 
     /// Convert to `Variant` in the most efficient way (move or borrow).
     #[doc(hidden)]
@@ -617,7 +596,6 @@ impl ArgPassing for ByValue {
     fn ref_to_owned_via<T>(value: &T) -> T::Via
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: Clone,
     {
         value.engine_to_godot()
     }
@@ -625,7 +603,6 @@ impl ArgPassing for ByValue {
     fn ref_to_ffi<T>(value: &T) -> Self::FfiOutput<'_, T::Via>
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: GodotType,
     {
         // For ByValue: engine_to_godot() returns owned T::Via, move directly to FFI.
         GodotType::into_ffi(value.engine_to_godot())
@@ -648,7 +625,6 @@ impl ArgPassing for ByRef {
     fn ref_to_owned_via<T>(value: &T) -> T::Via
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: Clone,
     {
         // For ByRef types, clone the reference to get owned value.
         value.engine_to_godot().clone()
@@ -657,7 +633,6 @@ impl ArgPassing for ByRef {
     fn ref_to_ffi<T>(value: &T) -> <T::Via as GodotType>::ToFfi<'_>
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: GodotType,
     {
         // Use by-ref conversion if possible, avoiding unnecessary clones when passing to FFI.
         GodotType::to_ffi(value.engine_to_godot())
@@ -683,7 +658,6 @@ impl ArgPassing for ByVariant {
     fn ref_to_owned_via<T>(value: &T) -> T::Via
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: Clone,
     {
         value.engine_to_godot().clone()
     }
@@ -691,7 +665,6 @@ impl ArgPassing for ByVariant {
     fn ref_to_ffi<T>(value: &T) -> <T::Via as GodotType>::ToFfi<'_>
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: GodotType,
     {
         GodotType::to_ffi(value.engine_to_godot())
     }
@@ -715,7 +688,6 @@ impl ArgPassing for ByObject {
     fn ref_to_owned_via<T>(value: &T) -> T::Via
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: Clone,
     {
         // For ByObject types, do like ByRef: clone the reference to get owned value.
         value.engine_to_godot().clone()
@@ -724,7 +696,6 @@ impl ArgPassing for ByObject {
     fn ref_to_ffi<T>(value: &T) -> ObjectArg<'_>
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: GodotType,
     {
         let obj_ref: &T::Via = value.engine_to_godot(); // implements GodotType.
         obj_ref.as_object_arg()
@@ -746,8 +717,7 @@ pub enum ByOption<Via> {
 impl<Via> Sealed for ByOption<Via> {}
 impl<Via> ArgPassing for ByOption<Via>
 where
-    Via: GodotType,
-    for<'f> Via::ToFfi<'f>: GodotNullableFfi,
+    Via: GodotNullableType,
 {
     type Output<'r, T: 'r>
         = Option<&'r Via>
@@ -764,7 +734,6 @@ where
     fn ref_to_owned_via<T>(value: &T) -> T::Via
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: Clone,
     {
         value.engine_to_godot_owned()
     }
@@ -772,11 +741,13 @@ where
     fn ref_to_ffi<T>(value: &T) -> Self::FfiOutput<'_, T::Via>
     where
         T: EngineToGodot<Pass = Self>,
-        T::Via: GodotType,
     {
         // Reuse pattern from impl GodotType for Option<T>:
         // Convert Option<&Via> to Option<Via::ToFfi> and then flatten to Via::ToFfi with null handling.
-        GodotNullableFfi::flatten_option(value.engine_to_godot().map(|via_ref| via_ref.to_ffi()))
+        value
+            .engine_to_godot()
+            .map(|via_ref| via_ref.to_ffi())
+            .unwrap_or_else(Via::ffi_null_ref)
     }
 }
 

@@ -11,8 +11,6 @@
 //!
 //! The user of these structs and functions must still ensure that multithreaded usage of the various pointers is safe.
 
-use std::sync::OnceLock;
-
 use super::GodotBinding;
 use crate::ManualInitCell;
 
@@ -85,25 +83,22 @@ impl BindingStorage {
         let storage = Self::storage();
         storage.binding.is_initialized()
     }
+
+    /// No-op in multi-threaded builds: with "experimental-threads", FFI access from any thread is permitted, so there is no main-thread
+    /// assertion to make. Exists for API parity with the single-threaded storage, which the shared `get_binding()` relies on.
+    #[inline(always)]
+    pub(super) fn ensure_main_thread() {}
 }
 
 pub struct GdextConfig {
     /// True if only `#[class(tool)]` classes are active in editor; false if all classes are.
     pub tool_only_in_editor: bool,
-
-    /// Whether the extension is loaded in an editor.
-    is_editor: OnceLock<bool>,
 }
 
 impl GdextConfig {
     pub fn new(tool_only_in_editor: bool) -> Self {
         Self {
             tool_only_in_editor,
-            is_editor: OnceLock::new(),
         }
-    }
-
-    pub fn is_editor_or_init(&self, is_editor: impl FnOnce() -> bool) -> bool {
-        *self.is_editor.get_or_init(is_editor)
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "godot-core"
-version = "0.4.4"
+version = "0.5.3"
 edition.workspace = true
 rust-version.workspace = true
 license = "MPL-2.0"
@@ -20,6 +20,8 @@ codegen-lazy-fptrs = [
     "godot-codegen/codegen-lazy-fptrs",
 ]
 double-precision = ["godot-codegen/double-precision"]
+# TODO(v0.6): remove this + downstream features; behavior becomes default.
+upcoming-editor-placeholders = []
 experimental-godot-api = ["godot-codegen/experimental-godot-api"]
 experimental-threads = ["godot-ffi/experimental-threads", "godot-codegen/experimental-threads"]
 experimental-wasm-nothreads = ["godot-ffi/experimental-wasm-nothreads"]
@@ -42,16 +44,16 @@ safeguards-dev-balanced = ["godot-ffi/safeguards-dev-balanced"]
 safeguards-release-disengaged = ["godot-ffi/safeguards-release-disengaged"]
 
 [dependencies]
-godot-ffi = { path = "../godot-ffi", version = "=0.4.4" }
+godot-ffi = { path = "../godot-ffi", version = "=0.5.3" }
 
 # See https://docs.rs/glam/latest/glam/index.html#feature-gates
 glam = { workspace = true }
 serde = { workspace = true, optional = true }
-godot-cell = { path = "../godot-cell", version = "=0.4.4" }
+godot-cell = { path = "../godot-cell", version = "=0.5.3" }
 
 [build-dependencies]
-godot-bindings = { path = "../godot-bindings", version = "=0.4.4" }
-godot-codegen = { path = "../godot-codegen", version = "=0.4.4" }
+godot-bindings = { path = "../godot-bindings", version = "=0.5.3" }
+godot-codegen = { path = "../godot-codegen", version = "=0.5.3" }
 
 # Reverse dev dependencies so doctests can use `godot::` prefix.
 [dev-dependencies]

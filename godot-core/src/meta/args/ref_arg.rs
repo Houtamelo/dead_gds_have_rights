@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use godot_ffi::{ExtVariantType, GodotFfi, GodotNullableFfi, PtrcallType};
+use godot_ffi::{ExtVariantType, GodotFfi, PtrcallType};
 
 use crate::builtin::Variant;
 use crate::meta::error::ConvertError;
@@ -22,7 +22,7 @@ use crate::sys;
 /// Private type. Cannot be `pub(crate)` because it's used in `#[doc(hidden)]` associate type `GodotType::ToFfi<'f>`, and `GodotType` is public.
 #[doc(hidden)]
 pub struct RefArg<'r, T> {
-    /// Only `None` if `T: GodotNullableFfi` and `T::is_null()` is true.
+    /// Only `None` for nullable types (`Option<Gd<...>>::None`).
     shared_ref: Option<&'r T>,
 }
 
@@ -34,6 +34,11 @@ impl<'r, T> RefArg<'r, T> {
         RefArg {
             shared_ref: Some(shared_ref),
         }
+    }
+
+    /// Creates a null `RefArg`, used for `Option<Gd<...>>::None`.
+    pub(crate) fn null_ref() -> Self {
+        RefArg { shared_ref: None }
     }
 
     // Note: the following APIs are not used by gdext itself, but exist for user convenience, since
@@ -48,15 +53,15 @@ impl<'r, T> RefArg<'r, T> {
         self.shared_ref.expect("RefArg is null")
     }
 
-    /// Returns the stored reference.
-    ///
-    /// Returns `None` if `T` is `Option<Gd<...>>::None`.
-    pub fn get_ref_or_none(&self) -> Option<&T>
+    /* Currently not needed, might be useful in future.
+    /// Returns the stored reference, or `None` if this represents a null object (`Option<Gd<...>>::None`).
+    pub(crate) fn get_ref_or_none(&self) -> Option<&T>
     where
-        T: GodotNullableFfi,
+        T: GodotNullableType,
     {
         self.shared_ref
     }
+    */
 
     /// Returns the stored reference.
     ///
@@ -104,10 +109,7 @@ where
         shared_ref.to_godot()
     }
 
-    fn to_godot_owned(&self) -> Self::Via
-    where
-        Self::Via: Clone,
-    {
+    fn to_godot_owned(&self) -> Self::Via {
         // Default implementation calls underlying T::to_godot().clone(), which is wrong.
         // Some to_godot_owned() calls are specialized/overridden, we need to honor that.
 
@@ -204,18 +206,5 @@ where
 
     fn ffi_from_variant(_variant: &Variant) -> Result<Self, ConvertError> {
         wrong_direction!(ffi_from_variant)
-    }
-}
-
-impl<T> GodotNullableFfi for RefArg<'_, T>
-where
-    T: GodotNullableFfi,
-{
-    fn null() -> Self {
-        RefArg { shared_ref: None }
-    }
-
-    fn is_null(&self) -> bool {
-        self.shared_ref.is_none_or(T::is_null)
     }
 }

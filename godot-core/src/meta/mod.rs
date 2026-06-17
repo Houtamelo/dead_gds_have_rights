@@ -55,6 +55,13 @@ mod uniform_object_deref;
 
 pub(crate) mod sealed;
 
+/// Re-exports for proc-macros and generated code. Not part of the public API.
+#[doc(hidden)]
+pub mod private_reexport {
+    pub use super::param_tuple::TupleFromGodot;
+    pub use super::signature::{CallContext, FuncReturn, Signature, ensure_func_bounds};
+}
+
 pub mod conv;
 pub mod error;
 pub mod inspect;
@@ -66,19 +73,28 @@ pub use args::*;
 pub use class_id::ClassId;
 pub use godot_convert::{EngineFromGodot, EngineToGodot, FromGodot, GodotConvert, ToGodot};
 pub use object_to_owned::ObjectToOwned;
-pub use param_tuple::{InParamTuple, OutParamTuple, ParamTuple, TupleFromGodot, varcall_arg};
+pub use param_tuple::{InParamTuple, OutParamTuple, ParamTuple, varcall_arg};
 pub use raw_ptr::{FfiRawPointer, RawPtr};
 #[cfg(feature = "trace")]
 pub use signature::trace;
-#[doc(hidden)]
-pub use signature::*;
 pub use signed_range::{SignedRange, wrapped};
 pub use traits::{Element, GodotImmutable, GodotType, PackedElement, element_variant_type};
-pub(crate) use traits::{ExtVariantType, GodotFfiVariant, GodotNullableFfi, ffi_variant_type};
+pub(crate) use traits::{ExtVariantType, GodotFfiVariant, ffi_variant_type};
 pub use uniform_object_deref::UniformObjectDeref;
 
-use crate::registry::method::MethodParamOrReturnInfo;
-pub use crate::{arg_into_owned, arg_into_ref, declare_arg_method, impl_godot_as_self};
+// Macro re-exports (used as `meta::arg_into_owned!` etc.).
+#[doc(hidden)]
+pub use crate::{arg_into_owned, arg_into_ref, impl_godot_as_self};
+
+// Crate-local re-exports. Done like this to prevent rustfmt from mixing with public export.
+mod reexport_crate {
+    pub(crate) use super::param_tuple::TupleFromGodot;
+    pub(crate) use super::signature::{CallContext, Signature, varcall_return_checked};
+    pub(crate) use super::traits::GodotNullableType;
+    // Private imports for this module only.
+    pub(super) use crate::registry::method::MethodParamOrReturnInfo;
+}
+pub(crate) use reexport_crate::*;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 

@@ -6,7 +6,7 @@
  */
 
 use proc_macro2::{Ident, TokenStream};
-use quote::quote;
+use quote::{TokenStreamExt, format_ident, quote};
 
 use crate::class::FuncDefinition;
 
@@ -62,7 +62,11 @@ impl TransferMode {
     }
 }
 
-pub fn make_rpc_registrations_fn(class_name: &Ident, funcs: &[FuncDefinition]) -> TokenStream {
+pub fn make_rpc_registrations(
+    class_name: &Ident,
+    funcs: &[FuncDefinition],
+    no_typed_rpcs: bool,
+) -> (TokenStream, Option<TokenStream>) {
     let rpc_registrations = funcs
         .iter()
         .filter_map(make_rpc_registration)
@@ -71,31 +75,48 @@ pub fn make_rpc_registrations_fn(class_name: &Ident, funcs: &[FuncDefinition]) -
     // This check is necessary because the class might not implement `WithBaseField` or `Inherits<Node>`,
     //   which means `to_gd` wouldn't exist or the trait bounds on `RpcConfig::register` wouldn't be satisfied.
     if rpc_registrations.is_empty() {
-        return TokenStream::new();
+        return (TokenStream::new(), None);
     }
 
-    quote! {
-        // Clippy complains about using `..RpcConfig::default()` if all fields are overridden.
-        #[allow(clippy::needless_update)]
-        fn __register_rpcs(object: &mut dyn ::std::any::Any) {
-            use ::std::any::Any;
-            use ::godot::register::RpcConfig;
-            use ::godot::classes::multiplayer_api::RpcMode;
-            use ::godot::classes::multiplayer_peer::TransferMode;
-            use ::godot::classes::Node;
-            use ::godot::obj::{WithBaseField, Gd};
+    (
+        if cfg!(feature = "codegen-full") {
+            quote! {
+                // Clippy complains about using `..RpcConfig::default()` if all fields are overridden.
+                #[allow(clippy::needless_update)]
+                fn __register_rpcs(object: &mut dyn ::std::any::Any) {
+                    use ::std::any::Any;
+                    use ::godot::register::RpcConfig;
+                    use ::godot::classes::multiplayer_api::RpcMode;
+                    use ::godot::classes::multiplayer_peer::TransferMode;
+                    use ::godot::classes::Node;
+                    use ::godot::obj::{WithBaseField, Gd};
 
-            let this = object
-                .downcast_ref::<#class_name>()
-                .expect("bad type erasure when registering RPCs");
+                    let this = object
+                        .downcast_ref::<#class_name>()
+                        .expect("bad type erasure when registering RPCs");
 
-            // Use fully-qualified syntax, so that error message isn't just "no method named `to_gd` found".
-            let mut gd = ::godot::obj::WithBaseField::to_gd(this);
+                    // Use fully-qualified syntax, so that error message isn't just "no method named `to_gd` found".
+                    let mut gd = ::godot::obj::WithBaseField::to_gd(this);
 
-            let node = gd.upcast_mut::<Node>();
-            #( #rpc_registrations )*
-        }
-    }
+                    let node = gd.upcast_mut::<Node>();
+                    #( #rpc_registrations )*
+                }
+            }
+        } else {
+            TokenStream::new()
+        },
+        if !no_typed_rpcs {
+            make_rpc_api(
+                class_name,
+                funcs
+                    .iter()
+                    .filter(|func| func.rpc_info.is_some())
+                    .collect(),
+            )
+        } else {
+            None
+        },
+    )
 }
 
 fn make_rpc_registration(func_def: &FuncDefinition) -> Option<TokenStream> {
@@ -160,4 +181,81 @@ fn make_rpc_registration(func_def: &FuncDefinition) -> Option<TokenStream> {
     };
 
     Some(registration)
+}
+
+// TODO(v0.7): cap per-RPC methods at the actual #[rpc] fn visibility instead of `pub(crate)`. Consider reusing `SignalVisibility` from
+// `signal.rs`; requires threading the fn's `vis_marker` into `FuncDefinition`. The collection struct must remain `pub` (it's the return
+// type of public `Gd::rpcs()`), only the generated methods are affected.
+pub fn make_rpc_api(class_name: &Ident, rpcs: Vec<&FuncDefinition>) -> Option<TokenStream> {
+    if rpcs.is_empty() {
+        return None;
+    }
+
+    let collection_name = format_ident!("__godot_Rpcs_{class_name}", span = class_name.span());
+
+    let mut collection_impl_methods = TokenStream::new();
+    for rpc in rpcs {
+        let rust_name = rpc.rust_ident();
+        let rpc_name = &rpc.godot_name();
+        let param_idents = &rpc.signature_info.param_idents;
+        let rpc_typed_args = param_idents
+            .iter()
+            .zip(&rpc.signature_info.param_types)
+            .map(|(param_name, param_type)| {
+                quote! {
+                    #param_name: impl ::godot::meta::AsArg<#param_type>
+                }
+            });
+
+        collection_impl_methods.append_all(quote! {
+            // `pub(crate)`, not `pub`: these are invoked through `.rpcs()` within the declaring crate, so crate visibility suffices. Keeping
+            // them out of `pub` avoids leaking one method per `#[rpc]` into the user's public API surface and downstream crates.
+            #[must_use]
+            pub(crate) fn #rust_name(self, #( #rpc_typed_args ),*) -> RpcBuilder<'c, #class_name> {
+                RpcBuilder::new(
+                    self.object,
+                    #rpc_name,
+                    vec![#( ::godot::meta::ToGodot::to_variant(&#param_idents.into_arg()) ),*],
+                )
+            }
+        });
+    }
+
+    let rpc_mod = format_ident!("__{class_name}_rpcs");
+    Some(quote! {
+        use #rpc_mod::*;
+
+        #[allow(non_camel_case_types)]
+        mod #rpc_mod {
+            use super::*;
+            use ::godot::obj::rpc::RpcBuilder;
+            use ::godot::private::UserRpcObject;
+
+            #[doc(hidden)]
+            pub struct #collection_name<'c> {
+                object: UserRpcObject<'c, #class_name>,
+            }
+
+            impl<'c> #collection_name<'c> {
+                #collection_impl_methods
+            }
+
+            impl ::godot::obj::WithUserRpcs for #class_name {
+                type RpcCollection<'c> = #collection_name<'c>;
+
+                fn rpcs(&mut self) -> Self::RpcCollection<'_> {
+                    #collection_name {
+                        object: UserRpcObject::Internal(self),
+                    }
+                }
+
+                #[doc(hidden)]
+                fn __rpcs_from_external(external: & ::godot::obj::Gd<Self>) -> Self::RpcCollection<'_> {
+                    #collection_name {
+                        object: UserRpcObject::External(external.clone()),
+                    }
+                }
+            }
+        }
+    })
 }

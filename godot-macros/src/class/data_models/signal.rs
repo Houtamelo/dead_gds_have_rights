@@ -23,6 +23,10 @@ pub struct SignalDefinition {
 
     /// Whether there is going to be a type-safe builder for this signal (true by default).
     pub has_builder: bool,
+
+    /// Whether to register with Godot using a `_`-prefixed name, hiding the signal from docs/autocomplete.
+    /// Consistent with `#[class(internal)]` naming.
+    pub is_internal: bool,
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -105,8 +109,8 @@ struct SignalDetails<'a> {
     param_tuple: TokenStream,
     /// `MySignal`
     signal_name: &'a Ident,
-    /// `"MySignal"`
-    signal_name_str: String,
+    /// `"_my_signal"` if `is_internal`, otherwise `"my_signal"`. Used for Godot registration and `TypedSignal::extract`.
+    godot_name_str: String,
     /// `#[cfg(..)] #[cfg(..)]`
     signal_cfg_attrs: Vec<&'a venial::Attribute>,
     /// `///` `#[doc = ...]`
@@ -124,6 +128,7 @@ impl<'a> SignalDetails<'a> {
         fn_signature: &'a venial::Function, // *Not* the original #[signal], just the signature part (no attributes, body, etc).
         class_name: &'a Ident,
         external_attributes: &'a [venial::Attribute],
+        is_internal: bool,
     ) -> ParseResult<SignalDetails<'a>> {
         let mut param_types = vec![];
         let mut param_names = vec![];
@@ -155,6 +160,12 @@ impl<'a> SignalDetails<'a> {
 
         let param_tuple = quote! { ( #( #param_types, )* ) };
         let signal_name = &fn_signature.name;
+        let rust_name_str = fn_signature.name.to_string();
+        let godot_name_str = if is_internal {
+            format!("_{rust_name_str}")
+        } else {
+            rust_name_str.clone()
+        };
         let individual_struct_name = format_ident!(
             "__godot_Signal_{class_name}_{signal_name}",
             span = signal_name.span()
@@ -177,7 +188,7 @@ impl<'a> SignalDetails<'a> {
             param_names_str,
             param_tuple,
             signal_name,
-            signal_name_str: fn_signature.name.to_string(),
+            godot_name_str,
             signal_cfg_attrs,
             signal_doc_attrs,
             individual_struct_name,
@@ -206,9 +217,11 @@ pub fn make_signal_registrations(
             fn_signature,
             external_attributes,
             has_builder,
+            is_internal,
         } = signal;
 
-        let details = SignalDetails::extract(fn_signature, class_name, external_attributes)?;
+        let details =
+            SignalDetails::extract(fn_signature, class_name, external_attributes, *is_internal)?;
 
         // Type-safe signal builder API, if available.
         if *has_builder {
@@ -216,7 +229,18 @@ pub fn make_signal_registrations(
             // max_visibility = max_visibility.max(details.vis_classified);
         }
 
-        let registration = make_signal_registration(&details, class_name_obj);
+        let mut registration = make_signal_registration(&details, class_name_obj);
+
+        // Warn if signal name starts with `_` but isn't declared as #[signal(internal)].
+        if !is_internal && details.godot_name_str.starts_with('_') {
+            let warning_fn = Ident::new("signal_underscore_prefix", fn_signature.name.span());
+
+            registration = quote! {
+                ::godot::__deprecated::emit_deprecated_warning!(#warning_fn);
+                #registration
+            };
+        }
+
         signal_registrations.push(registration);
     }
 
@@ -234,7 +258,7 @@ fn make_signal_registration(details: &SignalDetails, class_name_obj: &TokenStrea
         param_types,
         param_names,
         param_names_str,
-        signal_name_str,
+        godot_name_str,
         signal_cfg_attrs,
         ..
     } = details;
@@ -264,7 +288,7 @@ fn make_signal_registration(details: &SignalDetails, class_name_obj: &TokenStrea
             let mut parameters_info_sys: [sys::GDExtensionPropertyInfo; #signal_parameters_count] =
                 std::array::from_fn(|i| parameters_info[i].property_sys());
 
-            let signal_name = ::godot::builtin::StringName::from(#signal_name_str);
+            let signal_name = ::godot::builtin::StringName::from(#godot_name_str);
 
             sys::interface_fn!(classdb_register_extension_class_signal)(
                 sys::get_library(),
@@ -295,7 +319,7 @@ impl SignalCollection {
     fn extend_with(&mut self, details: &SignalDetails) {
         let SignalDetails {
             signal_name,
-            signal_name_str,
+            godot_name_str,
             signal_cfg_attrs,
             signal_doc_attrs,
             individual_struct_name,
@@ -314,7 +338,7 @@ impl SignalCollection {
             // visibility that exceeds the class visibility). So, we can as well declare the visibility here.
             #vis_marker fn #signal_name(&mut self) -> #individual_struct_name<'c, C> {
                 #individual_struct_name {
-                    __typed: ::godot::signal::TypedSignal::<'c, C, _>::extract(&mut self.__internal_obj, #signal_name_str)
+                    __typed: ::godot::signal::TypedSignal::<'c, C, _>::extract(&mut self.__internal_obj, #godot_name_str)
                 }
             }
         });

@@ -21,7 +21,7 @@ use crate::meta::{ArgPassing, GodotType, ToArg};
 /// [`GodotType`] is a stronger bound than [`GodotConvert`], since it expresses that a type is _directly_ representable
 /// in Godot (without intermediate "via"). Every `GodotType` also implements `GodotConvert` with `Via = Self`.
 ///
-/// Please read the [`godot::meta` module docs][crate::meta] for further information about conversions.
+/// Please read the [`godot::meta` module docs](index.html) for further information about conversions.
 ///
 /// # u64
 /// The type `u64` is **not** supported by `ToGodot` and `FromGodot` traits. You can thus not pass it in `#[func]` parameters/return types.
@@ -52,9 +52,18 @@ pub trait GodotConvert {
 ///
 /// Violating these assumptions is safe but will give unexpected results.
 ///
-/// Please read the [`godot::meta` module docs][crate::meta] for further information about conversions.
+/// Please read the [`godot::meta` module docs](index.html) for further information about conversions.
 ///
 /// This trait can be derived using the [`#[derive(GodotConvert)]`](../register/derive.GodotConvert.html) macro.
+///
+/// # `Result<T, E>`
+/// It is possible to return `Result<T, E>` from `#[func]`, when `T: ToGodot` and [`E: ErrorToGodot`][crate::meta::error::ErrorToGodot].
+/// However, `Result<T, E>` currently does not implement `ToGodot` itself, as it is not generally infallible.
+///
+/// # Panics
+/// Currently, the methods `to_godot()`, `to_godot_owned()` and `to_variant()` are infallible and never panic, i.e. you can convert every value
+/// to a Godot representation. If new types are supported in the future that may not satisfy this (example: `Result<T, E>`), it's possible
+/// that panics are introduced _only for those new types_.
 #[diagnostic::on_unimplemented(
     message = "passing type `{Self}` to Godot requires `ToGodot` trait, which is usually provided by the library",
     note = "ToGodot is implemented for built-in types (i32, Vector2, GString, …). For objects, use Gd<T> instead of T.",
@@ -90,18 +99,12 @@ pub trait ToGodot: Sized + GodotConvert {
     /// Converts this type to owned Godot representation.
     ///
     /// Always returns `Self::Via`, cloning if necessary for ByRef types.
-    // Future: could potentially split into separate ToGodotOwned trait, which has a blanket impl for T: Clone, while requiring
-    // manual implementation for non-Clone types. This would remove the Via: Clone bound, which can be restrictive.
-    fn to_godot_owned(&self) -> Self::Via
-    where
-        Self::Via: Clone,
-    {
+    fn to_godot_owned(&self) -> Self::Via {
         Self::Pass::ref_to_owned_via(self)
     }
 
     /// Converts this type to a [Variant].
-    // Exception safety: must not panic apart from exceptional circumstances (Nov 2024: only u64).
-    // This has invariant implications, e.g. in Array::resize().
+    // Exception safety: introducing a panic would have invariant implications, e.g. in Array::resize().
     fn to_variant(&self) -> Variant {
         Self::Pass::ref_to_variant(self)
     }
@@ -115,7 +118,7 @@ pub trait ToGodot: Sized + GodotConvert {
 ///
 /// Violating these assumptions is safe but will give unexpected results.
 ///
-/// Please read the [`godot::meta` module docs][crate::meta] for further information about conversions.
+/// Please read the [`godot::meta` module docs](index.html) for further information about conversions.
 ///
 /// This trait can be derived using the [`#[derive(GodotConvert)]`](../register/derive.GodotConvert.html) macro.
 #[diagnostic::on_unimplemented(
@@ -177,14 +180,37 @@ pub trait EngineToGodot: Sized + GodotConvert {
     fn engine_to_godot(&self) -> ToArg<'_, Self::Via, Self::Pass>;
 
     /// Converts this type to owned Godot representation.
-    fn engine_to_godot_owned(&self) -> Self::Via
-    where
-        Self::Via: Clone,
-    {
+    fn engine_to_godot_owned(&self) -> Self::Via {
         Self::Pass::ref_to_owned_via(self)
     }
 
     fn engine_to_variant(&self) -> Variant;
+
+    /// Consuming conversion to `Variant` for `#[func]` varcall return values. Relevant for `Result<T, E>`.
+    ///
+    /// Defaults to infallible [`Self::engine_to_variant()`] for types without `ToGodot` (e.g. `u64`). For `ToGodot` types,
+    /// the blanket impl delegates to [`ToGodot::__godot_try_into_variant()`].
+    //
+    // Could alternatively be avoided by splitting Signature in-call methods into `in_varcall`/`in_ptrcall` (EngineToGodot, for virtual
+    // methods + property accessors) and `in_func_varcall`/`in_func_ptrcall` (ToGodot, for #[func]). That avoids this trait method but
+    // duplicates more code in signature.rs and requires is_func plumbing in the macro. Trying this resulted in ~120 additional LoC.
+    fn engine_try_into_variant(
+        self,
+        _call_ctx: &crate::meta::CallContext,
+    ) -> Result<Variant, crate::meta::error::CallError> {
+        Ok(self.engine_to_variant())
+    }
+
+    /// Consuming conversion to the Godot `Via` type for `#[func]` ptrcall return values.
+    ///
+    /// Defaults to infallible [`Self::engine_to_godot_owned()`]. For `ToGodot` types,
+    /// the blanket impl delegates to [`ToGodot::__godot_try_into_godot_owned()`].
+    fn engine_try_into_godot_owned(
+        self,
+        _call_ctx: &crate::meta::CallContext,
+    ) -> Result<Self::Via, crate::meta::error::CallError> {
+        Ok(self.engine_to_godot_owned())
+    }
 }
 
 // Blanket implementations: all user-facing types work in engine contexts.
@@ -195,15 +221,26 @@ impl<T: ToGodot> EngineToGodot for T {
         <T as ToGodot>::to_godot(self)
     }
 
-    fn engine_to_godot_owned(&self) -> Self::Via
-    where
-        Self::Via: Clone,
-    {
+    fn engine_to_godot_owned(&self) -> Self::Via {
         <T as ToGodot>::to_godot_owned(self)
     }
 
     fn engine_to_variant(&self) -> Variant {
         <T as ToGodot>::to_variant(self)
+    }
+
+    fn engine_try_into_variant(
+        self,
+        _call_ctx: &crate::meta::CallContext,
+    ) -> Result<Variant, crate::meta::error::CallError> {
+        Ok(self.to_variant())
+    }
+
+    fn engine_try_into_godot_owned(
+        self,
+        _call_ctx: &crate::meta::CallContext,
+    ) -> Result<Self::Via, crate::meta::error::CallError> {
+        Ok(self.to_godot_owned())
     }
 }
 
@@ -286,5 +323,4 @@ macro_rules! impl_godot_as_self {
             }
         }
     };
-
 }

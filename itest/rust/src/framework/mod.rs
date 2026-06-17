@@ -21,29 +21,35 @@ pub use godot::test::{bench, itest};
 pub use runner::*;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
-// Plugin registration
+// Shard registration
 
 // Registers all the `#[itest]` tests and `#[bench]` benchmarks.
-sys::plugin_registry!(pub(crate) __GODOT_ITEST: RustTestCase);
-sys::plugin_registry!(pub(crate) __GODOT_ASYNC_ITEST: AsyncRustTestCase);
-sys::plugin_registry!(pub(crate) __GODOT_BENCH: RustBenchmark);
+sys::shard_registry!(pub(crate) __GODOT_ITEST: RustTestCase);
+sys::shard_registry!(pub(crate) __GODOT_ASYNC_ITEST: AsyncRustTestCase);
+sys::shard_registry!(pub(crate) __GODOT_BENCH: RustBenchmark);
 
 /// Finds all `#[itest]` tests.
 fn collect_rust_tests(filters: &[String]) -> (Vec<RustTestCase>, HashSet<&str>, bool) {
     let mut all_files = HashSet::new();
     let mut tests: Vec<RustTestCase> = vec![];
-    let mut is_focus_run = false;
+    let mut is_focused_run = false;
+    let in_editor = Engine::singleton().is_editor_hint();
 
-    sys::plugin_foreach!(__GODOT_ITEST; |test: &RustTestCase| {
+    sys::shard_foreach!(__GODOT_ITEST; |test: &RustTestCase| {
+        // Editor itests run only in editor; non-editor itests run only outside editor.
+        if test.editor_only != in_editor {
+            return;
+        }
+
         // First time a focused test is encountered, switch to "focused" mode and throw everything away.
-        if !is_focus_run && test.focused {
+        if !is_focused_run && test.focused {
             tests.clear();
             all_files.clear();
-            is_focus_run = true;
+            is_focused_run = true;
         }
 
         // Only collect tests if normal mode, or focus mode and test is focused.
-        if (!is_focus_run || test.focused) && passes_filter(filters, test.name) {
+        if (!is_focused_run || test.focused) && passes_filter(filters, test.name) {
             all_files.insert(test.file);
             tests.push(*test);
         }
@@ -52,28 +58,34 @@ fn collect_rust_tests(filters: &[String]) -> (Vec<RustTestCase>, HashSet<&str>, 
     // Sort alphabetically for deterministic run order
     tests.sort_by_key(|test| test.file);
 
-    (tests, all_files, is_focus_run)
+    (tests, all_files, is_focused_run)
 }
 
 /// Finds all `#[itest(async)]` tests.
 fn collect_async_rust_tests(
     filters: &[String],
-    sync_focus_run: bool,
+    sync_focused_run: bool,
 ) -> (Vec<AsyncRustTestCase>, HashSet<&str>, bool) {
     let mut all_files = HashSet::new();
     let mut tests = vec![];
-    let mut is_focus_run = sync_focus_run;
+    let mut is_focused_run = sync_focused_run;
+    let in_editor = Engine::singleton().is_editor_hint();
 
-    sys::plugin_foreach!(__GODOT_ASYNC_ITEST; |test: &AsyncRustTestCase| {
+    sys::shard_foreach!(__GODOT_ASYNC_ITEST; |test: &AsyncRustTestCase| {
+        // Editor itests run only in editor; non-editor itests run only outside editor.
+        if test.editor_only != in_editor {
+            return;
+        }
+
         // First time a focused test is encountered, switch to "focused" mode and throw everything away.
-        if !is_focus_run && test.focused {
+        if !is_focused_run && test.focused {
             tests.clear();
             all_files.clear();
-            is_focus_run = true;
+            is_focused_run = true;
         }
 
         // Only collect tests if normal mode, or focus mode and test is focused.
-        if (!is_focus_run || test.focused) && passes_filter(filters, test.name) {
+        if (!is_focused_run || test.focused) && passes_filter(filters, test.name) {
             all_files.insert(test.file);
             tests.push(*test);
         }
@@ -82,7 +94,7 @@ fn collect_async_rust_tests(
     // Sort alphabetically for deterministic run order
     tests.sort_by_key(|test| test.file);
 
-    (tests, all_files, is_focus_run)
+    (tests, all_files, is_focused_run)
 }
 
 /// Finds all `#[bench]` benchmarks.
@@ -90,7 +102,7 @@ fn collect_rust_benchmarks() -> (Vec<RustBenchmark>, usize) {
     let mut all_files = HashSet::new();
     let mut benchmarks: Vec<RustBenchmark> = vec![];
 
-    sys::plugin_foreach!(__GODOT_BENCH; |bench: &RustBenchmark| {
+    sys::shard_foreach!(__GODOT_BENCH; |bench: &RustBenchmark| {
         benchmarks.push(*bench);
         all_files.insert(bench.file);
     });
@@ -135,6 +147,11 @@ pub struct RustTestCase {
     pub skipped: bool,
     /// If one or more tests are focused, only they will be executed. Helpful for debugging and working on specific features.
     pub focused: bool,
+    /// Test only runs when the engine is in editor mode (`Engine::is_editor_hint() == true`).
+    ///
+    /// Used for testing behavior specific to the editor, e.g. placeholder substitution for runtime classes.
+    /// Editor-only tests are skipped in non-editor runs, and non-editor tests are skipped in editor runs.
+    pub editor_only: bool,
     #[allow(dead_code)]
     pub line: u32,
     pub function: fn(&TestContext),
@@ -147,6 +164,8 @@ pub struct AsyncRustTestCase {
     pub skipped: bool,
     /// If one or more tests are focused, only they will be executed. Helpful for debugging and working on specific features.
     pub focused: bool,
+    /// See [`RustTestCase::editor_only`].
+    pub editor_only: bool,
     #[allow(dead_code)]
     pub line: u32,
     pub function: fn(&TestContext) -> godot::task::TaskHandle,
@@ -178,7 +197,8 @@ pub fn suppress_panic_log<R>(callback: impl FnOnce() -> R) -> R {
     ));
 
     // Keep following lines.
-    let prev_print_level = godot::private::set_error_print_level(0);
+    let prev_print_level =
+        godot::private::set_error_print_level(godot::private::ErrorPrintLevel::Silent);
     let res = callback();
     godot::private::set_error_print_level(prev_print_level);
 
@@ -197,6 +217,16 @@ pub fn expect_panic(context: &str, code: impl FnOnce()) {
         panic.is_err(),
         "code should have panicked but did not: {context}",
     );
+}
+
+/// Like [`expect_panic()`], but additionally silences Godot's error prints during the panicking call.
+///
+/// Use when the panicking code path also emits Godot errors (e.g. FFI access checks, errors emitted during unwind drops) that would otherwise
+/// spam the test output. Prefer plain [`expect_panic()`] when no Godot errors are expected, to avoid accidentally swallowing unrelated errors.
+pub fn expect_panic_quiet(context: &str, code: impl FnOnce()) {
+    // Future: could wire this up with Logger class, intercept output and check for containing an "expected" string.
+    // This would make expected errors visible in tests, and catch changes on Godot side. Possibly some maintenance if Godot error changes.
+    suppress_godot_print(|| expect_panic(context, code));
 }
 
 /// Run for code that should panic in *strict* and *balanced* safeguard levels, but cause UB in *disengaged* level.
@@ -305,16 +335,13 @@ where
     }
 }
 
-/// Disable printing errors from Godot. Ideally we should catch and handle errors, ensuring they happen when
-/// expected. But that isn't possible, so for now we can just disable printing the error to avoid spamming
-/// the terminal when tests should error.
+/// Disable printing errors from Godot while running `f`, restoring afterwards (panic-safe via RAII).
 ///
-/// **Important:** Do not run this inside [`expect_panic()`], it will mute panic messages forever. Instead, make sure [`suppress_godot_print()`]
-/// is the outer function.
-pub fn suppress_godot_print(mut f: impl FnMut()) {
-    Engine::singleton().set_print_error_messages(false);
-    f();
-    Engine::singleton().set_print_error_messages(true);
+/// Ideally we should catch and handle errors, ensuring they happen when expected. But that isn't always possible,
+/// so for now we can just disable printing the error to avoid spamming the terminal when tests should error.
+pub fn suppress_godot_print<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = godot::global::suppress_godot_errors();
+    f()
 }
 
 /// Some tests are disabled, as they rely on Godot checks which are only available in Debug builds.

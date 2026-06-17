@@ -81,6 +81,8 @@ pub struct JsonClass {
     pub methods: Option<Vec<JsonClassMethod>>,
     // pub properties: Option<Vec<Property>>,
     pub signals: Option<Vec<JsonSignal>>,
+    // Not all extensions declare a description field.
+    pub description: Option<String>,
 }
 
 #[derive(DeJson)]
@@ -111,11 +113,11 @@ pub struct JsonBuiltinEnum {
 }
 
 impl JsonBuiltinEnum {
-    pub fn to_enum(&self) -> JsonEnum {
+    pub fn into_enum(self) -> JsonEnum {
         JsonEnum {
-            name: self.name.clone(),
+            name: self.name,
             is_bitfield: false,
-            values: self.values.clone(),
+            values: self.values,
         }
     }
 }
@@ -203,6 +205,7 @@ pub struct JsonUtilityFunction {
     pub is_vararg: bool,
     pub hash: i64,
     pub arguments: Option<Vec<JsonMethodArg>>,
+    pub description: Option<String>,
 }
 
 #[derive(DeJson)]
@@ -214,9 +217,10 @@ pub struct JsonBuiltinMethod {
     pub is_static: bool,
     pub hash: Option<i64>,
     pub arguments: Option<Vec<JsonMethodArg>>,
+    pub description: Option<String>,
 }
 
-#[derive(DeJson, Clone)]
+#[derive(DeJson)]
 pub struct JsonClassMethod {
     pub name: String,
     pub is_const: bool,
@@ -228,6 +232,7 @@ pub struct JsonClassMethod {
     pub hash: Option<i64>,
     pub return_value: Option<JsonMethodReturn>,
     pub arguments: Option<Vec<JsonMethodArg>>,
+    pub description: Option<String>,
 }
 
 // Example: set_point_weight_scale ->
@@ -268,7 +273,7 @@ pub fn load_extension_api(watch: &mut godot_bindings::StopWatch) -> JsonExtensio
     // Use type inference, so we can accept both String (dynamically resolved) and &str (prebuilt).
     // #[allow]: as_ref() acts as impl AsRef<str>, but with conditional compilation
 
-    let json = godot_bindings::load_gdextension_json(watch);
+    let json = godot_bindings::load_extension_api_json(watch);
     let json_str: &str = json.as_ref();
 
     let model: JsonExtensionApi =

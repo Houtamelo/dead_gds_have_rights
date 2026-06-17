@@ -29,14 +29,17 @@
 
 use std::borrow::Cow;
 
-use proc_macro2::Ident;
+use proc_macro2::{Ident, TokenStream};
+use quote::quote;
 
 use crate::Context;
 use crate::conv::to_enum_type_uncached;
+use crate::models::api_json::{
+    JsonBuiltinMethod, JsonClassMethod, JsonSignal, JsonUtilityFunction,
+};
 use crate::models::domain::{
     ClassCodegenLevel, Enum, EnumReplacements, RustTy, TyName, VirtualMethodPresence,
 };
-use crate::models::json::{JsonBuiltinMethod, JsonClassMethod, JsonSignal, JsonUtilityFunction};
 use crate::special_cases::codegen_special_cases;
 use crate::util::option_as_slice;
 
@@ -101,13 +104,17 @@ pub fn get_class_method_deprecation(class_name: &TyName, method: &JsonClassMetho
 
         _ => return None,
     };
-    
+
     Some(deprecation_msg)
 }
 
 pub fn is_class_deleted(class_name: &TyName) -> bool {
-    codegen_special_cases::is_class_excluded(&class_name.godot_ty)
-        || is_godot_type_deleted(&class_name.godot_ty)
+    is_class_deleted_str(&class_name.godot_ty)
+}
+
+pub fn is_class_deleted_str(godot_class_name: &str) -> bool {
+    codegen_special_cases::is_class_excluded(godot_class_name)
+        || is_godot_type_deleted(godot_class_name)
 }
 
 /// Native-struct types excluded in minimal codegen, because they hold codegen-excluded classes as fields.
@@ -132,7 +139,7 @@ pub fn get_native_struct_definition(struct_name: &str) -> Option<&'static str> {
 }
 
 #[rustfmt::skip]
-pub fn is_godot_type_deleted(godot_ty: &str) -> bool {
+pub(super) fn is_godot_type_deleted(godot_ty: &str) -> bool {
     // Note: parameter can be a class or builtin name, but also something like "enum::AESContext.Mode".
 
     // Exclude experimental APIs unless opted-in.
@@ -439,7 +446,7 @@ pub fn is_method_private(class_or_builtin_ty: &TyName, godot_method_name: &str) 
 ///
 /// See also [`get_class_method_enum_param_replacement()`] for a more automated approach specifically for enum parameters.
 #[rustfmt::skip]
-fn is_class_method_replaced_with_type_safe(class_ty: &TyName, godot_method_name: &str) -> bool {
+pub fn is_class_method_replaced_with_type_safe(class_ty: &TyName, godot_method_name: &str) -> bool {
     match (class_ty.godot_ty.as_str(), godot_method_name) {
         // Variant -> Option<Gd<Script>>
         | ("Object", "get_script")
@@ -771,7 +778,7 @@ pub fn is_class_method_const(class_name: &TyName, godot_method: &JsonClassMethod
         _ if !godot_method.is_const && !godot_method.is_static && !godot_method.is_virtual
             && ["get_", "is_", "has_"].iter().any(|p| godot_method.name.starts_with(p))
         => Some(true),
-        
+
         _ => None,
     }
 }
@@ -785,7 +792,7 @@ pub fn is_class_method_param_required(
     param: &Ident, // Don't use `&str` to avoid to_string() allocations for each check on call-site.
 ) -> bool {
     // Could possibly be unified with `meta=required` handling right at the JSON->domain mapping. Could then also apply to non-virtual fns.
-    
+
     // Note: for virtual methods, it's enough if a base class method is declared here; it will be picked up by derived classes.
 
     let param = param.to_string();
@@ -798,7 +805,7 @@ pub fn is_class_method_param_required(
         | ("Control", "_gui_input", "event")
 
         // https://docs.godotengine.org/en/stable/classes/class_collisionobject2d.html#class-collisionobject2d-private-method-input-event
-        | ("CollisionObject2D", "_input_event", "viewport" | "event") 
+        | ("CollisionObject2D", "_input_event", "viewport" | "event")
 
         // UI.
 
@@ -853,6 +860,28 @@ pub fn is_utility_function_deleted(function: &JsonUtilityFunction, ctx: &mut Con
     hardcoded || codegen_special_cases::is_utility_function_excluded(function, ctx)
 }
 
+/// Utility functions manually reviewed as thread-safe (callable from any thread).
+#[rustfmt::skip]
+pub fn is_utility_function_thread_safe(function: &JsonUtilityFunction) -> bool {
+    match function.name.as_str() {
+        // Print group -> Godot's `OS::print()` -> active logger. See print.rs for the per-backend C++ analysis.
+        | "print"
+        | "print_rich"
+        | "printerr"
+        | "printraw"
+        | "printt"
+        | "prints"
+        | "print_verbose"
+        | "push_error"
+        | "push_warning"
+        
+        // Pure Variant -> GString conversion, touches only caller-owned memory.
+        | "str"
+
+        => true, _ => false
+    }
+}
+
 #[rustfmt::skip]
 pub fn is_utility_function_private(function: &JsonUtilityFunction) -> bool {
     match function.name.as_str() {
@@ -905,26 +934,37 @@ pub fn maybe_rename_virtual_method<'m>(
 }
 
 // TODO method-level extra docs, for:
+// - Object::get_class() + is_class() -> point to Gd::dynamic_class() + is_dynamic_class().
 // - Node::rpc_config() -> link to RpcConfig.
 // - Node::process/physics_process -> mention `f32`/`f64` duality.
 // - Node::duplicate -> to copy #[var] fields, needs STORAGE property usage, or #[export],
 //   or #[export(storage)] which is #[export] without editor UI.
 
 pub fn get_class_extra_docs(class_name: &TyName) -> Option<&'static str> {
-    match class_name.godot_ty.as_str() {
-        "FileAccess" => Some(
-            "The godot-rust library provides a higher-level abstraction, which should be preferred: [`GFile`][crate::tools::GFile].",
-        ),
-        "ScriptExtension" => {
-            Some("Use this in combination with the [`obj::script` module][crate::obj::script].")
+    let docs = match class_name.godot_ty.as_str() {
+        "FileAccess" => {
+            "The godot-rust library provides a higher-level abstraction, which should be preferred: [`GFile`][crate::tools::GFile]."
         }
-        "ResourceFormatLoader" => Some(
+        "ScriptExtension" => {
+            "Use this in combination with the [`obj::script` module][crate::obj::script]."
+        }
+        "ResourceFormatLoader" => {
             "Enable the `experimental-threads` feature when using custom `ResourceFormatLoader`s. \
             Otherwise the application will panic when the custom `ResourceFormatLoader` is used by Godot \
-            in a thread other than the main thread.",
-        ),
-        _ => None,
-    }
+            in a thread other than the main thread."
+        }
+        "WeakRef" => {
+            "It's almost never a good idea to use this class. You can use instance IDs as _weak references_, and upgrade to strong references \
+            through [`Gd::try_from_instance_id()`](crate::obj::Gd::try_from_instance_id). This works for both manually-managed and ref-counted \
+            classes. You can even build your own generic `WeakRef<T>` wrapper around `InstanceId` and achieve better type-safety and performance \
+            than Godot's `WeakRef` class, which carries the whole object overhead instead of an `i64`.\n\n\
+            The only reason to use `WeakRef` is when you need to interact with a third-party API that does so. Godot itself doesn't use it in \
+            any API outside of [`global::weakref()`][crate::global::weakref]."
+        }
+        _ => return None,
+    };
+
+    Some(docs)
 }
 
 pub fn get_interface_extra_docs(trait_name: &str) -> Option<&'static str> {
@@ -935,6 +975,18 @@ pub fn get_interface_extra_docs(trait_name: &str) -> Option<&'static str> {
 
         _ => None,
     }
+}
+
+pub fn get_utility_fn_extra_docs(function_name: &str) -> Option<&'static str> {
+    let docs = match function_name {
+        "weakref" => {
+            "Use of `weakref()` is discouraged. See [`WeakRef`][crate::classes::WeakRef] for \
+            a detailed explanation and better alternatives."
+        }
+        _ => return None,
+    };
+
+    Some(docs)
 }
 
 #[cfg(before_api = "4.4")]
@@ -1182,7 +1234,7 @@ pub fn get_derived_virtual_method_presence(class_name: &TyName, godot_method_nam
 /// - **Scene level**: All singletons including `RenderingServer` are available.
 /// - **Editor level**: Editor-specific functionality is available.
 ///
-/// GDExtension singletons are generally not available during *any* level initialization, with the exception of a few core singletons 
+/// GDExtension singletons are generally not available during *any* level initialization, with the exception of a few core singletons
 /// (see above). This is different from how modules work, where servers are available at _Servers_ level.
 ///
 /// See also:
@@ -1217,7 +1269,7 @@ pub fn classify_codegen_level(class_name: &str) -> Option<ClassCodegenLevel> {
         | "PhysicsDirectBodyState2D" | "PhysicsDirectBodyState2DExtension" 
         | "PhysicsDirectSpaceState2D" | "PhysicsDirectSpaceState2DExtension" 
         | "PhysicsServer2D" | "PhysicsServer2DExtension" 
-        | "PhysicsServer2DManager" 
+        | "PhysicsServer2DManager"
         | "PhysicsDirectBodyState3D" | "PhysicsDirectBodyState3DExtension" 
         | "PhysicsDirectSpaceState3D" | "PhysicsDirectSpaceState3DExtension" 
         | "PhysicsServer3D" | "PhysicsServer3DExtension" 
@@ -1226,7 +1278,7 @@ pub fn classify_codegen_level(class_name: &str) -> Option<ClassCodegenLevel> {
         | "RenderData" | "RenderDataExtension"
         | "RenderSceneData" | "RenderSceneDataExtension"
         => ClassCodegenLevel::Servers,
-        
+
         // Declared final (un-inheritable) in Rust, but those are still servers.
         | "AudioServer" | "CameraServer" | "NavigationServer2D" | "NavigationServer3D" | "RenderingServer" | "TranslationServer" | "XRServer" | "DisplayServer"
         => ClassCodegenLevel::Servers,
@@ -1235,11 +1287,11 @@ pub fn classify_codegen_level(class_name: &str) -> Option<ClassCodegenLevel> {
         // https://github.com/godotengine/godot/issues/103867
         "OpenXRInteractionProfileEditorBase"
         | "OpenXRInteractionProfileEditor"
-        | "OpenXRBindingModifierEditor" if cfg!(before_api = "4.5") 
+        | "OpenXRBindingModifierEditor" if cfg!(before_api = "4.5")
         => ClassCodegenLevel::Editor,
-        
+
         // https://github.com/godotengine/godot/issues/86206
-        "ResourceImporterOggVorbis" | "ResourceImporterMP3" if cfg!(before_api = "4.3") 
+        "ResourceImporterOggVorbis" | "ResourceImporterMP3" if cfg!(before_api = "4.3")
         => ClassCodegenLevel::Editor,
 
         // No special-case override for this class.
@@ -1265,6 +1317,25 @@ pub fn is_enum_private(class_name: Option<&TyName>, enum_name: &str) -> bool {
         | (None, "MethodFlags")
 
         => true, _ => false
+    }
+}
+
+/// Returns the Rust module path of a global Godot enum as a string (instead of `crate::global`).
+pub fn get_global_enum_module_path(enum_name: &str) -> &'static str {
+    match enum_name {
+        "PropertyHint" | "PropertyUsageFlags" | "MethodFlags" => "crate::registry::info",
+        // Godot's JSON spells `VariantType` as `Variant.Type`; accept both since callers may pass either form.
+        "Corner" | "EulerOrder" | "Side" | "VariantType" | "Variant.Type" => "crate::builtin",
+        _ => "crate::global",
+    }
+}
+
+/// Returns the Rust module path of a global Godot enum (instead of `crate::global::EnumName`).
+pub fn get_global_enum_rust_path(enum_name: &str) -> TokenStream {
+    match get_global_enum_module_path(enum_name) {
+        "crate::registry::info" => quote! { crate::registry::info },
+        "crate::builtin" => quote! { crate::builtin },
+        _ => quote! { crate::global },
     }
 }
 
@@ -1304,7 +1375,7 @@ pub fn is_enum_bitfield(class_name: Option<&TyName>, enum_name: &str) -> Option<
         | (Some("GPUParticles2D"), "EmitFlags")
         | (Some("GPUParticles3D"), "EmitFlags")
         | (Some("Node"), "DuplicateFlags")
-        | (Some("Object"), "ConnectFlags")
+        | (Some("Object"), "ConnectFlags") // Fixed in Godot 4.7 (https://github.com/godotengine/godot/pull/109892).
         | (Some("SceneTree"), "GroupCallFlags")
         | (Some("TextEdit"), "SearchFlags")
 

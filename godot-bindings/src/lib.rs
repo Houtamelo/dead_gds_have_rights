@@ -18,8 +18,8 @@ pub use watch::StopWatch;
 
 mod import;
 
-// This is outside of `godot_version` to allow us to use it even when we don't have the `api-custom`
-// feature enabled.
+pub use import::{LATEST_API_VERSION, MIN_SUPPORTED_VERSION};
+
 #[derive(Eq, PartialEq, Debug)]
 pub struct GodotVersion {
     /// the original string (trimmed, stripped of text around)
@@ -38,11 +38,38 @@ pub struct GodotVersion {
     pub custom_rev: Option<String>,
 }
 
+#[cfg(any(feature = "api-custom", feature = "api-custom-json"))]
+impl GodotVersion {
+    pub(crate) fn validate_or_panic(self) -> Self {
+        let (min_major, min_minor) = MIN_SUPPORTED_VERSION;
+
+        assert_eq!(
+            self.major, min_major,
+            "Only Godot versions with major version 4 are supported; found version {}.",
+            self.full_string
+        );
+
+        assert!(
+            self.minor > min_minor,
+            "Godot 4.0 is no longer supported by godot-rust; found version {}.",
+            self.full_string
+        );
+
+        self
+    }
+
+    /// `True` if given godot version is newer than one included in the shipped prebuilt.
+    pub(crate) fn is_newer_than_latest(&self) -> bool {
+        let (_latest_major, latest_minor, _latest_patch): (u8, u8, u8) = LATEST_API_VERSION;
+
+        self.minor > latest_minor
+    }
+}
+
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Custom mode: Regenerate all files
 
-// This file is explicitly included in unit tests. Needs regex dependency.
-#[cfg(test)]
+#[cfg(all(test, feature = "api-custom"))]
 mod godot_version;
 
 #[cfg(feature = "api-custom")]
@@ -54,19 +81,13 @@ mod depend_on_custom {
 
     pub(crate) mod godot_exe;
     pub(crate) mod godot_version;
-    pub(crate) mod header_gen;
 
-    pub fn load_gdextension_json(watch: &mut StopWatch) -> Cow<'static, str> {
-        Cow::Owned(godot_exe::load_gdextension_json(watch))
+    pub fn load_extension_api_json(watch: &mut StopWatch) -> Cow<'static, str> {
+        Cow::Owned(godot_exe::load_extension_api_json(watch))
     }
 
-    pub fn write_gdextension_headers(h_path: &Path, rs_path: &Path, watch: &mut StopWatch) {
-        godot_exe::write_gdextension_headers(h_path, rs_path, false, watch);
-    }
-
-    #[cfg(feature = "api-custom-extheader")]
-    pub fn write_gdextension_headers_from_c(h_path: &Path, rs_path: &Path, watch: &mut StopWatch) {
-        godot_exe::write_gdextension_headers(h_path, rs_path, true, watch);
+    pub fn load_gdextension_interface_json(watch: &mut StopWatch) -> Cow<'static, str> {
+        godot_exe::load_gdextension_interface_json(watch)
     }
 
     pub(crate) fn get_godot_version() -> GodotVersion {
@@ -88,17 +109,15 @@ mod depend_on_custom_json {
     use super::*;
 
     pub(crate) mod godot_json;
-    pub(crate) mod godot_version;
-    pub(crate) mod header_gen;
 
-    pub fn load_gdextension_json(watch: &mut StopWatch) -> Cow<'static, str> {
-        let result = godot_json::load_custom_gdextension_json();
+    pub fn load_extension_api_json(watch: &mut StopWatch) -> Cow<'static, str> {
+        let result = godot_json::load_custom_extension_api_json();
         watch.record("read_api_custom_json");
         Cow::Owned(result)
     }
 
-    pub fn write_gdextension_headers(h_path: &Path, rs_path: &Path, watch: &mut StopWatch) {
-        godot_json::write_gdextension_headers(h_path, rs_path, watch);
+    pub fn load_gdextension_interface_json(watch: &mut StopWatch) -> Cow<'static, str> {
+        godot_json::load_gdextension_interface_json(watch)
     }
 
     pub(crate) fn get_godot_version() -> GodotVersion {
@@ -118,50 +137,14 @@ mod depend_on_prebuilt {
     use super::*;
     use crate::import::prebuilt;
 
-    pub fn load_gdextension_json(_watch: &mut StopWatch) -> std::borrow::Cow<'static, str> {
-        prebuilt::load_gdextension_json()
+    pub fn load_extension_api_json(_watch: &mut StopWatch) -> std::borrow::Cow<'static, str> {
+        prebuilt::load_extension_api_json()
     }
 
-    /// Determines the **target** (e.g. cross-compilation).
-    ///
-    /// The target is different from the host platform where the build is running. In build scripts, it needs to be evaluated at "runtime"
-    /// (aka. build execution time) via environment variables. Using `#[cfg(...)]` attributes would yield the host platform instead.
-    fn select_target_platform() -> prebuilt::TargetPlatform {
-        let target_os =
-            std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS must be set by Cargo");
-
-        match target_os.as_str() {
-            // Windows.
-            "windows" => prebuilt::TargetPlatform::Windows,
-
-            // MacOS, including iOS.
-            "ios" | "macos" => prebuilt::TargetPlatform::MacOS,
-
-            // Linux, including other Unix-like systems such as BSD and Android.
-            "android" | "dragonfly" | "freebsd" | "linux" | "netbsd" | "openbsd" => {
-                prebuilt::TargetPlatform::Linux
-            }
-
-            // WebAssembly: Godot requires Emscripten.
-            "emscripten" => prebuilt::TargetPlatform::Wasm,
-
-            // Others are currently unsupported. If needed, better to add explicit than accidental support.
-            other => panic!("Unsupported target OS `{other}`."),
-        }
-    }
-
-    pub fn write_gdextension_headers(h_path: &Path, rs_path: &Path, watch: &mut StopWatch) {
-        // Note: prebuilt artifacts just return a static str.
-        let h_contents = prebuilt::load_gdextension_header_h();
-        std::fs::write(h_path, h_contents.as_ref())
-            .unwrap_or_else(|e| panic!("failed to write gdextension_interface.h: {e}"));
-        watch.record("write_header_h");
-
-        let platform = select_target_platform();
-        let rs_contents = prebuilt::load_gdextension_header_rs_for_platform(platform);
-        std::fs::write(rs_path, rs_contents.as_ref())
-            .unwrap_or_else(|e| panic!("failed to write gdextension_interface.rs: {e}"));
-        watch.record("write_header_rs");
+    pub fn load_gdextension_interface_json(
+        _watch: &mut StopWatch,
+    ) -> std::borrow::Cow<'static, str> {
+        gdextension_api::load_gdextension_interface_json()
     }
 
     pub(crate) fn get_godot_version() -> GodotVersion {
@@ -295,6 +278,11 @@ pub fn before_api(major_minor: &str) -> bool {
 
 pub fn since_api(major_minor: &str) -> bool {
     !before_api(major_minor)
+}
+
+/// Configured Godot API minor version, usable from `build.rs`. Intended for itest stale-artifact detection.
+pub fn get_godot_minor_for_itest() -> u8 {
+    get_godot_version().minor
 }
 
 pub fn emit_safeguard_levels() {

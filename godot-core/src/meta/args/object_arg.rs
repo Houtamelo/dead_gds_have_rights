@@ -7,7 +7,7 @@
 
 use std::ptr;
 
-use godot_ffi::{ExtVariantType, GodotFfi, GodotNullableFfi, PtrcallType};
+use godot_ffi::{ExtVariantType, GodotFfi, PtrcallType};
 
 use crate::builtin::Variant;
 use crate::meta::error::ConvertError;
@@ -122,15 +122,5 @@ impl<'gd> GodotFfiVariant for ObjectArg<'gd> {
 
     fn ffi_from_variant(_variant: &Variant) -> Result<Self, ConvertError> {
         unreachable!("ObjectArg should only be passed *to* Godot, not *from*.")
-    }
-}
-
-impl<'gd> GodotNullableFfi for ObjectArg<'gd> {
-    fn null() -> Self {
-        Self::null()
-    }
-
-    fn is_null(&self) -> bool {
-        Self::is_null(self)
     }
 }

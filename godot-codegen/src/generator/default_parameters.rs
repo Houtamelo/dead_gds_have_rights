@@ -9,11 +9,12 @@ use functions_common as fns;
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 
-use crate::generator::functions_common;
+use crate::context::Context;
 use crate::generator::functions_common::{
-    FnArgExpr, FnCode, FnKind, FnParamDecl, make_arg_expr, make_param_or_field_type,
+    FnArgExpr, FnCode, FnKind, FnMeta, FnParamDecl, make_arg_expr, make_param_or_field_type,
 };
-use crate::models::domain::{FnParam, FnQualifier, Function, RustTy, TyName};
+use crate::generator::{functions_common, import_docs};
+use crate::models::domain::{ApiView, FnParam, FnQualifier, Function, RustTy, TyName};
 use crate::util::{ident, safe_ident};
 use crate::{conv, special_cases};
 
@@ -21,7 +22,9 @@ pub fn make_function_definition_with_defaults(
     sig: &dyn Function,
     code: &FnCode,
     full_fn_name: &Ident,
-    cfg_attributes: &TokenStream,
+    meta: &FnMeta,
+    view: &ApiView,
+    ctx: &Context,
 ) -> (TokenStream, TokenStream) {
     let (default_fn_params, required_fn_params): (Vec<_>, Vec<_>) = sig
         .params()
@@ -31,7 +34,8 @@ pub fn make_function_definition_with_defaults(
     let simple_fn_name = safe_ident(sig.name());
     let extended_fn_name = format_ident!("{}_ex", simple_fn_name);
     let default_parameter_usage = format!(
-        "To set the default parameters, use [`Self::{extended_fn_name}`] and its builder methods.  See [the book](https://godot-rust.github.io/book/godot-api/functions.html#default-parameters) for detailed usage instructions."
+        "To set the default parameters, use [`{extended_fn_name}`][Self::{extended_fn_name}] and its builder methods.  \
+        See [the book](https://godot-rust.github.io/book/godot-api/functions.html#default-parameters) for detailed usage instructions."
     );
     let vis = functions_common::make_vis(sig.is_private());
 
@@ -69,6 +73,13 @@ pub fn make_function_definition_with_defaults(
     let receiver_self = &code.receiver.self_prefix;
     let simple_receiver_param = &code.receiver.param;
     let extended_receiver_param = &code.receiver.param_lifetime_ex;
+    let cfg_attributes = &meta.cfg_attributes;
+    let maybe_specific_docs = &meta.specific_docs;
+
+    let mut maybe_godot_doc = TokenStream::new();
+    if let Some(doc) = import_docs::import_function_docs(sig, ctx, view) {
+        maybe_godot_doc = quote! { #[doc = #doc] };
+    }
 
     let builders = quote! {
         #[doc = #builder_doc]
@@ -114,7 +125,9 @@ pub fn make_function_definition_with_defaults(
         // Lifetime is set if any parameter is a reference.
         #maybe_deprecated
         #maybe_expect_deprecated
+        #maybe_specific_docs
         #[doc = #default_parameter_usage]
+        #maybe_godot_doc
         #[inline]
         #vis fn #simple_fn_name (
             #simple_receiver_param
@@ -128,6 +141,8 @@ pub fn make_function_definition_with_defaults(
         // _ex() function:
         // Lifetime is set if any parameter is a reference OR if the method is not static/global (and thus can refer to self).
         #maybe_deprecated
+        #maybe_specific_docs
+        #maybe_godot_doc
         #[inline]
         #vis fn #extended_fn_name<'ex> (
             #extended_receiver_param

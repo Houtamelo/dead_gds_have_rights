@@ -10,9 +10,12 @@ class_name GDScriptTestRunner
 
 func _ready():
 	# Don't run tests when opened in the editor, unless it's headless mode (-e --headless).
+	# When editor tests are run, we skip GDScript suites and benchmarks -- they aren't editor-specific.
+	var editor_only_run := false
 	if Engine.is_editor_hint():
 		if DisplayServer.get_name() == 'headless':
-			print("Opened itest in editor in headless mode -> run integration tests.")
+			print("Opened itest in editor in headless mode -> run editor integration tests.")
+			editor_only_run = true
 		else:
 			print("Opened itest in editor in UI mode -> skip integration tests.")
 			return
@@ -41,35 +44,30 @@ func _ready():
 
 	var rust_runner = IntegrationTests.new()
 
-	var gdscript_suites: Array = [
+	var gdscript_suites: Array = [] if editor_only_run else [
 		load("res://ManualFfiTests.gd").new(),
 		load("res://gen/GenFfiTests.gd").new(),
 		load("res://InheritTests.gd").new(),
 		load("res://ScriptInstanceTests.gd").new(),
-	]
-	
-	var gdscript_tests: Array = []
-	for suite in gdscript_suites:
-		for method in suite.get_method_list():
-			var method_name: String = method.name
-			if method_name.begins_with("test_"):
-				gdscript_tests.push_back(GDScriptExecutableTestCase.new(suite, method_name))
-
-	var special_case_test_suites: Array = [
 		load("res://SpecialTests.gd").new(),
 	]
 
-	for suite in special_case_test_suites:
+	var gdscript_focused_run := _has_focused_tests(gdscript_suites)
+	var prefix := "focus_test_" if gdscript_focused_run else "test_"
+
+	var gdscript_tests: Array = []
+	for suite in gdscript_suites:
 		for method in suite.get_method_list():
-			var method_name: String = method.name
-			if method_name.begins_with("test_"):
-				gdscript_tests.push_back(await suite.run_test(suite, method_name))
+			if method.name.begins_with(prefix):
+				# Always use `await` -- it does nothing on synchronous run_test() methods.
+				gdscript_tests.push_back(await suite.run_test(suite, method.name))
 
 	var property_tests = load("res://gen/GenPropertyTests.gd").new()
 
 	# Run benchmarks after all synchronous and asynchronous tests have completed.
+	# Skipped in editor-only mode -- benchmarks are not editor-specific.
 	var run_benchmarks = func (success: bool):
-		if success:
+		if success and not editor_only_run:
 			rust_runner.run_all_benchmarks(self)
 
 		var exit_code: int = 0 if success else 1
@@ -79,12 +77,20 @@ func _ready():
 		gdscript_tests,
 		gdscript_suites.size(),
 		allow_focus,
+		gdscript_focused_run,
 		self,
 		filters,
 		property_tests,
 		run_benchmarks
 	)
 
+
+func _has_focused_tests(suites: Array) -> bool:
+	for suite in suites:
+		for method in suite.get_method_list():
+			if method.name.begins_with("focus_test_"):
+				return true
+	return false
 
 
 class GDScriptTestCase:

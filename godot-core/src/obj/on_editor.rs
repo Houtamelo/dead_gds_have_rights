@@ -6,7 +6,7 @@
  */
 
 use crate::meta::shape::GodotShape;
-use crate::meta::{FromGodot, GodotConvert, GodotType};
+use crate::meta::{FromGodot, GodotConvert};
 use crate::registry::property::{BuiltinExport, Export, Var};
 
 /// Exported property that must be initialized in the editor (or associated code) before use.
@@ -346,7 +346,7 @@ impl<T> std::ops::DerefMut for OnEditor<T> {
 impl<T> GodotConvert for OnEditor<T>
 where
     T: GodotConvert,
-    T::Via: GodotType + BuiltinExport,
+    T::Via: BuiltinExport,
 {
     type Via = T::Via;
 

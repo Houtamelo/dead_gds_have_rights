@@ -10,13 +10,16 @@ use std::path::Path;
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
 
-use crate::generator::functions_common;
-use crate::generator::functions_common::{FnCode, FnReceiver};
-use crate::models::domain::{ExtensionApi, Function, UtilityFunction};
+use crate::context::Context;
+use crate::generator::functions_common::{FnCode, FnMeta, FnReceiver};
+use crate::generator::{docs, functions_common};
+use crate::models::domain::{ApiView, ExtensionApi, Function, UtilityFunction};
 use crate::{SubmitFn, util};
 
 pub(crate) fn generate_utilities_file(
     api: &ExtensionApi,
+    ctx: &Context,
+    view: &ApiView,
     gen_path: &Path,
     submit_fn: &mut SubmitFn,
 ) {
@@ -24,7 +27,7 @@ pub(crate) fn generate_utilities_file(
     let utility_fn_defs = api
         .utility_functions
         .iter()
-        .map(make_utility_function_definition);
+        .map(|fun| make_utility_function_definition(fun, view, ctx));
 
     let imports = util::make_imports();
 
@@ -41,12 +44,24 @@ pub(crate) fn make_utility_function_ptr_name(function: &dyn Function) -> Ident {
     function.name_ident()
 }
 
-pub(crate) fn make_utility_function_definition(function: &UtilityFunction) -> TokenStream {
+pub(crate) fn make_utility_function_definition(
+    function: &UtilityFunction,
+    view: &ApiView,
+    ctx: &Context,
+) -> TokenStream {
     let function_ident = make_utility_function_ptr_name(function);
     let function_name_str = function.name();
 
+    // Most utility functions access shared engine state and go through the main-thread-asserting accessor. Those that are manually approved as
+    // thread-safe use the thread-safe accessor instead, which doesn't panic.
+    let table = if function.is_thread_safe {
+        quote! { sys::utility_function_table_thread_safe() }
+    } else {
+        quote! { sys::utility_function_table() }
+    };
+
     let ptrcall_invocation = quote! {
-        let utility_fn = sys::utility_function_table().#function_ident;
+        let utility_fn = #table.#function_ident;
 
         Signature::<CallParams, CallRet>::out_utility_ptrcall(
             utility_fn,
@@ -56,7 +71,7 @@ pub(crate) fn make_utility_function_definition(function: &UtilityFunction) -> To
     };
 
     let varcall_invocation = quote! {
-        let utility_fn = sys::utility_function_table().#function_ident;
+        let utility_fn = #table.#function_ident;
 
         Signature::<CallParams, CallRet>::out_utility_ptrcall_varargs(
             utility_fn,
@@ -65,6 +80,10 @@ pub(crate) fn make_utility_function_definition(function: &UtilityFunction) -> To
             varargs
         )
     };
+
+    let extra_docs = docs::make_utility_fn_doc(function_name_str)
+        .map(|note| quote! { #[doc = #note] })
+        .unwrap_or_default();
 
     let definition = functions_common::make_function_definition(
         function,
@@ -75,7 +94,12 @@ pub(crate) fn make_utility_function_definition(function: &UtilityFunction) -> To
             is_virtual_required: false,
             is_varcall_fallible: false,
         },
-        &TokenStream::new(),
+        &FnMeta {
+            cfg_attributes: TokenStream::new(),
+            specific_docs: extra_docs,
+        },
+        view,
+        ctx,
     );
 
     // Utility functions have no builders.

@@ -14,7 +14,7 @@ pub use super::global::{
     godot_error, godot_print, godot_print_rich, godot_script_error, godot_warn,
 };
 pub use super::init::{ExtensionLibrary, InitLevel, InitStage, gdextension};
-pub use super::meta::error::ConvertError;
+pub use super::meta::error::{ConvertError, func_bail, strat};
 pub use super::meta::{FromGodot, GodotConvert, ToGodot};
 pub use super::obj::{
     AsDyn, Base, DynGd, DynGdMut, DynGdRef, Gd, GdMut, GdRef, GodotClass, Inherits, InstanceId,
@@ -37,6 +37,7 @@ mod trait_reexports {
     pub use crate::obj::WithBaseField as _; // base(), base_mut(), to_gd(), run_deferred(), run_deferred_gd()
     pub use crate::obj::WithSignals as _; // Gd::signals()
     pub use crate::obj::WithUserSignals as _; // self.signals()
+    pub use crate::obj::WithUserRpcs as _; // rpcs()
 }
 
 pub use trait_reexports::*;

@@ -8,8 +8,9 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 
-use crate::generator::default_parameters;
-use crate::models::domain::{ArgPassing, FnParam, FnQualifier, Function, RustTy};
+use crate::context::Context;
+use crate::generator::{default_parameters, import_docs};
+use crate::models::domain::{ApiView, ArgPassing, FnParam, FnQualifier, Function, RustTy};
 use crate::special_cases;
 use crate::util::lifetime;
 
@@ -45,6 +46,15 @@ pub struct FnCode {
     pub ptrcall_invocation: TokenStream,
     pub is_virtual_required: bool,
     pub is_varcall_fallible: bool,
+}
+
+/// Item-level decoration for generated functions: conditional compilation and manual doc additions.
+#[derive(Default)]
+pub struct FnMeta {
+    /// `#[cfg(...)]` attributes gating compilation of the function (and related builder items).
+    pub cfg_attributes: TokenStream,
+    /// Extra `#[doc = "..."]` attributes appended to the Godot-provided documentation. Empty if no additions.
+    pub specific_docs: TokenStream,
 }
 
 pub struct FnDefinition {
@@ -103,7 +113,10 @@ pub struct FnParamTokens {
 pub fn make_function_definition(
     sig: &dyn Function,
     code: &FnCode,
-    cfg_attributes: &TokenStream,
+    meta: &FnMeta,
+    // TODO(v0.6): Consider removing these two arguments, because they are only needed for importing docs.
+    view: &ApiView,
+    ctx: &Context,
 ) -> FnDefinition {
     let has_default_params = default_parameters::function_uses_default_params(sig);
     let vis = if has_default_params {
@@ -162,7 +175,9 @@ pub fn make_function_definition(
                 sig,
                 code,
                 &primary_fn_name,
-                cfg_attributes,
+                meta,
+                view,
+                ctx,
             );
     } else {
         primary_fn_name = rust_function_name.clone();
@@ -171,6 +186,20 @@ pub fn make_function_definition(
     };
 
     let (maybe_deprecated, _maybe_expect_deprecated) = make_deprecation_attribute(sig);
+    let maybe_specific_doc = &meta.specific_docs;
+
+    // If a sectioned doc precedes the Godot doc (`# Safety` from unsafe pointers, `# Specific notes for this function` from utility-fn extra
+    // docs), prefix the Godot doc with its own `# Godot docs` heading so the sections don't visually merge. Standalone, no heading.
+    let mut maybe_godot_doc = TokenStream::new();
+    if let Some(doc) = import_docs::import_function_docs(sig, ctx, view) {
+        let has_preceding_section = sig.common().is_unsafe || !meta.specific_docs.is_empty();
+        let doc = if has_preceding_section {
+            format!("\n# Godot docs\n{doc}")
+        } else {
+            doc
+        };
+        maybe_godot_doc = quote! { #[doc = #doc] };
+    }
 
     let call_sig_decl = {
         let return_ty = &sig.return_value().type_tokens();
@@ -194,6 +223,8 @@ pub fn make_function_definition(
 
         quote! {
             #maybe_deprecated
+            #maybe_specific_doc
+            #maybe_godot_doc
             #maybe_safety_doc
             #maybe_unsafe fn #primary_fn_name (
                 #receiver_param
@@ -210,6 +241,8 @@ pub fn make_function_definition(
         if !code.is_varcall_fallible {
             quote! {
                 #maybe_deprecated
+                #maybe_specific_doc
+                #maybe_godot_doc
                 #maybe_safety_doc
                 #vis #maybe_unsafe fn #primary_fn_name (
                     #receiver_param
@@ -240,6 +273,8 @@ pub fn make_function_definition(
 
             quote! {
                 #maybe_deprecated
+                #maybe_specific_doc
+                #maybe_godot_doc
                 /// # Panics
                 /// This is a _varcall_ method, meaning parameters and return values are passed as `Variant`.
                 /// It can detect call failures and will panic in such a case.
@@ -280,6 +315,8 @@ pub fn make_function_definition(
 
         quote! {
             #maybe_deprecated
+            #maybe_specific_doc
+            #maybe_godot_doc
             #maybe_safety_doc
             #vis #maybe_unsafe fn #primary_fn_name  (
                 #receiver_param

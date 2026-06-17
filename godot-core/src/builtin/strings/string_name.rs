@@ -10,7 +10,7 @@ use std::fmt;
 use godot_ffi as sys;
 use sys::{ExtVariantType, GodotFfi, ffi_methods};
 
-use crate::builtin::{Encoding, GString, NodePath, Variant, inner};
+use crate::builtin::{Encoding, GString, GodotStringExt, NodePath, Variant, inner};
 use crate::meta::AsArg;
 use crate::meta::error::StringError;
 use crate::{impl_shared_string_api, meta};
@@ -21,28 +21,29 @@ use crate::{impl_shared_string_api, meta};
 /// one instance of a given name exists.
 ///
 /// # Ordering
-///
 /// In Godot, `StringName`s are **not** ordered lexicographically, and the ordering relation is **not** stable across multiple runs of your
 /// application. Therefore, this type does not implement `PartialOrd` and `Ord`, as it would be very easy to introduce bugs by accidentally
 /// relying on lexicographical ordering.
 ///
 /// Instead, we provide [`transient_ord()`][Self::transient_ord] for ordering relations.
 ///
-/// # Null bytes
+/// # All string types + conversions
+/// | String type                                | Intended use case       | Encoding  | Convert to                                 |
+/// |--------------------------------------------|-------------------------|-----------|--------------------------------------------|
+/// | [`GString`][crate::builtin::GString]       | General purpose         | UTF-32    | [`to_gstring()`][Self::to_gstring]         |
+/// | **`StringName`**                           | Interned names          | UTF-32    | `to_string_name()`                         |
+/// | [`NodePath`][crate::builtin::NodePath]     | Scene-node paths        | segmented | [`to_node_path()`][Self::to_node_path]     |
+/// | `String`                                   | Owned, general purpose  | UTF-8     | [`to_string()`](#method.to_string)         |
+/// | `&str`                                     | Borrowed slice          | UTF-8     | _not supported_                            |
+/// | `&[char]`                                  | Borrowed slice (UTF-32) | UTF-32    | [`chars()`][Self::chars]                   |
 ///
+/// See also `StringName` constructors for more low-level conversions from `&[u8]` and `CStr`.
+///
+/// # Null bytes
 /// Note that Godot ignores any bytes after a null-byte. This means that for instance `"hello, world!"` and  \
 /// `"hello, world!\0 ignored by Godot"` will be treated as the same string if converted to a `StringName`.
 ///
-/// # All string types
-///
-/// | Intended use case | String type                                |
-/// |-------------------|--------------------------------------------|
-/// | General purpose   | [`GString`][crate::builtin::GString]       |
-/// | Interned names    | **`StringName`**                           |
-/// | Scene-node paths  | [`NodePath`][crate::builtin::NodePath]     |
-///
 /// # Godot docs
-///
 /// [`StringName` (stable)](https://docs.godotengine.org/en/stable/classes/class_stringname.html)
 // Currently we rely on `transparent` for `borrow_string_sys`.
 #[repr(transparent)]
@@ -83,7 +84,7 @@ impl StringName {
             let is_static = sys::conv::SYS_FALSE;
             let s = unsafe {
                 Self::new_with_string_uninit(|string_ptr| {
-                    let ctor = sys::interface_fn!(string_name_new_with_latin1_chars);
+                    let ctor = sys::thread_safe().string_name_new_with_latin1_chars;
                     ctor(
                         string_ptr,
                         cstr.as_ptr() as *const std::ffi::c_char,
@@ -283,7 +284,7 @@ impl StringName {
         // SAFETY: c_str is nul-terminated and remains valid for entire program duration.
         unsafe {
             Self::new_with_string_uninit(|ptr| {
-                sys::interface_fn!(string_name_new_with_latin1_chars)(
+                (sys::thread_safe().string_name_new_with_latin1_chars)(
                     ptr,
                     c_str.as_ptr(),
                     sys::conv::bool_to_sys(is_static),
@@ -310,8 +311,9 @@ unsafe impl GodotFfi for StringName {
 
 meta::impl_godot_as_self!(StringName: ByRef);
 
+// Thread-safe in the sense of Send (not Sync): a single `StringName` is only accessed from one thread at a time, but cloning yields another instance pointing at the same shared read-only buffer, so distinct instances on distinct threads are fine.
 impl_builtin_traits! {
-    for StringName {
+    thread_safe for StringName {
         Default => string_name_construct_default;
         Clone => string_name_construct_copy;
         Drop => string_name_destroy;
@@ -373,18 +375,7 @@ impl_rust_string_conv!(StringName);
 
 impl From<&str> for StringName {
     fn from(string: &str) -> Self {
-        let utf8 = string.as_bytes();
-
-        // SAFETY: Rust guarantees validity and range of string.
-        unsafe {
-            Self::new_with_string_uninit(|ptr| {
-                sys::interface_fn!(string_name_new_with_utf8_chars_and_len)(
-                    ptr,
-                    utf8.as_ptr() as *const std::ffi::c_char,
-                    utf8.len() as i64,
-                );
-            })
-        }
+        string.to_string_name()
     }
 }
 
@@ -395,15 +386,9 @@ impl From<&String> for StringName {
 }
 
 impl From<&GString> for StringName {
-    /// See also [`GString::to_string_name()`].
+    /// See also [`GodotStringExt::to_string_name()`].
     fn from(string: &GString) -> Self {
-        unsafe {
-            Self::new_with_uninit(|self_ptr| {
-                let ctor = sys::builtin_fn!(string_name_from_string);
-                let args = [string.sys()];
-                ctor(self_ptr, args.as_ptr());
-            })
-        }
+        string.to_string_name()
     }
 }
 
@@ -440,9 +425,8 @@ impl Ord for TransientStringNameOrd<'_> {
         // SAFETY: builtin operator provided by Godot.
         let op_less = |lhs, rhs| unsafe {
             let mut result = false;
-            sys::builtin_call! {
-                string_name_operator_less(lhs, rhs, result.sys_mut())
-            }
+            let lifecycle = sys::thread_safe_lifecycle();
+            (lifecycle.string_name_operator_less)(lhs, rhs, result.sys_mut());
             result
         };
 

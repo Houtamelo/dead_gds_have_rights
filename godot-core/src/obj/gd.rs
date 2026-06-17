@@ -15,10 +15,12 @@ use sys::{SysPtr as _, static_assert_eq_size_align};
 use crate::builtin::{Callable, NodePath, StringName, Variant};
 use crate::meta::error::{ConvertError, FromFfiError};
 use crate::meta::shape::GodotShape;
-use crate::meta::{AsArg, ClassId, Element, FromGodot, GodotConvert, GodotType, RefArg, ToGodot};
+use crate::meta::{
+    AsArg, ClassId, Element, FromGodot, GodotConvert, GodotNullableType, GodotType, RefArg, ToGodot,
+};
 use crate::obj::{
     Bounds, DynGd, GdDerefTarget, GdMut, GdRef, GodotClass, Inherits, InstanceId, OnEditor, RawGd,
-    WithBaseField, WithSignals, bounds, cap,
+    WithBaseField, WithSignals, WithUserRpcs, bounds, cap,
 };
 use crate::private::{PanicPayload, callbacks};
 use crate::registry::class::try_dynify_object;
@@ -89,7 +91,7 @@ use crate::{classes, meta, out};
 ///
 /// # Conversions
 ///
-/// For type conversions, please read the [`godot::meta` module docs][crate::meta].
+/// For type conversions, please read the [`godot::meta` module docs](../meta/index.html).
 ///
 /// # Exporting
 ///
@@ -160,7 +162,7 @@ where
         let object_ptr = callbacks::create_custom(init, true) // or propagate panic.
             .unwrap_or_else(|payload| PanicPayload::repanic(payload));
 
-        unsafe { Gd::from_obj_sys(object_ptr) }
+        unsafe { Gd::from_constructed_obj_sys(object_ptr) }
     }
 
     /// Moves a user-created object into this smart pointer, submitting ownership to the Godot engine.
@@ -184,6 +186,10 @@ where
     /// * If another `Gd` smart pointer pointing to the same Rust instance has a live `GdMut` guard bound.
     /// * If there is an ongoing function call from GDScript to Rust, which currently holds a `&mut T`
     ///   reference to the user instance. This can happen through re-entrancy (Rust -> GDScript -> Rust call).
+    /// * If the object is a **placeholder instance** -- i.e. it has no Rust instance attached. This can happen when a non-`#[class(tool)]`
+    ///   object is loaded or instantiated in the editor. Since Godot 4.3, non-tool classes are registered as "runtime classes", meaning
+    ///   the editor only creates a Godot-side placeholder without invoking the Rust constructor. If you need to `bind()` such an object
+    ///   in the editor (e.g. a loaded resource), mark its class as `#[class(tool)]`.
     // Note: possible names: write/read, hold/hold_mut, r/w, r/rw, ...
     pub fn bind(&self) -> GdRef<'_, T> {
         self.raw.bind()
@@ -202,8 +208,43 @@ where
     /// * If another `Gd` smart pointer pointing to the same Rust instance has a live `GdRef` or `GdMut` guard bound.
     /// * If there is an ongoing function call from GDScript to Rust, which currently holds a `&T` or `&mut T`
     ///   reference to the user instance. This can happen through re-entrancy (Rust -> GDScript -> Rust call).
+    /// * If the object is a placeholder instance with no Rust part. See [`bind()`][Self::bind] for details.
     pub fn bind_mut(&mut self) -> GdMut<'_, T> {
         self.raw.bind_mut()
+    }
+
+    /// Returns `true` if this object has no Rust instance attached (placeholder).
+    ///
+    /// In the Godot editor, classes that are not marked `#[class(tool)]` are replaced with _placeholder instances_ (Godot 4.3+ "runtime classes").
+    /// From Godot's perspective the instance still exists, so scenes and script code referring to it do not break, but the Rust side is absent.
+    ///
+    /// Specifically, the following logic is **disabled** for a placeholder:
+    /// * Rust-side objects. As a result, [`bind()`][Self::bind] and [`bind_mut()`][Self::bind_mut] panic on placeholders.
+    ///   Use this method to branch, or mark the class `#[class(tool)]` if editor-side Rust state is required.
+    /// * `init()` constructor -- *not* called on `new_alloc()` / `new_gd()` / `ClassDB.instantiate()` in the editor. However, Godot _does_
+    ///   invoke `init()` exactly once per class at editor startup, to populate its default-value cache.
+    /// * Custom property accessors (`#[var(get = ..., set = ...)]`, `IObject::get_property` / `set_property`). Placeholders keep their
+    ///   own property map: `set()` stores into it; `get()` returns the stored value or falls back to the class's default-value cache.
+    /// * Virtual callbacks (`ready`, `process`, `enter_tree`, `notification`, `on_property_get_revert`, ...) -- replaced with Godot-side stubs
+    ///   (e.g. `property_can_revert` always returns `false`, `property_get_revert` always returns nil). Rust overrides never run.
+    /// * `#[func]` methods -- callable through GDScript / `Callable`, but they `bind()` the receiver internally and will therefore panic.
+    /// * Signal connections wired up in `init()` or `ready()` -- since those methods don't run (except for one-time `init()` filling defaults).
+    ///
+    /// Note that only `#[export]` fields populate the default-value cache (their `PropertyUsageFlags` include the storage/editor bits).
+    /// `#[var]`-only fields do not, so placeholder `get()` returns `nil` for them rather than the value assigned in `init()`. `set()` on the
+    /// placeholder accepts both kinds and stores them, but cross-instance state is not shared.
+    ///
+    /// The following operations still work as usual on a placeholder:
+    /// * Holding the `Gd<T>` pointer, cloning it, comparing instance IDs, freeing it.
+    /// * Upcasts and downcasts -- the Godot class hierarchy is intact, and `Object::get_class()` reports the user-declared name (not internal
+    ///   `PlaceholderExtensionInstance`).
+    /// * `get`, `set`, `get_property_list()`, etc. However, they access the static map and don't route to Rust `IObject` virtual methods.
+    ///
+    /// On Godot versions before 4.3 placeholder substitution does not exist; non-tool classes are instead filtered out at registration when the
+    /// `tool_only_in_editor` config option is enabled (the default). This method then always returns `false`.
+    #[cfg(all(feature = "trace", feature = "upcoming-editor-placeholders"))]
+    pub fn is_editor_placeholder(&self) -> bool {
+        self.raw.storage().is_none()
     }
 }
 
@@ -286,13 +327,39 @@ impl<T: GodotClass> Gd<T> {
         self.raw.is_instance_valid()
     }
 
-    /// Returns the dynamic class name of the object as `StringName`.
+    /// Returns the dynamic type of the object as [`ClassId`].
     ///
-    /// This method retrieves the class name of the object at runtime, which can be different from [`T::class_id()`][GodotClass::class_id]
-    /// if derived classes are involved.
+    /// Retrieves the class name of the object at runtime, which can differ from [`T::class_id()`][GodotClass::class_id] if derived
+    /// classes are involved (e.g. a `Gd<Node>` whose dynamic type is `Sprite2D`, or a GDScript class inheriting `T`).
     ///
-    /// Unlike [`Object::get_class()`][crate::classes::Object::get_class], this returns `StringName` instead of `GString` and needs no
-    /// `Inherits<Object>` bound.
+    /// Unlike [`Object::get_class()`][crate::classes::Object::get_class], this needs no `Inherits<Object>` bound and returns a
+    /// comparable [`ClassId`] instead of `GString`.
+    ///
+    /// To test whether the dynamic class _inherits_ a given class (not just equals it), use [`is_dynamic_class()`][Self::is_dynamic_class] or
+    ///  [`is_dynamic_class_of()`][Self::is_dynamic_class_of].
+    pub fn dynamic_class(&self) -> ClassId {
+        ClassId::new_dynamic(self.dynamic_class_string().to_string())
+    }
+
+    /// Returns whether the dynamic type of the object is `class_id` or a subclass thereof.
+    ///
+    /// Corresponds to GDScript's `is_class()` / [`Object::is_class()`][crate::classes::Object::is_class], but accepts a typed [`ClassId`]
+    /// argument and needs no `Inherits<Object>` bound. See also [`is_dynamic_class_of()`][Self::is_dynamic_class_of] for compile-time.
+    ///
+    /// Note that `class_id` is matched by name only; this is a runtime check based on Godot's class hierarchy. For a strict equality
+    /// check against the dynamic class without walking the hierarchy, compare against [`dynamic_class()`][Self::dynamic_class] directly.
+    pub fn is_dynamic_class(&self, class_id: ClassId) -> bool {
+        self.raw.is_dynamic_class(class_id)
+    }
+
+    /// Returns whether the dynamic type of the object is `U` or a subclass thereof.
+    ///
+    /// See also [`is_dynamic_class()`][Self::is_dynamic_class] for runtime arguments, and [`cast()`][Self::cast]/
+    /// [`try_cast()`][Self::try_cast] for obtaining the result of this check.
+    pub fn is_dynamic_class_of<U: GodotClass>(&self) -> bool {
+        self.is_dynamic_class(U::class_id())
+    }
+
     pub(crate) fn dynamic_class_string(&self) -> StringName {
         unsafe {
             StringName::new_with_string_uninit(|ptr| {
@@ -528,6 +595,67 @@ impl<T: GodotClass> Gd<T> {
     where
         T: cap::GodotDefault,
     {
+        // Behavior of default instance creation -- see also https://github.com/godot-rust/gdext/issues/1404.
+        //
+        // With `upcoming-editor-placeholders` (future v0.6 default):
+        // * Editor: use ClassDB.instantiate() -> C++ instantiate_internal().
+        //   * Tool class    -> Godot creates instance regularly (extra Variant roundtrip, but editor usually not perf-critical).
+        //   * Runtime class -> Godot substitutes placeholder instance.
+        // * Runtime: directly invoke `create` callback.
+        //   * Any class     -> Godot creates instance regularly (optimized).
+        // * Unknown (for Godot < 4.4 && stage < Scene) -> behave like Runtime.
+        //   Editor/ClassDb::instantiate path would be correct in all cases, but ClassDB isn't available on all levels. Thus we can only do
+        //   the runtime path. It means that if runtime classes are constructed in level < Scene, they will not be placeholdered (rare case).
+        //
+        // Without the feature (v0.5-compatible default): editor branch is skipped; all states fall through to the direct `create` callback
+        // below, returning a real Rust instance even for non-tool classes in the editor. Migration warning below flags the v0.6 change.
+        #[cfg(feature = "upcoming-editor-placeholders")]
+        if sys::is_editor_or_unknown().unwrap_or(false) {
+            let class_name = T::class_id().to_string_name();
+
+            // Note: C API classdb_construct_object[2|3] calls C++ instantiate_no_placeholders(), which skips placeholder substitution.
+            // Instead we use ClassDB.instantiate() -> C++ _instantiate_internal().
+            use crate::obj::Singleton as _;
+            let variant = classes::ClassDb::singleton().instantiate(&class_name);
+            return variant.try_to::<Self>().unwrap_or_else(|_| {
+                panic!("ClassDB.instantiate({class_name}) failed -- class not registered or not instantiable")
+            });
+        }
+
+        // v0.6 migration: under the legacy path (no `upcoming-editor-placeholders`), `T::new_alloc()` / `T::new_gd()` returns a real Rust
+        // instance even for non-`#[class(tool)]` classes in the editor. In v0.6 this becomes a placeholder, silently losing Rust-side
+        // logic (init/ready/...). One warning per class id, then backtrace printed to stderr so user can locate caller.
+        #[cfg(not(feature = "upcoming-editor-placeholders"))]
+        let class_id = T::class_id();
+        #[cfg(not(feature = "upcoming-editor-placeholders"))]
+        if sys::is_editor_or_unknown().unwrap_or(false)
+            && crate::registry::class::is_class_tool(class_id) == Some(false)
+        {
+            use std::collections::HashSet;
+
+            // Persists for the process lifetime, including across hot reloads -- one warning per class per process, not per reload.
+            static WARNED: sys::Global<HashSet<ClassId>> = sys::Global::default();
+
+            let is_new = WARNED.lock().insert(class_id);
+            if is_new {
+                sys::defer_startup_warn!(
+                    id: "EditorPlaceholderV06",
+                    "godot-rust v0.6 will change editor behavior for non-`#[class(tool)]` runtime classes.\n\
+                    Class `{class_id}` creation in editor now returns real Rust instance; v0.6 will return a placeholder (details with RUST_BACKTRACE=1).\n\
+                    Opt in early via the `upcoming-editor-placeholders` feature, or mark the class as `#[class(tool)]` if it runs in the editor.",
+                );
+
+                // If RUST_BACKTRACE is set, print backtrace.
+                let bt = std::backtrace::Backtrace::capture();
+                if bt.status() == std::backtrace::BacktraceStatus::Captured {
+                    eprintln!(
+                        "Backtrace for `{class_id}` (v0.6 editor-placeholder migration):\n{bt}"
+                    );
+                }
+            }
+        }
+
+        // Fast path if not running in the editor: bypass substitution and directly call creation func.
         unsafe {
             // Default value (and compat one) for `p_notify_postinitialize` is true in Godot.
             #[cfg(since_api = "4.4")]
@@ -535,7 +663,7 @@ impl<T: GodotClass> Gd<T> {
             #[cfg(before_api = "4.4")]
             let object_ptr = callbacks::create::<T>(std::ptr::null_mut());
 
-            Gd::from_obj_sys(object_ptr)
+            Gd::from_constructed_obj_sys(object_ptr)
         }
     }
 
@@ -591,6 +719,32 @@ impl<T: GodotClass> Gd<T> {
         F: 'static + FnMut(&[&Variant]) -> R,
     {
         Callable::from_linked_fn(method_name, self, rust_function)
+    }
+
+    /// Used by caller to transform pointer of freshly created instance into `Gd<T>`. This is default in most initializations from FFI.
+    ///
+    /// Before 4.7 Godot (including GDExtension layer) returns not fully-initialized instance and initializing it is a caller
+    /// responsibility, which is done with [`Self::from_obj_sys`].
+    ///
+    /// After 4.7 Godot (and GDExtension layer too) returns fully-initialized instance to the caller, and [`Self::from_obj_sys_weak`]
+    /// is used instead.
+    ///
+    /// In other words, before 4.7 it was something along the lines of:
+    /// construct base -> do init/postinit -> CALLER initializes instance
+    ///
+    /// While afterwards we ended with:
+    /// construct initialized base -> do init/postinit -> CALLER receives initialized instance.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid object of this type.
+    pub(crate) unsafe fn from_constructed_obj_sys(ptr: sys::GDExtensionObjectPtr) -> Self {
+        #[cfg(before_api = "4.7")]
+        let obj = unsafe { Gd::<T>::from_obj_sys(ptr) };
+
+        #[cfg(since_api = "4.7")]
+        let obj = unsafe { Gd::<T>::from_obj_sys_weak(ptr) };
+
+        obj
     }
 
     pub(crate) unsafe fn from_obj_sys_or_none(
@@ -756,7 +910,8 @@ where
         let is_panic_unwind = std::thread::panicking();
         let error_or_panic = |msg: String| {
             if is_panic_unwind {
-                if crate::private::has_error_print_level(1) {
+                use crate::private::{ErrorPrintLevel, has_error_print_level};
+                if has_error_print_level(ErrorPrintLevel::Reduced) {
                     crate::godot_error!(
                         "Encountered 2nd panic in free() during panic unwind; will skip destruction:\n{msg}"
                     );
@@ -864,6 +1019,17 @@ where
     }
 }
 
+impl Gd<classes::Object> {
+    /// Whether the object inherits `RefCounted`.
+    ///
+    /// This is a very fast check that involves no FFI roundtrip.
+    ///
+    /// Implemented only on `Object` because for all other classes, this property is statically known.
+    pub fn is_ref_counted(&self) -> bool {
+        self.instance_id_unchecked().is_ref_counted()
+    }
+}
+
 impl<T> Gd<T>
 where
     T: GodotClass + Bounds<Declarer = bounds::DeclEngine>,
@@ -911,6 +1077,22 @@ where
     /// [`WithUserSignals::signals()`]: crate::obj::WithUserSignals::signals()
     pub fn signals(&self) -> T::SignalCollection<'_, T> {
         T::__signals_from_external(self)
+    }
+}
+
+impl<T> Gd<T>
+where
+    T: WithUserRpcs,
+{
+    /// Access type-safe RPCs of this object.
+    ///
+    /// For classes that have at least one `#[rpc]` defined, returns a collection with one method per RPC, allowing them to be called in a
+    /// type-safe way. This method is the equivalent of [`WithUserRpcs::rpcs()`][crate::obj::WithUserRpcs::rpcs], but when called externally
+    /// (not from `self`).
+    ///
+    /// When you are within the `impl` of a class, use `self.rpcs()` directly instead.
+    pub fn rpcs(&self) -> T::RpcCollection<'_> {
+        T::__rpcs_from_external(self)
     }
 }
 
@@ -1037,6 +1219,23 @@ impl<T: GodotClass> GodotType for Gd<T> {
 }
 
 impl<T: GodotClass> Element for Gd<T> {}
+
+impl<T: GodotClass> GodotNullableType for Gd<T> {
+    fn ffi_null() -> RawGd<T> {
+        RawGd::null()
+    }
+
+    fn ffi_null_ref<'f>() -> RefArg<'f, RawGd<T>>
+    where
+        Self: 'f,
+    {
+        RefArg::null_ref()
+    }
+
+    fn ffi_is_null(ffi: &RawGd<T>) -> bool {
+        ffi.is_null()
+    }
+}
 
 impl<T: GodotClass> Element for Option<Gd<T>> {}
 

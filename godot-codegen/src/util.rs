@@ -10,8 +10,8 @@
 use proc_macro2::{Ident, Literal, Punct, Spacing, TokenStream, TokenTree};
 use quote::{format_ident, quote};
 
+use crate::models::api_json::JsonClass;
 use crate::models::domain::ClassCodegenLevel;
-use crate::models::json::JsonClass;
 use crate::special_cases;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -25,7 +25,8 @@ pub fn make_imports() -> TokenStream {
     quote! {
         use godot_ffi as sys;
         use crate::builtin::*;
-        use crate::meta::{AsArg, ClassId, CowArg, InParamTuple, OutParamTuple, ParamTuple, RawPtr, RefArg, Signature};
+        use crate::meta::{AsArg, ClassId, CowArg, InParamTuple, OutParamTuple, ParamTuple, RawPtr, RefArg};
+        use crate::private::Signature;
         use crate::classes::native::*;
         use crate::classes::Object;
         use crate::obj::Gd;

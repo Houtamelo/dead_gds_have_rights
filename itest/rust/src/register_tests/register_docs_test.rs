@@ -158,23 +158,29 @@ pub struct FairlyDocumented {
     #[doc = r#"this is very documented"#]
     #[var]
     item: f32,
+
     #[doc = "@deprecated use on your own risk!!"]
     #[doc = ""]
     #[doc = "not to be confused with B!"]
     #[export]
     a: i32,
+
     /// Some docs…
     /// @experimental idk.
     #[export]
     b: i64,
+
     /// is it documented?
     #[var]
     item_2: i64,
+
     #[var]
     /// this docstring has < a special character
     item_xml: GString,
-    /// this isnt documented
+
+    /// this isn't documented
     _other_item: (),
+
     /// nor this
     base: Base<Node>,
 }
@@ -287,6 +293,10 @@ impl FairlyDocumented {
     #[signal]
     fn documented_signal(p: Vector3, w: f64, node: Gd<Node>);
 
+    /// Won't appear in editor, due to #[signal(internal)].
+    #[signal(internal)]
+    fn internal_signal(q: Vector2i);
+
     /// My signal
     ///
     /// @deprecated – use other_signal instead.
@@ -317,6 +327,37 @@ impl FairlyDocumented {
     /// Documented method in other godot_api secondary block
     #[func]
     fn tertiary_but_documented(&self, _smth: i64) {}
+}
+
+// Verify that #[signal] with a leading underscore emits a deprecation warning, unlike #[signal(internal)].
+// Keep the scope of #[expect(deprecated)] as small as possible to avoid masking real warnings. Test just below.
+#[expect(deprecated)]
+mod check_warnings {
+    use super::*;
+
+    #[derive(GodotClass)]
+    #[class(base=Object, init)]
+    struct UnderscoreSignal {
+        base: Base<Object>,
+    }
+
+    #[godot_api]
+    impl UnderscoreSignal {
+        /// Needs docs to show up in XML (the signal will appear in editor docs anyway, but without description otherwise).
+        #[signal]
+        fn _underscored(p: Vector2);
+    }
+}
+
+#[itest]
+fn test_underscore_signal_in_docs() {
+    let xml = find_class_docs("UnderscoreSignal");
+
+    // Don't do full XML file check, contains() is enough.
+    assert!(
+        xml.contains("<signal name=\"_underscored\">"),
+        "underscore signal should appear in docs XML:\n{xml}"
+    );
 }
 
 #[itest]

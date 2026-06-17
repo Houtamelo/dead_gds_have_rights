@@ -15,7 +15,7 @@ use crate::registry::info::ParamMetadata;
 
 // Re-export sys traits in this module, so all are in one place.
 #[rustfmt::skip] // Do not reorder.
-pub use sys::{ExtVariantType, GodotFfi, GodotNullableFfi};
+pub use sys::{ExtVariantType, GodotFfi};
 
 pub use crate::builtin::meta_reexport::PackedElement;
 
@@ -38,7 +38,7 @@ pub trait GodotFfiVariant: Sized + GodotFfi {
 // type. For instance [`i32`] does not implement `GodotFfi` because it cannot represent all values of
 // Godot's `int` type, however it does implement `GodotType` because we can set the meta-data of values with
 // this type to indicate that they are 32 bits large.
-pub trait GodotType: GodotConvert<Via = Self> + Sized + 'static
+pub trait GodotType: GodotConvert<Via = Self> + Clone + Sized + 'static
 // 'static is not technically required, but it simplifies a few things (limits e.g. `ObjectArg`).
 {
     // Value type for this type's FFI representation.
@@ -88,7 +88,7 @@ pub trait GodotType: GodotConvert<Via = Self> + Sized + 'static
     ///
     /// Returning false only means that this is not a special case, not that it cannot be `None`. Regular checks are expected to run afterward.
     ///
-    /// This exists only for var-calls and serves a similar purpose as `GodotNullableFfi::is_null()` (although that handles general cases).
+    /// This exists only for var-calls and serves a similar purpose as `GodotNullableType::ffi_is_null()` (although that handles general cases).
     #[doc(hidden)]
     fn qualifies_as_special_none(_from_variant: &Variant) -> bool {
         false
@@ -109,6 +109,30 @@ pub trait GodotType: GodotConvert<Via = Self> + Sized + 'static
             std::any::type_name::<Self>()
         )
     }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+/// Types representing nullable Godot objects (e.g., `Gd<T>`, `DynGd<T, D>`).
+///
+/// This trait enables blanket implementations for [`Option<T>`] across conversions and argument passing,
+/// without exposing internal FFI details in public where-clause bounds.
+///
+/// Implemented for `Gd<T>` directly. `DynGd<T, D>` benefits through `Via = Gd<T>`.
+pub(crate) trait GodotNullableType: GodotType {
+    /// Creates a null FFI owned value.
+    #[doc(hidden)]
+    fn ffi_null() -> Self::Ffi;
+
+    /// Creates a null borrowed FFI value.
+    #[doc(hidden)]
+    fn ffi_null_ref<'f>() -> Self::ToFfi<'f>
+    where
+        Self: 'f;
+
+    /// Checks whether an FFI value represents null.
+    #[doc(hidden)]
+    fn ffi_is_null(ffi: &Self::Ffi) -> bool;
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------

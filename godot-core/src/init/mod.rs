@@ -11,20 +11,77 @@ use godot_ffi as sys;
 use sys::GodotFfi;
 
 use crate::builtin::{GString, StringName};
-use crate::obj::Singleton;
-use crate::out;
+use crate::obj::{GodotClass, Singleton};
+use crate::{classes, out};
 
 mod reexport_pub {
-    // `Engine::singleton()` is not available before `InitLevel::Scenes` for Godot before 4.4.
-    #[cfg(since_api = "4.4")]
-    pub use super::sys::is_editor_hint;
     #[cfg(not(wasm_nothreads))]
     pub use super::sys::main_thread_id;
     pub use super::sys::{GdextBuild, InitStage, is_main_thread};
 }
 pub use reexport_pub::*;
 
-use crate::obj::signal::prune_stored_signal_connections;
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Public functions
+
+/// Returns whether the engine is running inside the Godot editor.
+///
+/// This is different from whether the Godot binary is an _editor_ build (as opposed to an export/release build).
+pub fn is_editor_hint() -> bool {
+    sys::is_editor()
+}
+
+/// Return whether a certain class API can be used in Godot.
+///
+/// This is only relevant when you operate before all stages have been initialized, or once deinitialization has started.
+///
+/// See also [`is_singleton_available()`] and [this section in `ExtensionLibrary`](../init/trait.ExtensionLibrary.html#availability-of-godot-apis-during-init-and-deinit).
+pub fn is_class_available<T: GodotClass>() -> bool {
+    // If called when bindings are not yet/anymore initialized (e.g. in a global destructor), returns false.
+    CURRENT_INIT_LEVEL
+        .load()
+        .is_some_and(|level| T::INIT_LEVEL <= level)
+}
+
+/// Return whether a certain singleton can currently be retrieved from Godot.
+///
+/// This differs from [`is_class_available()`]: a singleton instance may become available later than its class API.
+/// For example, some core singletons are available at `Core`, while most singletons only appear at `Scene` or later.
+///
+/// See also [this section in `ExtensionLibrary`](../init/trait.ExtensionLibrary.html#availability-of-godot-apis-during-init-and-deinit).
+pub fn is_singleton_available<T: Singleton>() -> bool {
+    if !is_class_available::<T>() {
+        return false;
+    }
+
+    let class_name = T::class_id().to_string_name();
+
+    // Use Engine::has_singleton() rather than global_get_singleton() directly.
+    // The latter prints a Godot error "Failed to retrieve non-existent singleton 'X'" whenever the singleton is absent.
+    // Engine is a Core-level class from Godot 4.4+, so it's available once bindings are initialized (guaranteed by is_class_available() above).
+    #[cfg(since_api = "4.4")]
+    {
+        classes::Engine::singleton().has_singleton(&class_name)
+    }
+
+    // Fallback for <4.4: call C API; Engine singleton is not available in all levels.
+    // Will emit an error if not found. We cannot disable through Engine::set_print_error_messages, if that class is not available itself.
+    // Could possibly be achieved through GDScript...
+    #[cfg(before_api = "4.4")]
+    {
+        let object_ptr =
+            unsafe { sys::interface_fn!(global_get_singleton)(class_name.string_sys()) };
+
+        !object_ptr.is_null()
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Implementation
+
+use crate::signal::prune_stored_signal_connections;
+
+static CURRENT_INIT_LEVEL: sys::AtomicEnum<Option<InitLevel>> = sys::AtomicEnum::default();
 
 #[repr(C)]
 struct InitUserData {
@@ -56,6 +113,10 @@ unsafe extern "C" fn frame_func<E: ExtensionLibrary>() {
 
 #[cfg(since_api = "4.5")]
 unsafe extern "C" fn shutdown_func<E: ExtensionLibrary>() {
+    // The main loop (SceneTree) is being torn down. Mark the async runtime as exiting, so a signal future whose object is freed during teardown
+    // is left suspended (and dropped in cleanup()) instead of being woken into a spurious panic. See `async_runtime::is_engine_exiting()`.
+    crate::task::mark_engine_exiting();
+
     let ctx = || "ExtensionLibrary::on_stage_deinit(MainLoop)".to_string();
 
     swallow_panics(ctx, || {
@@ -212,6 +273,14 @@ unsafe fn gdext_on_level_init(level: InitLevel, _userdata: &InitUserData) {
     // (e.g. class registration). This would break the assumption that the load_class_method_table() calls are exclusive.
     // We could maybe protect globals with a mutex until initialization is complete, and then move it to a directly-accessible, read-only static.
 
+    // Godot might change the main-thread between init levels Core and Servers. We have to know the correct main-thread ID before doing
+    // anything else. Currently Android is the only platform known to do this.
+    // See https://github.com/godot-rust/gdext/issues/1423#issuecomment-4340496087 and https://github.com/godot-rust/gdext/issues/1250.
+    if level == InitLevel::Servers {
+        // SAFETY: called from the main thread, sys::initialized has already been called.
+        unsafe { sys::discover_main_thread() };
+    }
+
     // SAFETY: we are in the main thread, initialize has been called, has never been called with this level before.
     unsafe { sys::load_class_method_table(level) };
 
@@ -225,16 +294,27 @@ unsafe fn gdext_on_level_init(level: InitLevel, _userdata: &InitUserData) {
                 )
             };
 
+            // Engine/OS classes are available at Core level on Godot 4.4+, so cache the editor states here.
             #[cfg(since_api = "4.4")]
-            sys::set_editor_hint(crate::classes::Engine::singleton().is_editor_hint());
+            {
+                sys::set_editor_hint(classes::Engine::singleton().is_editor_hint());
+                sys::set_editor_binary(classes::Os::singleton().has_feature("editor"));
+            }
         }
-        InitLevel::Servers => {
-            // SAFETY: called from the main thread, sys::initialized has already been called.
-            unsafe { sys::discover_main_thread() };
-        }
+        InitLevel::Servers => {}
         InitLevel::Scene => {
+            // On Godot < 4.4, the Engine/OS method tables are not available before Scene level, so populate here.
+            #[cfg(before_api = "4.4")]
+            {
+                sys::set_editor_hint(crate::classes::Engine::singleton().is_editor_hint());
+                sys::set_editor_binary(crate::classes::Os::singleton().has_feature("editor"));
+            }
+
             // SAFETY: On the main thread, api initialized, `Scene` was initialized above.
             unsafe { ensure_godot_features_compatible() };
+
+            #[cfg(all(since_api = "4.3", feature = "register-docs"))]
+            warn_docs_in_exported_build();
         }
         InitLevel::Editor => {
             #[cfg(all(since_api = "4.3", feature = "register-docs"))]
@@ -246,6 +326,7 @@ unsafe fn gdext_on_level_init(level: InitLevel, _userdata: &InitUserData) {
     }
 
     crate::registry::class::auto_register_classes(level);
+    CURRENT_INIT_LEVEL.store(Some(level));
 }
 
 /// Tasks needed to be done by gdext internally upon unloading an initialization level. Called after user code.
@@ -255,6 +336,7 @@ fn gdext_on_level_deinit(level: InitLevel) {
     }
 
     crate::registry::class::unregister_classes(level);
+    CURRENT_INIT_LEVEL.store(previous_init_level(level));
 
     if level == InitLevel::Core {
         // If lowest level is unloaded, call global deinitialization.
@@ -274,6 +356,15 @@ fn gdext_on_level_deinit(level: InitLevel) {
         unsafe {
             sys::deinitialize();
         }
+    }
+}
+
+const fn previous_init_level(level: InitLevel) -> Option<InitLevel> {
+    match level {
+        InitLevel::Core => None,
+        InitLevel::Servers => Some(InitLevel::Core),
+        InitLevel::Scene => Some(InitLevel::Servers),
+        InitLevel::Editor => Some(InitLevel::Scene),
     }
 }
 
@@ -338,7 +429,8 @@ where
 /// To get an up-to-date view, inspect the Godot source code of [main.cpp], particularly `Main::setup()`, `Main::setup2()` and
 /// `Main::cleanup()` methods. Make sure to look at the correct version of the file.
 ///
-/// In case of doubt, do not rely on classes being available during init/deinit.
+/// You can use the functions [`init::is_class_available()`][is_class_available] and [`init::is_singleton_available()`][is_singleton_available]
+/// to check at runtime.
 ///
 /// [main.cpp]: https://github.com/godotengine/godot/blob/master/main/main.cpp
 ///
@@ -564,4 +656,23 @@ unsafe fn ensure_godot_features_compatible() {
             s(gdext_is_double),
         );
     }
+}
+
+/// Warn once if the `register-docs` feature is compiled into an exported build (export template, not editor).
+#[cfg(all(since_api = "4.3", feature = "register-docs"))]
+fn warn_docs_in_exported_build() {
+    // `is_editor_binary()` is populated by the Core level, so it is safe to read here. Unlike `is_editor()`, it stays true
+    // during play-mode from the editor, so the warning fires only for actual export templates.
+    if sys::is_editor_binary() {
+        return;
+    }
+
+    sys::defer_startup_warn!(
+        once;
+        id: "RegisterDocsInExport",
+        "Feature `register-docs` is enabled in an exported (non-editor) build.\n\
+        Doing so embeds plaintext documentation of your Rust #[class], #[func] etc. into the binary.\n\
+        This has no runtime benefit, but can bloat binary size and make reverse-engineering easier.\n\
+        Consider disabling `register-docs` for exported builds."
+    );
 }

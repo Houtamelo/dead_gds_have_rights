@@ -7,9 +7,13 @@
 
 use crate::builtin::{Array, Variant};
 use crate::meta;
-use crate::meta::error::{ConvertError, ErrorKind, FromFfiError};
+use crate::meta::error::{
+    CallError, CallOutcome, ConvertError, ErrorKind, ErrorToGodot, FromFfiError,
+};
 use crate::meta::shape::GodotShape;
-use crate::meta::{Element, FromGodot, GodotConvert, GodotNullableFfi, GodotType, ToGodot};
+use crate::meta::{
+    Element, EngineToGodot, FromGodot, GodotConvert, GodotNullableType, GodotType, ToGodot,
+};
 use crate::registry::info::ParamMetadata;
 
 // The following ToGodot/FromGodot/Convert impls are auto-generated for each engine type, co-located with their definitions:
@@ -19,26 +23,22 @@ use crate::registry::info::ParamMetadata;
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Option<T>
 
-impl<T> GodotType for Option<T>
-where
-    T: GodotType,
-    T::Ffi: GodotNullableFfi,
-    for<'f> T::ToFfi<'f>: GodotNullableFfi,
-{
+impl<T: GodotNullableType> GodotType for Option<T> {
     type Ffi = T::Ffi;
-
     type ToFfi<'f> = T::ToFfi<'f>;
 
     fn to_ffi(&self) -> Self::ToFfi<'_> {
-        GodotNullableFfi::flatten_option(self.as_ref().map(|t| t.to_ffi()))
+        self.as_ref()
+            .map(|t| t.to_ffi())
+            .unwrap_or_else(T::ffi_null_ref)
     }
 
     fn into_ffi(self) -> Self::Ffi {
-        GodotNullableFfi::flatten_option(self.map(|t| t.into_ffi()))
+        self.map(|t| t.into_ffi()).unwrap_or_else(T::ffi_null)
     }
 
     fn try_from_ffi(ffi: Self::Ffi) -> Result<Self, ConvertError> {
-        if ffi.is_null() {
+        if T::ffi_is_null(&ffi) {
             return Ok(None);
         }
 
@@ -46,7 +46,7 @@ where
     }
 
     fn from_ffi(ffi: Self::Ffi) -> Self {
-        if ffi.is_null() {
+        if T::ffi_is_null(&ffi) {
             return None;
         }
 
@@ -88,14 +88,8 @@ impl<T> ToGodot for Option<T>
 where
     // Currently limited to holding objects -> needed to establish to_godot() relation T::to_godot() = Option<&T::Via>.
     T: ToGodot<Pass = meta::ByObject>,
-    // Extra Clone bound for to_godot_owned(); might be extracted in the future.
-    T::Via: Clone,
     // T::Via must be a Godot nullable type (to support the None case).
-    for<'f> T::Via: GodotType<
-            // Associated types need to be nullable.
-            Ffi: GodotNullableFfi,
-            ToFfi<'f>: GodotNullableFfi,
-        >,
+    T::Via: GodotNullableType,
     // Previously used bound, not needed right now but don't remove: Option<T::Via>: GodotType,
 {
     // Basically ByRef, but allows Option<T> -> Option<&T::Via> conversion.
@@ -105,10 +99,7 @@ where
         self.as_ref().map(T::to_godot)
     }
 
-    fn to_godot_owned(&self) -> Option<T::Via>
-    where
-        Self::Via: Clone,
-    {
+    fn to_godot_owned(&self) -> Option<T::Via> {
         self.as_ref().map(T::to_godot_owned)
     }
 
@@ -157,6 +148,71 @@ where
 
         Some(T::from_variant(variant))
     }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Result<T, E: ErrorToGodot>
+
+impl<T, E> GodotConvert for Result<T, E>
+where
+    T: ToGodot,
+    E: ErrorToGodot<T>,
+{
+    type Via = <<E as ErrorToGodot<T>>::Mapped as GodotConvert>::Via;
+
+    fn godot_shape() -> GodotShape {
+        <<E as ErrorToGodot<T>>::Mapped>::godot_shape()
+    }
+}
+
+impl<T, E> EngineToGodot for Result<T, E>
+where
+    T: ToGodot,
+    E: ErrorToGodot<T>,
+{
+    type Pass = meta::ByValue;
+
+    fn engine_to_godot(&self) -> meta::ToArg<'_, Self::Via, Self::Pass> {
+        panic_non_consuming()
+    }
+
+    fn engine_to_godot_owned(&self) -> Self::Via {
+        panic_non_consuming()
+    }
+
+    fn engine_to_variant(&self) -> Variant {
+        panic_non_consuming()
+    }
+
+    // Varcall and ptrcall each need their own override; merging them would force an extra conversion in one direction.
+    //
+    // Varcall writes a Variant, so engine_try_into_variant produces one directly -- routing through Via first would add a clone for ByRef types.
+    // Ptrcall writes Via, so engine_try_into_godot_owned produces it directly -- routing through Variant would cost a Variant→Via round-trip.
+    //
+    // Both methods also report unexpected errors as CallError rather than panicking.
+
+    fn engine_try_into_variant(self, call_ctx: &meta::CallContext) -> Result<Variant, CallError> {
+        match E::result_to_godot(self) {
+            CallOutcome::Return(mapped) => Ok(mapped.to_variant()),
+            CallOutcome::CallFailed(msg) => Err(CallError::failed_by_user_result(call_ctx, msg)),
+        }
+    }
+
+    fn engine_try_into_godot_owned(
+        self,
+        call_ctx: &meta::CallContext,
+    ) -> Result<Self::Via, CallError> {
+        match E::result_to_godot(self) {
+            CallOutcome::Return(mapped) => Ok(mapped.to_godot_owned()),
+            CallOutcome::CallFailed(msg) => Err(CallError::failed_by_user_result(call_ctx, msg)),
+        }
+    }
+}
+
+fn panic_non_consuming() -> ! {
+    panic!(
+        "Result<T, E> is only valid as a #[func] return value; non-owned conversions unsupported"
+    )
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------

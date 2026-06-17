@@ -33,7 +33,7 @@
 //! - `// SAFETY: Ref-count managed by Godot during ptrcall.`
 //! - `// SAFETY: One-time init on main thread; not yet initialized.`
 //!
-//! **TODO(v0.7)**: Revisit once JSON-based C API is ready.
+//! All FFI type definitions and interface function pointers are generated from `gdextension_interface.json`.
 
 #![cfg_attr(test, allow(unused))]
 
@@ -73,6 +73,7 @@ pub(crate) mod r#gen {
 pub mod conv;
 
 mod assertions;
+mod atomic_enum;
 mod extras;
 mod global;
 mod godot_ffi;
@@ -80,17 +81,15 @@ mod interface_init;
 #[cfg(target_os = "linux")]
 pub mod linux_reload_workaround;
 mod opaque;
-mod plugins;
+mod shard_registry;
 mod string_cache;
 mod toolbox;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
+pub use atomic_enum::*;
 // Other
 pub use extras::*;
 pub use r#gen::central::*;
 pub use r#gen::gdextension_interface::*;
-pub use r#gen::interface::*;
 // Method tables
 pub use r#gen::table_builtins::*;
 pub use r#gen::table_builtins_lifecycle::*;
@@ -104,9 +103,7 @@ pub use init_level::*;
 pub use string_cache::StringCache;
 pub use toolbox::*;
 
-pub use crate::godot_ffi::{
-    ExtVariantType, GodotFfi, GodotNullableFfi, PrimitiveConversionError, PtrcallType,
-};
+pub use crate::godot_ffi::{ExtVariantType, GodotFfi, PrimitiveConversionError, PtrcallType};
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // API to access Godot via FFI
@@ -129,6 +126,16 @@ static MAIN_THREAD_ID: ManualInitCell<std::thread::ThreadId> = ManualInitCell::n
 
 /// Warnings/errors collected during startup, and deferred until editor UI is ready.
 static STARTUP_MESSAGES: Global<Vec<StartupMessage>> = Global::default();
+
+/// Set to `true` after [`print_deferred_startup_messages`] has flushed once. From then on, new messages are printed directly instead
+/// of queued, so warnings/errors emitted later are not silently dropped.
+static STARTUP_MESSAGES_FLUSHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tracks message keys already emitted via the `once` flag of `defer_startup_warn!`/`defer_startup_error!`.
+/// Ensures each message is only shown once even if the code path fires multiple times. Keys are prefixed
+/// per source (`w:` warn, `e:` error explicit id, `e@` error implicit call site) to avoid collisions.
+static ONCE_EMITTED_MESSAGES: Global<std::collections::HashSet<&'static str>> = Global::default();
 
 /// A message to be displayed in the Godot editor once UI is ready.
 struct StartupMessage {
@@ -337,6 +344,7 @@ pub fn collect_startup_message(
     file: &str,
     line: u32,
     module_path: &str,
+    once_id: Option<&'static str>,
 ) {
     // Check if this warning should be suppressed (only warnings can be suppressed, not errors).
     if let StartupMessageLevel::Warn { id } = &level {
@@ -349,6 +357,13 @@ pub fn collect_startup_message(
         }
     }
 
+    // Once-check (after suppression check).
+    if let Some(id) = once_id
+        && !ONCE_EMITTED_MESSAGES.lock().insert(id)
+    {
+        return;
+    }
+
     let msg = StartupMessage {
         message: std::ffi::CString::new(message).expect("message contains null byte"),
         function: std::ffi::CString::new(module_path).expect("module_path contains null byte"),
@@ -357,7 +372,34 @@ pub fn collect_startup_message(
         level,
     };
 
-    STARTUP_MESSAGES.lock().push(msg);
+    // Check the flushed-flag while holding the lock: otherwise, a concurrent flush could drain and set the flag between our load and push,
+    // leaving the message in the queue with no further flush to deliver it. Holding the lock serializes us against the flusher.
+    let mut messages = STARTUP_MESSAGES.lock();
+    if STARTUP_MESSAGES_FLUSHED.load(std::sync::atomic::Ordering::Acquire) {
+        drop(messages);
+        print_message(&msg);
+    } else {
+        messages.push(msg);
+    }
+}
+
+/// Print a single message to the editor UI via the FFI interface.
+fn print_message(msg: &StartupMessage) {
+    let print_fn = match msg.level {
+        StartupMessageLevel::Warn { .. } => interface_fn!(print_warning),
+        StartupMessageLevel::Error => interface_fn!(print_error),
+    };
+
+    // SAFETY: The binding has been initialized, so we can use interface functions.
+    unsafe {
+        print_fn(
+            msg.message.as_ptr(),
+            msg.function.as_ptr(),
+            msg.file.as_ptr(),
+            msg.line,
+            conv::SYS_TRUE, // Notify editor.
+        );
+    }
 }
 
 /// Check if a message ID is suppressed via the `GDRUST_SUPPRESSED_WARNINGS` environment variable.
@@ -372,32 +414,20 @@ fn is_message_suppressed(id: &str) -> bool {
 }
 
 /// Flush all deferred messages to the Godot editor. Called during `MainLoop` initialization, when editor UI is ready.
+///
+/// After this returns, [`collect_startup_message`] switches to direct printing so late-firing sites
+/// (property accessors, `_ready` callbacks, etc.) are not silently dropped.
 pub fn print_deferred_startup_messages() {
     let mut messages = STARTUP_MESSAGES.lock();
 
-    if messages.is_empty() {
-        return;
-    }
-
     for msg in messages.iter() {
-        let print_fn = match msg.level {
-            StartupMessageLevel::Warn { .. } => interface_fn!(print_warning),
-            StartupMessageLevel::Error => interface_fn!(print_error),
-        };
-
-        // SAFETY: The binding has been initialized, so we can use interface functions.
-        unsafe {
-            print_fn(
-                msg.message.as_ptr(),
-                msg.function.as_ptr(),
-                msg.file.as_ptr(),
-                msg.line,
-                conv::SYS_TRUE, // Notify editor.
-            );
-        }
+        print_message(msg);
     }
-
     messages.clear();
+
+    // Flip flag while holding the lock, so any collector racing with us either pushes before us
+    // (and gets flushed above) or sees the flag set (and prints directly). Either path delivers.
+    STARTUP_MESSAGES_FLUSHED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 fn print_preamble(version: GDExtensionGodotVersion) {
@@ -543,8 +573,8 @@ pub unsafe fn godot_has_feature(
 
     // SAFETY: Called from main thread, and interface has been initialized.
     let interface = unsafe { get_interface() };
-    let get_singleton = interface.global_get_singleton.unwrap();
-    let class_ptrcall = interface.object_method_bind_ptrcall.unwrap();
+    let get_singleton = interface.global_get_singleton;
+    let class_ptrcall = interface.object_method_bind_ptrcall;
 
     // SAFETY: Interface has been initialized, and `Scene` has been initialized, so `get_singleton` can be called. `os_class_sname` is a valid
     // `StringName` pointer.
@@ -598,17 +628,90 @@ pub fn is_main_thread() -> bool {
     }
 }
 
-static IS_EDITOR_HINT: AtomicBool = AtomicBool::new(false);
-
-/// Caches the current value of `Engine::is_editor_hint`.
-/// Should be called only once, during bindings initialization.
-pub fn set_editor_hint(is_editor_hint: bool) {
-    IS_EDITOR_HINT.store(is_editor_hint, Ordering::Relaxed);
+atomic_enum! {
+    /// Tri-state boolean for flags that are cached during library initialization and thus may not be known yet.
+    ///
+    /// `Unknown` distinguishes "not yet populated" from a known `False`/`True`. Used to back the editor-hint and editor-binary
+    /// flags below; the semantics of `True`/`False` depend on the respective getter.
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    pub enum TriBool {
+        /// Not yet populated -- the default.
+        Unknown = 0,
+        False = 1,
+        True = 2,
+    }
 }
 
-/// Cached output of `Engine::is_editor_hint`, allowing to fetch the value without crossing the FFI barrier.
-pub fn is_editor_hint() -> bool {
-    IS_EDITOR_HINT.load(Ordering::Relaxed)
+impl TriBool {
+    fn from_bool(value: bool) -> Self {
+        if value { TriBool::True } else { TriBool::False }
+    }
+
+    fn to_option(self) -> Option<bool> {
+        match self {
+            TriBool::Unknown => None,
+            TriBool::False => Some(false),
+            TriBool::True => Some(true),
+        }
+    }
+}
+
+// Reflects `Engine::is_editor_hint()`: `True` only while the editor UI is shown, `False` in play-mode (even when launched from the editor).
+// See `is_editor_hint()`. Populated at `InitLevel::Core` (Godot 4.4+) or `InitLevel::Scene` (Godot < 4.4, Engine singleton not available earlier).
+static IS_EDITOR_HINT: AtomicEnum<TriBool> = AtomicEnum::default();
+
+// Reflects `OS::has_feature("editor")`: `True` for editor builds (including play-mode launched from the editor), `False` for export templates.
+// See `is_editor_binary()`. Populated at `InitLevel::Core` (Godot 4.4+) or `InitLevel::Scene` (Godot < 4.4, OS method table not available earlier).
+static IS_EDITOR_BINARY: AtomicEnum<TriBool> = AtomicEnum::default();
+
+/// Caches the current value of `Engine::is_editor_hint`, populated during library initialization.
+///
+/// - Godot 4.4+: called at `InitLevel::Core`.
+/// - Godot < 4.4: called at `InitLevel::Scene` (Engine singleton not available earlier).
+pub fn set_editor_hint(is_editor_hint: bool) {
+    IS_EDITOR_HINT.store(TriBool::from_bool(is_editor_hint));
+}
+
+/// Returns the cached editor-hint state, or `None` if not yet initialized.
+///
+/// Returns `None` if called before the level at which the state is populated:
+/// - Godot 4.4+: `None` before `InitLevel::Core`.
+/// - Godot < 4.4: `None` before `InitLevel::Scene`.
+///
+/// See also [`is_editor`] for the panicking variant.
+pub fn is_editor_or_unknown() -> Option<bool> {
+    IS_EDITOR_HINT.load().to_option()
+}
+
+/// Returns whether the editor UI is currently shown, mirroring `Engine::is_editor_hint()`.
+///
+/// This is `false` in play-mode, even when launched from the editor; use [`is_editor_binary`] to detect exported builds instead.
+///
+/// # Panics
+/// If called before the state has been populated. Use [`is_editor_or_unknown`] at call sites that may be reached before initialization
+/// is complete.
+// Rename to is_editor_hint() or something else to differentiate from is_editor_binary?
+pub fn is_editor() -> bool {
+    is_editor_or_unknown()
+        .expect("editor-hint state not yet known; called before InitLevel::Core (4.4+) or InitLevel::Scene (<4.4)")
+}
+
+/// Caches whether the running binary is an editor build, populated during library initialization.
+pub fn set_editor_binary(is_editor_binary: bool) {
+    IS_EDITOR_BINARY.store(TriBool::from_bool(is_editor_binary));
+}
+
+/// Returns whether the running binary is an editor build (as opposed to an exported game), mirroring `OS::has_feature("editor")`.
+///
+/// Unlike [`is_editor`], this stays `true` during play-mode launched from the editor; it is only `false` for export templates.
+///
+/// # Panics
+/// If called before the state is populated (`InitLevel::Core` on Godot 4.4+, `InitLevel::Scene` on Godot < 4.4).
+pub fn is_editor_binary() -> bool {
+    IS_EDITOR_BINARY
+        .load()
+        .to_option()
+        .expect("editor-binary state not yet known; called before InitLevel::Core (4.4+) or InitLevel::Scene (<4.4)")
 }
 
 /// Assign the current thread id to be the main thread.
@@ -649,12 +752,18 @@ pub unsafe fn classdb_construct_object(
     #[cfg(before_api = "4.4")]
     let f = interface_fn!(classdb_construct_object);
 
-    #[cfg(since_api = "4.4")]
+    #[cfg(all(since_api = "4.4", before_api = "4.7"))]
     let f = interface_fn!(classdb_construct_object2);
+
+    #[cfg(since_api = "4.7")]
+    let f = interface_fn!(classdb_construct_object3);
 
     // SAFETY: function pointer is valid since binding is initialized; class_name validity is upheld by caller.
     unsafe { f(class_name) }
 }
+
+pub const fn require_send<T: Send>() {}
+pub const fn require_send_sync<T: Send + Sync>() {}
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Macros to access low-level function bindings
@@ -678,27 +787,43 @@ macro_rules! builtin_call {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! interface_fn {
-    ($name:ident) => {{ unsafe { $crate::get_interface().$name.unwrap_unchecked() } }};
+    ($name:ident) => {{
+        // SAFETY: caller ensures that the interface is initialized.
+        unsafe { $crate::get_interface().$name }
+    }};
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Deferred editor message macros
 
-/// Store a warning for deferred display in Godot editor UI.
+/// Store a warning for display in Godot editor UI.
 ///
-/// Captured during startup, displayed at `MainLoop` init. Will be visible in Godot editor's _Output_ tab.
-/// Warnings can be suppressed via the `GDRUST_SUPPRESSED_WARNINGS` environment variable.
+/// Messages appear in the Godot editor's _Output_ tab: queued before `MainLoop` init and flushed
+/// once the UI is ready, then printed immediately for late-firing sites (property accessors,
+/// `_ready` callbacks, etc.). Suppressible via the `GDRUST_SUPPRESSED_WARNINGS` environment variable.
 ///
 /// # Example
 /// ```no_run
 /// use godot_ffi::defer_startup_warn;
 /// # fn example() {
-/// // Warning with ID (can be suppressed via GDRUST_SUPPRESSED_WARNINGS env var).
 /// defer_startup_warn!(id: "FeatureDeprecated", "Feature X is deprecated");
+/// // One-time warning only:
+/// defer_startup_warn!(once; id: "BadCond", "A runtime condition is bad");
 /// # }
 /// ```
 #[macro_export]
 macro_rules! defer_startup_warn {
+    (once; id: $id:literal, $fmt:literal $(, $args:expr_2021)* $(,)?) => {{
+        let message = format!($fmt $(, $args)*);
+        $crate::collect_startup_message(
+            message,
+            $crate::StartupMessageLevel::Warn { id: $id },
+            file!(),
+            line!(),
+            module_path!(),
+            Some(concat!("w:", $id)),
+        );
+    }};
     (id: $id:literal, $fmt:literal $(, $args:expr_2021)* $(,)?) => {{
         let message = format!($fmt $(, $args)*);
         $crate::collect_startup_message(
@@ -707,14 +832,15 @@ macro_rules! defer_startup_warn {
             file!(),
             line!(),
             module_path!(),
+            None,
         );
     }};
 }
 
-/// Store an error for deferred display in Godot editor UI.
+/// Store an error for display in Godot editor UI.
 ///
-/// Captured during startup, displayed at `MainLoop` init. Will be visible in Godot editor's _Output_ tab.
-/// Errors cannot be suppressed.
+/// Messages appear in the Godot editor's _Output_ tab: queued before `MainLoop` init and flushed
+/// once the UI is ready, then printed immediately for late-firing sites. Errors cannot be suppressed.
 ///
 /// # Example
 /// ```no_run
@@ -722,10 +848,36 @@ macro_rules! defer_startup_warn {
 /// # fn example() {
 /// # let reason = "some reason";
 /// defer_startup_error!("Failed to initialize: {reason}");
+/// // One-time error, deduplicated by call site:
+/// defer_startup_error!(once; "A runtime condition is bad");
+/// // One-time error, deduplicated by explicit ID (shared across call sites):
+/// defer_startup_error!(once; id: "InitFail", "Failed to initialize: {reason}");
 /// # }
 /// ```
 #[macro_export]
 macro_rules! defer_startup_error {
+    (once; id: $id:literal, $fmt:literal $(, $args:expr_2021)* $(,)?) => {{
+        let message = format!($fmt $(, $args)*);
+        $crate::collect_startup_message(
+            message,
+            $crate::StartupMessageLevel::Error,
+            file!(),
+            line!(),
+            module_path!(),
+            Some(concat!("e:", $id)),
+        );
+    }};
+    (once; $fmt:literal $(, $args:expr_2021)* $(,)?) => {{
+        let message = format!($fmt $(, $args)*);
+        $crate::collect_startup_message(
+            message,
+            $crate::StartupMessageLevel::Error,
+            file!(),
+            line!(),
+            module_path!(),
+            Some(concat!("e@", file!(), ":", line!())),
+        );
+    }};
     ($fmt:literal $(, $args:expr_2021)* $(,)?) => {{
         let message = format!($fmt $(, $args)*);
         $crate::collect_startup_message(
@@ -734,6 +886,7 @@ macro_rules! defer_startup_error {
             file!(),
             line!(),
             module_path!(),
+            None,
         );
     }};
 }

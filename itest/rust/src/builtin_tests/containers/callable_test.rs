@@ -18,7 +18,7 @@ use godot::meta::ToGodot;
 use godot::obj::{Gd, NewAlloc, NewGd};
 use godot::register::{GodotClass, godot_api};
 
-use crate::framework::itest;
+use crate::framework::{itest, suppress_godot_print};
 
 #[derive(GodotClass)]
 #[class(init, base=RefCounted)]
@@ -41,6 +41,40 @@ impl CallableTestObj {
     #[func] // static
     fn concat_array(a: i32, b: GString, c: Array<NodePath>, d: Gd<RefCounted>) -> VarArray {
         varray![a, &b, &c, &d]
+    }
+}
+
+#[itest]
+fn callable_is_rust_callable() {
+    let obj = CallableTestObj::new_gd();
+    let rust_fn = || Callable::from_fn("rust_fn", |_args: &[&Variant]| Variant::nil());
+
+    // (description, callable, expected is_custom, expected is_rust_callable).
+    let cases: [(&str, Callable, bool, bool); 6] = [
+        ("invalid", Callable::invalid(), false, false),
+        ("engine method", obj.callable("assign_int"), false, false),
+        ("from_fn", rust_fn(), true, true),
+        ("from_fn + bind", rust_fn().bind(vslice![1]), true, false),
+        ("from_fn + unbind", rust_fn().unbind(1), true, false),
+        (
+            "engine method + bind",
+            obj.callable("stringify_int").bind(vslice![1]),
+            true,
+            false,
+        ),
+    ];
+
+    for (desc, callable, expected_custom, expected_rust) in cases {
+        assert_eq!(
+            callable.is_custom(),
+            expected_custom,
+            "is_custom() mismatch for: {desc}"
+        );
+        assert_eq!(
+            callable.is_rust_callable(),
+            expected_rust,
+            "is_rust_callable() mismatch for: {desc}"
+        );
     }
 }
 
@@ -133,8 +167,10 @@ fn callable_variant_method() {
 
     // Color - invalid method.
     let color = Color::from_rgba8(255, 0, 127, 255).to_variant();
-    let color_to_html = Callable::from_variant_method(&color, "to_htmI");
-    assert!(!color_to_html.is_valid());
+    suppress_godot_print(|| {
+        let color_to_html = Callable::from_variant_method(&color, "to_htmI");
+        assert!(!color_to_html.is_valid());
+    });
 }
 
 #[itest]
@@ -420,7 +456,7 @@ pub mod custom_callable {
         // - We can't catch panics from Callable invocations yet (see above), only the FFI access panics.
         if cfg!(safeguards_balanced) && !cfg!(feature = "experimental-threads") {
             // Single-threaded with balanced safeguards: FFI access check will panic.
-            crate::framework::expect_panic(
+            crate::framework::expect_panic_quiet(
                 "Callable created with from_fn() must panic when invoked on other thread",
                 || {
                     quick_thread(|| {
@@ -484,6 +520,22 @@ pub mod custom_callable {
     // Now non-Variant return type.
     fn sum(args: &[&Variant]) -> i32 {
         args.iter().map(|arg| arg.to::<i32>()).sum()
+    }
+
+    // A linked callable (`Gd::linked_callable()`, used e.g. by `connect_self()`) captures only the object's instance ID, so it can outlive the
+    // object. Once freed, `is_valid()` must report false. Godot's `is_valid_func` ignores the `object_id` we set, so `rust_callable_is_valid()`
+    // performs the liveness check itself; this is the regression test for it.
+    #[itest]
+    fn callable_linked_invalidated_after_free() {
+        let receiver = godot::classes::Node::new_alloc();
+        let linked = receiver.linked_callable("nop", |_args| {});
+
+        assert!(linked.is_valid());
+        receiver.free();
+        assert!(
+            !linked.is_valid(),
+            "linked callable invalid after freeing its object"
+        );
     }
 
     #[itest]

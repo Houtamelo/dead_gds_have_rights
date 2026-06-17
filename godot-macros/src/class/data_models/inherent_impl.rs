@@ -5,7 +5,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream};
+use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
 use quote::spanned::Spanned;
 use quote::{ToTokens, format_ident, quote};
 
@@ -64,6 +64,7 @@ struct FuncAttr {
 #[derive(Default)]
 struct SignalAttr {
     pub no_builder: bool,
+    pub internal: bool,
 }
 
 pub(crate) struct InherentImplAttr {
@@ -73,6 +74,9 @@ pub(crate) struct InherentImplAttr {
 
     /// When typed signal generation is explicitly disabled by the user.
     pub no_typed_signals: bool,
+
+    /// When the type-safe RPC API is disabled by the user.
+    pub no_typed_rpcs: bool,
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -132,10 +136,8 @@ pub fn transform_inherent_impl(
         meta.no_typed_signals,
     )?;
 
-    #[cfg(feature = "codegen-full")]
-    let rpc_registrations = crate::class::make_rpc_registrations_fn(&class_name, &funcs);
-    #[cfg(not(feature = "codegen-full"))]
-    let rpc_registrations = TokenStream::new();
+    let (rpc_registrations, rpc_api) =
+        crate::class::make_rpc_registrations(&class_name, &funcs, meta.no_typed_rpcs);
 
     let method_registrations: Vec<TokenStream> = funcs
         .into_iter()
@@ -146,7 +148,7 @@ pub fn transform_inherent_impl(
 
     let fill_storage = {
         quote! {
-            ::godot::sys::plugin_execute_pre_main!({
+            ::godot::sys::shard_execute_pre_main!({
                 let mut guard = #class_name::__registration_storage().lock().unwrap();
 
                 guard.0.push(|| {
@@ -199,8 +201,8 @@ pub fn transform_inherent_impl(
         };
 
         let class_registration = quote! {
-            ::godot::sys::plugin_add!(#prv::__GODOT_PLUGIN_REGISTRY; #prv::ClassPlugin::new::<#class_name>(
-                #prv::PluginItem::InherentImpl(#prv::InherentImpl::new::<#class_name>())
+            ::godot::sys::shard_add!(#prv::__GODOT_SHARD_REGISTRY; #prv::ClassShard::new::<#class_name>(
+                #prv::ShardItem::InherentImpl(#prv::InherentImpl::new::<#class_name>())
             ));
         };
 
@@ -212,6 +214,7 @@ pub fn transform_inherent_impl(
             #fill_storage
             #class_registration
             #signal_symbol_types
+            #rpc_api
             #inherent_impl_docs
         };
 
@@ -286,6 +289,8 @@ fn process_godot_fns(
                 "#[func]: generic fn parameters are not supported"
             );
         }
+
+        validate_no_references(function)?;
 
         match attr.ty {
             ItemAttrType::Func(func, rpc_info) => {
@@ -373,6 +378,7 @@ fn process_godot_fns(
                     fn_signature,
                     external_attributes,
                     has_builder: !signal.no_builder,
+                    is_internal: signal.internal,
                 });
 
                 removed_indexes.push(index);
@@ -504,7 +510,7 @@ fn add_virtual_script_call(
             type CallRet = #call_ret;
             let args = (#( #arg_names, )*);
             unsafe {
-                ::godot::meta::Signature::<CallParams, CallRet>::out_script_virtual_call(
+                ::godot::private::Signature::<CallParams, CallRet>::out_script_virtual_call(
                     #class_name_str,
                     #method_name_str,
                     method_sname_ptr,
@@ -528,6 +534,37 @@ fn add_virtual_script_call(
     virtual_functions.push(early_bound_function);
 
     method_name_str
+}
+
+/// Validates that a function uses no reference types (`&T`, `&mut T`) in parameters or return type.
+///
+/// References cannot cross Godot FFI. Without this check, users get a confusing error, see <https://github.com/godot-rust/gdext/pull/1542>.
+fn validate_no_references(function: &venial::Function) -> ParseResult<()> {
+    for (param, _) in function.params.inner.iter() {
+        if let venial::FnParam::Typed(arg) = param
+            && let Some(TokenTree::Punct(p)) = arg.ty.tokens.first()
+            && p.as_char() == '&'
+        {
+            return bail!(
+                &arg.ty,
+                "#[func] does not support reference parameters \
+                (`&T` or `&mut T`); use a value type instead"
+            );
+        }
+    }
+
+    if let Some(ref ret_ty) = function.return_ty
+        && let Some(TokenTree::Punct(p)) = ret_ty.tokens.first()
+        && p.as_char() == '&'
+    {
+        return bail!(
+            ret_ty,
+            "#[func] does not support reference return types \
+            (`&T` or `&mut T`); use a value type instead"
+        );
+    }
+
+    Ok(())
 }
 
 /// Parses an entire item (`fn`, `const`) inside an `impl` block and returns a domain representation.
@@ -695,10 +732,14 @@ fn parse_signal_attr(
 
     // Private #[signal(__no_builder)]
     let no_builder = parser.handle_alone("__no_builder")?;
+    let internal = parser.handle_alone("internal")?;
 
     parser.finish()?;
 
-    let signal_attr = SignalAttr { no_builder };
+    let signal_attr = SignalAttr {
+        no_builder,
+        internal,
+    };
 
     Ok(AttrParseResult::Signal(signal_attr, attr.value.clone()))
 }

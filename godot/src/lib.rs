@@ -10,7 +10,7 @@
 //! The **gdext** library implements Rust bindings for the [Godot](https://godotengine.org) engine, more precisely its version 4.
 //! It does so using the GDExtension API, a C interface to integrate third-party language bindings with the engine.
 //!
-//! This API doc is accompanied by the [book](https://github.com/godot-rust/book), which provides tutorials
+//! This API doc is accompanied by the [book](https://godot-rust.github.io/book), which provides tutorials
 //! that guide you along the way.
 //!
 //! An overview of fundamental types and concepts can be found on [this page](__docs).
@@ -119,12 +119,19 @@
 //!   `api-custom` feature requires specifying `GDRUST_GODOT_BIN` environment variable with a path to your Godot4 binary.
 //!
 //!   The `api-custom-json` feature requires specifying `GDRUST_GODOT_API_JSON` environment variable with a path
-//!   to your custom-defined `extension_api.json`.<br><br>
+//!   to your custom-defined `extension_api.json`. The custom header should be set with the `GDRUST_GODOT_INTERFACE_JSON` environment variable
+//!   when generated extension API targets a Godot version greater than the latest stable – otherwise you might encounter compile errors
+//!   if the library tries to use an interface method that is not yet included in the latest stable header. <br><br>
 //!
 //! * **`double-precision`**
 //!
 //!   Use `f64` instead of `f32` for the floating-point type [`real`][type@builtin::real]. Requires Godot to be compiled with the
 //!   scons flag `precision=double`.<br><br>
+//!
+//! * **`upcoming-editor-placeholders`**
+//!
+//!   Opt-in support for inspecting editor placeholder instances of non-`#[class(tool)]` classes (Godot 4.3+ runtime classes).
+//!   Useful when editor-side code needs to distinguish placeholders from fully-attached Rust instances. Will become the default in v0.6.<br><br>
 //!
 //! * **`experimental-godot-api`**
 //!
@@ -175,7 +182,8 @@
 //!   Generates documentation for your structs from your Rust documentation.
 //!   Documentation is visible in Godot via `F1` -> searching for that class.
 //!   This feature requires at least Godot 4.3.
-//!   See also: [`#[derive(GodotClass)]`](register/derive.GodotClass.html#documentation)
+//!
+//!   See also [`#[derive(GodotClass)]`](register/derive.GodotClass.html#documentation), especially the Security note.<br><br>
 //!
 //! _Safeguards:_
 //!
@@ -253,38 +261,21 @@ pub mod init {
 
 /// Meta-information about Godot types, their properties and conversions between them.
 pub mod meta {
-    // Submodules.
-    // Derive macro (moved from `register`).
-    pub use godot_core::meta::ClassId;
-    #[doc(hidden)]
-    pub use godot_core::meta::arg_into_owned;
-    #[cfg(feature = "__trace")]
-    #[doc(hidden)]
-    pub use godot_core::meta::trace;
-    // Argument conversions that stay in flat `meta`.
-    pub use godot_core::meta::{AsArg, ObjectArg, ToArg, owned_into_arg, ref_to_arg};
-    // Hidden internal items for proc-macros and generated code.
-    #[doc(hidden)]
-    pub use godot_core::meta::{CallContext, Signature, ensure_func_bounds};
-    #[cfg(feature = "__trace")]
-    #[doc(hidden)]
-    pub use godot_core::meta::{CowArg, FfiArg};
-    // Type traits.
     pub use godot_core::meta::{
-        Element, GodotImmutable, GodotType, PackedElement, element_variant_type,
+        AsArg, ClassId, Element, EngineFromGodot, EngineToGodot, FromGodot, GodotConvert,
+        GodotImmutable, GodotType, ObjectArg, PackedElement, SignedRange, ToArg, ToGodot,
+        element_variant_type, owned_into_arg, ref_to_arg, wrapped,
     };
-    // Conversion traits.
-    pub use godot_core::meta::{EngineFromGodot, EngineToGodot, FromGodot, GodotConvert, ToGodot};
-    // Range utilities.
-    pub use godot_core::meta::{SignedRange, wrapped};
     #[doc(inline)]
     pub use godot_core::meta::{conv, error, inspect, shape};
+    // TODO(v0.6): this re-export prevents `godot::meta` from being a module alias `#[doc(inline)] pub use godot_core::meta`.
+    // If resolved by moving macro, search for "meta/index.html" (or just "index.html") and revert those links to `[...][crate::meta]`.
     pub use godot_macros::GodotConvert;
 }
 
 /// Runtime types for working with signals: connecting, emitting, and handling.
 pub mod signal {
-    pub use godot_core::obj::signal::re_export::*;
+    pub use godot_core::signal::*;
 }
 
 /// Register/export Rust symbols to Godot: classes, methods, enums...

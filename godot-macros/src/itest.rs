@@ -23,6 +23,7 @@ pub fn attribute_itest(input_item: venial::Item) -> ParseResult<TokenStream> {
     let skipped = attr.handle_alone("skip")?;
     let focused = attr.handle_alone("focus")?;
     let is_async = attr.handle_alone("async")?;
+    let editor_only = attr.handle_alone("editor")?;
     attr.finish()?;
 
     // Note: allow attributes for things like #[rustfmt] or #[clippy]
@@ -75,16 +76,16 @@ pub fn attribute_itest(input_item: venial::Item) -> ParseResult<TokenStream> {
 
     let body = &func.body;
 
-    let (return_tokens, test_case_ty, plugin_name);
+    let (return_tokens, test_case_ty, shard_name);
     if is_async {
         let [arrow, arrow_head] = func.tk_return_arrow.unwrap();
         return_tokens = quote! { #arrow #arrow_head #return_ty }; // retain span.
         test_case_ty = quote! { crate::framework::AsyncRustTestCase };
-        plugin_name = ident("__GODOT_ASYNC_ITEST");
+        shard_name = ident("__GODOT_ASYNC_ITEST");
     } else {
         return_tokens = TokenStream::new();
         test_case_ty = quote! { crate::framework::RustTestCase };
-        plugin_name = ident("__GODOT_ITEST");
+        shard_name = ident("__GODOT_ITEST");
     };
 
     // Filter out #[itest] itself, but preserve other attributes like #[allow], #[expect], etc.
@@ -95,10 +96,11 @@ pub fn attribute_itest(input_item: venial::Item) -> ParseResult<TokenStream> {
         pub fn #test_name(#param) #return_tokens
             #body
 
-        ::godot::sys::plugin_add!(crate::framework::#plugin_name; #test_case_ty {
+        ::godot::sys::shard_add!(crate::framework::#shard_name; #test_case_ty {
             name: #test_name_str,
             skipped: #skipped,
             focused: #focused,
+            editor_only: #editor_only,
             file: std::file!(),
             line: std::line!(),
             function: #test_name,

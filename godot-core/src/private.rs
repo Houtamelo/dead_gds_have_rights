@@ -5,15 +5,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::cell::Cell;
 #[cfg(safeguards_strict)]
 use std::cell::RefCell;
 use std::io::Write;
 use std::sync::atomic;
 
-use sys::Global;
-
 use crate::global::godot_error;
-use crate::meta::CallContext;
 use crate::meta::error::{CallError, CallResult};
 use crate::obj::Gd;
 use crate::registry::property::Var;
@@ -23,19 +21,22 @@ use crate::{classes, sys};
 // Public re-exports
 
 mod reexport_pub {
+    pub use crate::arg_into_owned;
     #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-    pub use crate::docs::{DocsItem, DocsPlugin, InherentImplDocs, StructDocs};
+    pub use crate::docs::{DocsItem, DocsShard, InherentImplDocs, StructDocs};
     pub use crate::r#gen::classes::class_macros;
     pub use crate::r#gen::virtuals; // virtual fn names, hashes, signatures
+    pub use crate::meta::private_reexport::*;
     #[cfg(feature = "trace")]
-    pub use crate::meta::trace;
+    pub use crate::meta::{CowArg, FfiArg, trace};
+    pub use crate::obj::rpc::priv_re_export::*;
     pub use crate::obj::rtti::ObjectRtti;
-    pub use crate::obj::signal::priv_re_export::*;
     pub use crate::registry::callbacks;
-    pub use crate::registry::plugin::{
-        ClassPlugin, DynTraitImpl, ErasedDynGd, ErasedRegisterFn, ITraitImpl, InherentImpl,
-        PluginItem, Struct,
+    pub use crate::registry::shard::{
+        ClassShard, DynTraitImpl, ErasedDynGd, ErasedRegisterFn, ITraitImpl, InherentImpl,
+        ShardItem, Struct,
     };
+    pub use crate::signal::priv_re_export::*;
     pub use crate::storage::{
         IntoVirtualMethodReceiver, RecvGdSelf, RecvMut, RecvRef, Storage, VirtualMethodReceiver,
         as_storage,
@@ -47,123 +48,102 @@ pub use reexport_pub::*;
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Global variables
 
-static CALL_ERRORS: Global<CallErrors> = Global::default();
+sys::atomic_enum! {
+    #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+    pub enum ErrorPrintLevel {
+        /// All errors are printed (default).
+        Normal = 2,
+        /// Reserved for future use; intended for `try_` call sites where errors are expected and printing is noisy.
+        Reduced = 1,
+        /// No error printing; used during `expect_panic` in tests.
+        Silent = 0,
+    }
+}
 
-/// Level:
-/// - 0: no error printing (during `expect_panic` in test)
-/// - 1: not yet implemented, but intended for `try_` function calls (which are expected to fail, so error is annoying)
-/// - 2: normal printing
-static ERROR_PRINT_LEVEL: atomic::AtomicU8 = atomic::AtomicU8::new(2);
+static ERROR_PRINT_LEVEL: sys::AtomicEnum<ErrorPrintLevel> = sys::AtomicEnum::default();
 
-sys::plugin_registry!(pub __GODOT_PLUGIN_REGISTRY: ClassPlugin);
+sys::shard_registry!(pub __GODOT_SHARD_REGISTRY: ClassShard);
 #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-sys::plugin_registry!(pub __GODOT_DOCS_REGISTRY: DocsPlugin);
+sys::shard_registry!(pub __GODOT_DOCS_REGISTRY: DocsShard);
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Call error handling
 
-// Note: if this leads to many allocated IDs that are not removed, we could limit to 1 per thread-ID.
-// Would need to check if re-entrant calls with multiple errors per thread are possible.
-struct CallErrors {
-    ring_buffer: Vec<Option<CallError>>,
-    next_id: u8,
-    generation: u16,
+// Thread-local storage for rich `CallError` produced by `#[func]` methods returning `Result<T, E>`.
+//
+// When a Rust `#[func]` fails (returns Err), the error is stashed here so that Rust's `try_call()` can retrieve it
+// after the Godot round-trip. The varcall FFI callback simultaneously sets `CALL_FAILED_STATUS` so that Godot's own
+// GDScript VM recognizes the failure and aborts the calling script function.
+//
+// Thread-safety: varcall callbacks execute on the calling thread, and `try_call` reads the result on the same
+// thread before any other call can overwrite it. No mutex is needed.
+thread_local! {
+    static LAST_CALL_ERROR: Cell<Option<CallError>> = const { Cell::new(None) };
+
+    // Depth of active Rust-initiated out-calls to Godot on the class out-call path (`out_class_varcall`, reached via
+    // `call`/`try_call`). When > 0, we're waiting for an FFI round-trip. If Godot re-enters Rust and a `#[func]` fails,
+    // the Rust caller will observe the error via the `CallResult`/`CallError` return -- so the in-Godot print would
+    // just be noise. Panic prints are still emitted (backtrace info is worth keeping regardless of out-call context).
+    static OUT_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-impl Default for CallErrors {
-    fn default() -> Self {
-        Self {
-            ring_buffer: [const { None }; Self::MAX_ENTRIES as usize].into(),
-            next_id: 0,
-            generation: 0,
-        }
-    }
+/// Store a [`CallError`] in thread-local storage for later retrieval by [`call_error_take`].
+fn call_error_store(err: CallError) {
+    LAST_CALL_ERROR.set(Some(err));
 }
 
-impl CallErrors {
-    const MAX_ENTRIES: u8 = 32;
+/// Take the [`CallError`] previously stored by [`call_error_store`], if any.
+///
+/// Returns `None` if no error was stored (i.e. the failure originated from Godot, not from gdext).
+pub(crate) fn call_error_take() -> Option<CallError> {
+    LAST_CALL_ERROR.take()
+}
 
-    fn insert(&mut self, err: CallError) -> i32 {
-        let id = self.next_id;
+/// RAII guard marking that a Rust-initiated out-call to Godot is in progress on this thread.
+///
+/// While any guard is live, inbound `#[func]` failures on the same thread skip their `godot_error!` print, since the Rust
+/// caller already observes the failure via the returned `CallError`/panic and the extra print would be redundant noise.
+pub(crate) struct OutCallGuard;
 
-        self.next_id = self.next_id.wrapping_add(1) % Self::MAX_ENTRIES;
-        if self.next_id == 0 {
-            self.generation = self.generation.wrapping_add(1);
-        }
-
-        self.ring_buffer[id as usize] = Some(err);
-
-        (self.generation as i32) << 16 | id as i32
-    }
-
-    // Returns success or failure.
-    fn remove(&mut self, id: i32) -> Option<CallError> {
-        let generation = (id >> 16) as u16;
-        let id = id as u8;
-
-        // If id < next_id, the generation must be the current one -- otherwise the one before.
-        if id < self.next_id {
-            if generation != self.generation {
-                return None;
-            }
-        } else if generation != self.generation.wrapping_sub(1) {
-            return None;
-        }
-
-        // Returns Some if there's still an entry, None if it was already removed.
-        self.ring_buffer[id as usize].take()
+impl OutCallGuard {
+    #[must_use = "guard must be bound to a local; dropping it immediately ends the out-call scope"]
+    pub fn new() -> Self {
+        OUT_CALL_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
     }
 }
 
-/// Inserts a `CallError` into a global variable and returns its ID to later remove it.
-fn call_error_insert(err: CallError) -> i32 {
-    // Wraps around if entire i32 is depleted. If this happens in practice (unlikely, users need to deliberately ignore errors that are printed),
-    // we just overwrite the oldest errors, should still work.
-    CALL_ERRORS.lock().insert(err)
-}
-
-pub(crate) fn call_error_remove(in_error: &sys::GDExtensionCallError) -> Option<CallError> {
-    // Error checks are just quality-of-life diagnostic; do not throw panics if they fail.
-
-    if in_error.error != sys::GODOT_RUST_CUSTOM_CALL_ERROR {
-        godot_error!("Tried to remove non-godot-rust call error {in_error:?}");
-        return None;
+impl Drop for OutCallGuard {
+    fn drop(&mut self) {
+        OUT_CALL_DEPTH.with(|d| d.set(d.get() - 1));
     }
-
-    let call_error = CALL_ERRORS.lock().remove(in_error.argument);
-    if call_error.is_none() {
-        // Just a quality-of-life diagnostic; do not throw panics if something like this fails.
-        godot_error!("Failed to remove call error {in_error:?}");
-    }
-
-    call_error
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
-// Plugin and global state handling
+// Shard and global state handling
 
 pub fn next_class_id() -> u16 {
     static NEXT_CLASS_ID: atomic::AtomicU16 = atomic::AtomicU16::new(0);
     NEXT_CLASS_ID.fetch_add(1, atomic::Ordering::Relaxed)
 }
 
-pub(crate) fn iterate_plugins(mut visitor: impl FnMut(&ClassPlugin)) {
-    sys::plugin_foreach!(__GODOT_PLUGIN_REGISTRY; visitor);
+pub(crate) fn iterate_shards(mut visitor: impl FnMut(&ClassShard)) {
+    sys::shard_foreach!(__GODOT_SHARD_REGISTRY; visitor);
 }
 
 #[cfg(all(since_api = "4.3", feature = "register-docs"))]
-pub(crate) fn iterate_docs_plugins(mut visitor: impl FnMut(&DocsPlugin)) {
-    sys::plugin_foreach!(__GODOT_DOCS_REGISTRY; visitor);
+pub(crate) fn iterate_docs_shards(mut visitor: impl FnMut(&DocsShard)) {
+    sys::shard_foreach!(__GODOT_DOCS_REGISTRY; visitor);
 }
 
 #[cfg(feature = "codegen-full")] // Remove if used in other scenarios.
 pub(crate) fn find_inherent_impl(class_name: crate::meta::ClassId) -> Option<InherentImpl> {
-    // We do this manually instead of using `iterate_plugins()` because we want to break as soon as we find a match.
-    let plugins = __GODOT_PLUGIN_REGISTRY.lock().unwrap();
+    // We do this manually instead of using `iterate_shards()` because we want to break as soon as we find a match.
+    let shards = __GODOT_SHARD_REGISTRY.lock().unwrap();
 
-    plugins.iter().find_map(|elem| {
+    shards.iter().find_map(|elem| {
         if elem.class_name == class_name
-            && let PluginItem::InherentImpl(inherent_impl) = &elem.item
+            && let ShardItem::InherentImpl(inherent_impl) = &elem.item
         {
             return Some(inherent_impl.clone());
         }
@@ -199,7 +179,7 @@ pub fn typecheck_setter<C, T: Var>(_setter: fn(&mut C, T::PubType)) {}
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Capability queries and internal access
 
-pub fn auto_init<T>(l: &mut crate::obj::OnReady<T>, base: &crate::obj::Gd<crate::classes::Node>) {
+pub fn auto_init<T>(l: &mut crate::obj::OnReady<T>, base: &Gd<classes::Node>) {
     l.init_auto(base);
 }
 
@@ -215,26 +195,25 @@ pub unsafe fn has_virtual_script_method(
 }
 
 /// Ensure `T` is an editor plugin.
-pub const fn is_editor_plugin<T: crate::obj::Inherits<crate::classes::EditorPlugin>>() {}
+pub const fn is_editor_plugin<T: crate::obj::Inherits<classes::EditorPlugin>>() {}
 
 // Starting from 4.3, Godot has "runtime classes"; this emulation is no longer needed.
 #[cfg(before_api = "4.3")]
 pub fn is_class_inactive(is_tool: bool) -> bool {
-    use crate::obj::Singleton;
-
     if is_tool {
         return false;
     }
 
     // SAFETY: only invoked after global library initialization.
     let global_config = unsafe { sys::config() };
-    let is_editor = || crate::classes::Engine::singleton().is_editor_hint();
 
-    global_config.tool_only_in_editor //.
-        && global_config.is_editor_or_init(is_editor)
+    // Unknown is unreachable here: virtual dispatch only runs post-registration, by which point editor state is populated
+    // (InitLevel::Scene on Godot < 4.4). `false` is a safe fallback.
+    global_config.tool_only_in_editor && sys::is_editor_or_unknown().unwrap_or(false)
 }
 
 // Starting from 4.3, Godot has "runtime classes"; we only need to check whether editor is running.
+// Runtime classes only get placeholder instances in the editor (no Rust constructor is called). `bind()` panics if called on placeholders.
 #[cfg(since_api = "4.3")]
 pub fn is_class_runtime(is_tool: bool) -> bool {
     if is_tool {
@@ -362,14 +341,12 @@ where
     }));
 }
 
-pub fn set_error_print_level(level: u8) -> u8 {
-    assert!(level <= 2);
-    ERROR_PRINT_LEVEL.swap(level, atomic::Ordering::Relaxed)
+pub fn set_error_print_level(level: ErrorPrintLevel) -> ErrorPrintLevel {
+    ERROR_PRINT_LEVEL.replace(level)
 }
 
-pub(crate) fn has_error_print_level(level: u8) -> bool {
-    assert!(level <= 2);
-    ERROR_PRINT_LEVEL.load(atomic::Ordering::Relaxed) >= level
+pub(crate) fn has_error_print_level(level: ErrorPrintLevel) -> bool {
+    ERROR_PRINT_LEVEL.load() >= level
 }
 
 /// Internal type used to store context information for debug purposes. Debug context is stored on the thread-local
@@ -477,6 +454,18 @@ where
     result
 }
 
+// Error code set on the varcall output when a `#[func]` fails (panic, parameter conversion, or `Result<T, E>` returning `Err`).
+//
+// None of the existing GDExtension call errors is great for this scenario -- all lead to misleading messages in the Godot console.
+// A custom out-of-range value causes "Bug: Invalid call error code 1337." in Godot's output, which is at least clearly non-standard.
+// Note that INVALID_METHOD must not be used: it signals that the method doesn't exist, which GDScript may treat as a fatal static error.
+// An alternative would be GDEXTENSION_CALL_ERROR_INSTANCE_IS_NULL.
+//
+// The GDScript VM interprets any non-OK code as "call failed, abort calling function", which is what we want. The "Bug: ..." print is
+// unavoidable at the VM level (no GDExtension code maps to a clean message); the preceding godot-rust `CallError` print carries the
+// actual diagnostic information.
+const CALL_FAILED_STATUS: sys::GDExtensionCallErrorType = 1337;
+
 /// Invokes a function with the _varcall_ calling convention, handling both expected errors and user panics.
 pub fn handle_fallible_varcall<F, R>(
     call_ctx: &CallContext,
@@ -485,16 +474,15 @@ pub fn handle_fallible_varcall<F, R>(
 ) where
     F: FnOnce() -> CallResult<R> + std::panic::UnwindSafe,
 {
-    if let Some(error_id) = handle_fallible_call(call_ctx, code, true) {
-        // Abuse 'argument' field to store our ID.
+    if handle_fallible_call(call_ctx, code) {
+        // Use CALL_FAILED_STATUS so the GDScript VM recognizes the failure and aborts the calling function.
+        // The Rust-side CallError has been stored in the thread-local, so that try_call() can retrieve it later.
         *out_err = sys::GDExtensionCallError {
-            error: sys::GODOT_RUST_CUSTOM_CALL_ERROR,
-            argument: error_id,
+            error: CALL_FAILED_STATUS,
+            argument: 0,
             expected: 0,
         };
     };
-
-    //sys::interface_fn!(variant_new_nil)(sys::AsUninit::as_uninit(ret));
 }
 
 /// Invokes a function with the _ptrcall_ calling convention, handling both expected errors and user panics.
@@ -502,16 +490,15 @@ pub fn handle_fallible_ptrcall<F>(call_ctx: &CallContext, code: F)
 where
     F: FnOnce() -> CallResult<()> + std::panic::UnwindSafe,
 {
-    handle_fallible_call(call_ctx, code, false);
+    handle_fallible_call(call_ctx, code);
 }
 
 /// Common error handling for fallible calls, handling detectable errors and user panics.
 ///
-/// Returns `None` if the call succeeded, or `Some(error_id)` if it failed.
+/// Returns `true` if the call failed, `false` if it succeeded.
 ///
-/// `track_globally` indicates whether the error should be stored as an index in the global error database (for varcall calls), to convey
-/// out-of-band, godot-rust specific error information to the caller.
-fn handle_fallible_call<F, R>(call_ctx: &CallContext, code: F, track_globally: bool) -> Option<i32>
+/// On failure, the [`CallError`] is stored in thread-local storage for later retrieval via [`call_error_take`].
+fn handle_fallible_call<F, R>(call_ctx: &CallContext, code: F) -> bool
 where
     F: FnOnce() -> CallResult<R> + std::panic::UnwindSafe,
 {
@@ -520,7 +507,7 @@ where
 
     let call_error = match outcome {
         // All good.
-        Ok(Ok(_result)) => return None,
+        Ok(Ok(_result)) => return false,
 
         // Error from Godot or godot-rust validation (e.g. parameter conversion).
         Ok(Err(err)) => err,
@@ -530,9 +517,13 @@ where
     };
 
     // Print failed calls to Godot's console.
-    // TODO(v0.6): Level 1 is not yet set, so this will always print if level != 0. Needs better logic to recognize try_* calls and avoid printing.
-    // But a bit tricky with multiple threads and re-entrancy; maybe pass in info in error struct.
-
+    //
+    // OUT_CALL_DEPTH > 0 means this failure is observed during a Rust-initiated out-call (e.g. `try_call`); the caller already sees
+    // the `CallError` via return value, so printing here would just be noise.
+    //
+    // Coverage gap: only `Signature::out_class_varcall` sets the guard. If a `#[func]` re-enters Rust via `out_utility_call`,
+    // `out_builtin_ptrcall`, or `out_script_virtual_call`, the redundant print returns. Extend the guard to those paths if reported.
+    //
     // caused_by_panic() check to avoid printing (2) once the panic message (1) is already printed:
     //
     // (1)  ERROR: [panic hot-reload/rust/src/lib.rs:37]
@@ -546,18 +537,15 @@ where
     // (2) ERROR: godot-rust function call failed: MyClass::my_method()
     //        Reason: function panicked: some panic message
     //     at: ...
-    if has_error_print_level(2) && !call_error.caused_by_panic() {
+    if has_error_print_level(ErrorPrintLevel::Normal)
+        && !call_error.caused_by_panic()
+        && OUT_CALL_DEPTH.with(|d| d.get() == 0)
+    {
         godot_error!("{call_error}");
     }
 
-    // Once there is a way to auto-remove added errors, this could be always true.
-    let error_id = if track_globally {
-        call_error_insert(call_error)
-    } else {
-        0
-    };
-
-    Some(error_id)
+    call_error_store(call_error);
+    true
 }
 
 // Currently unused; implemented due to temporary need and may come in handy.
@@ -572,8 +560,9 @@ pub fn rebuild_gd(object_ref: &classes::Object) -> Gd<classes::Object> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CallError, CallErrors, PanicPayload};
+    use super::{CallError, PanicPayload, call_error_store, call_error_take};
     use crate::meta::CallContext;
+    use crate::sys;
 
     fn make(index: usize) -> CallError {
         let method_name = format!("method_{index}");
@@ -584,39 +573,87 @@ mod tests {
     }
 
     #[test]
-    fn test_call_errors() {
-        let mut store = CallErrors::default();
+    fn thread_local_store_and_take() {
+        // Initially empty.
+        assert!(call_error_take().is_none());
 
-        let mut id07 = 0;
-        let mut id13 = 0;
-        let mut id20 = 0;
-        for i in 0..24 {
-            let id = store.insert(make(i));
-            match i {
-                7 => id07 = id,
-                13 => id13 = id,
-                20 => id20 = id,
-                _ => {}
-            }
-        }
+        // Store, then take.
+        call_error_store(make(1));
+        let e = call_error_take().expect("must be present");
+        assert_eq!(e.method_name(), "method_1");
 
-        let e = store.remove(id20).expect("must be present");
-        assert_eq!(e.method_name(), "method_20");
+        // Second take returns None.
+        assert!(call_error_take().is_none());
+    }
 
-        let e = store.remove(id20);
-        assert!(e.is_none());
+    #[test]
+    fn thread_local_overwrite() {
+        // Storing twice overwrites the first.
+        call_error_store(make(1));
+        call_error_store(make(2));
+        let e = call_error_take().expect("must be present");
+        assert_eq!(e.method_name(), "method_2");
 
-        for i in 24..CallErrors::MAX_ENTRIES as usize {
-            store.insert(make(i));
-        }
-        for i in 0..10 {
-            store.insert(make(i));
-        }
+        assert!(call_error_take().is_none());
+    }
 
-        let e = store.remove(id07);
-        assert!(e.is_none(), "generation overwritten");
+    /// Regression test: a stale TLS entry from an earlier `#[func]` failure must not be misattributed to a later, unrelated varcall failure.
+    /// `check_out_varcall` drains TLS unconditionally, so a Godot-side error (e.g. wrong arg count) after a stale store must *not* wrap the
+    /// stale error. "TLS" means thread-local storage.
+    #[test]
+    fn stale_tls_not_misattributed() {
+        use crate::meta::error::CallError;
 
-        let e = store.remove(id13).expect("generation not yet overwritten");
-        assert_eq!(e.method_name(), "method_13");
+        // Simulate a previous #[func] failure that was never consumed (e.g. GDScript was the caller).
+        call_error_store(make(99));
+
+        // Simulate a subsequent varcall that succeeds -- TLS must be drained.
+        let call_ctx = CallContext::outbound("Object", "call");
+        let ok_err = sys::GDExtensionCallError {
+            error: sys::GDEXTENSION_CALL_OK,
+            argument: 0,
+            expected: 0,
+        };
+        let result =
+            CallError::check_out_varcall(&call_ctx, ok_err, &[] as &[crate::builtin::Variant], &[]);
+        assert!(result.is_ok(), "successful call must return Ok");
+
+        // TLS must now be empty.
+        assert!(
+            call_error_take().is_none(),
+            "TLS must be drained after check_out_varcall"
+        );
+    }
+
+    /// Verify that when a varcall fails with a Godot-side error and there is *no* stale TLS entry,
+    /// the error is decoded from the Godot error struct (no source wrapping).
+    #[test]
+    fn varcall_godot_error_without_tls() {
+        use std::error::Error as _;
+
+        use crate::meta::error::CallError;
+
+        // Ensure TLS is clean.
+        let _ = call_error_take();
+
+        let call_ctx = CallContext::outbound("Node", "rpc_config");
+        let godot_err = sys::GDExtensionCallError {
+            error: sys::GDEXTENSION_CALL_ERROR_TOO_FEW_ARGUMENTS,
+            argument: 2,
+            expected: 3,
+        };
+        let result = CallError::check_out_varcall(
+            &call_ctx,
+            godot_err,
+            &[] as &[crate::builtin::Variant],
+            &[],
+        );
+        let err = result.expect_err("must fail");
+
+        // Must be a direct Godot error, not a wrapped source error.
+        assert!(
+            err.source().is_none(),
+            "Godot-side error must not have a source (stale or otherwise)"
+        );
     }
 }

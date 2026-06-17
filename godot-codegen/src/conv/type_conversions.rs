@@ -15,7 +15,7 @@ use quote::{ToTokens, quote};
 use crate::context::Context;
 use crate::conv;
 use crate::models::domain::{ArgPassing, FlowDirection, GodotTy, ModName, RustTy, TyName};
-use crate::special_cases::is_builtin_type_scalar;
+use crate::special_cases::{get_global_enum_rust_path, is_builtin_type_scalar};
 use crate::util::ident;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -67,7 +67,7 @@ fn to_hardcoded_rust_ident(full_ty: &GodotTy) -> Option<Ident> {
             None => "_unused__Dictionary_must_not_appear_in_idents",
         },
 
-        // Types needed for native structures mapping
+        // Types needed for native structures mapping; duplicated in header_codegen.rs map_c_type().
         ("uint8_t", None) => "u8",
         ("uint16_t", None) => "u16",
         ("uint32_t", None) => "u32",
@@ -202,6 +202,9 @@ fn to_rust_type_uncached(full_ty: &GodotTy, ctx: &mut Context) -> RustTy {
             TyName::from_godot(ty).rust_ty
         }
     }
+
+    // Code duplication: pointer parsing logic - generator/header_codegen.rs::map_c_type().
+    // Future refactoring: extract C type parsing to dedicated file.
 
     if ty.ends_with('*') {
         // Pointer type; strip '*', see if const, and then resolve the inner type.
@@ -345,10 +348,11 @@ pub(crate) fn to_enum_type_uncached(enum_or_bitfield: &str, is_bitfield: bool) -
         to_class_enum_uncached("Resource", enum_or_bitfield, is_bitfield)
     } else {
         // Global enum or bitfield.
+        let path = get_global_enum_rust_path(enum_or_bitfield);
         let enum_or_bitfield_name = conv::make_enum_name(enum_or_bitfield);
 
         RustTy::EngineEnum {
-            tokens: quote! { crate::global::#enum_or_bitfield_name },
+            tokens: quote! { #path::#enum_or_bitfield_name },
             surrounding_class: None,
             is_bitfield,
         }

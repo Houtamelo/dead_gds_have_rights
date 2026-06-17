@@ -18,12 +18,13 @@ use crate::meta;
 use crate::meta::{FromGodot, GodotType, ToGodot};
 use crate::obj::bounds::DynMemory;
 use crate::obj::{Bounds, EngineBitfield, Gd, GodotClass, InstanceId};
+use crate::signal::store_custom_callable_connection;
 
 /// Untyped Godot signal.
 ///
 /// Signals are composed of a pointer to an `Object` and the name of the signal on this object.
 ///
-/// In Rust, you might want to work with type-safe signals, available under the [`TypedSignal`](crate::obj::signal::TypedSignal) struct.
+/// In Rust, you might want to work with type-safe signals, available under the [`TypedSignal`][crate::signal::TypedSignal] struct.
 ///
 /// # Godot docs
 /// [`Signal` (stable)](https://docs.godotengine.org/en/stable/classes/class_signal.html)
@@ -74,6 +75,7 @@ impl Signal {
     pub fn connect(&self, callable: &Callable) -> Error {
         let error = self.as_inner().connect(callable, 0i64);
 
+        track_custom_callable(self, callable);
         Error::from_godot(error as i32)
     }
 
@@ -88,6 +90,7 @@ impl Signal {
     pub fn connect_flags(&self, callable: &Callable, flags: ConnectFlags) -> Error {
         let error = self.as_inner().connect(callable, flags.ord() as i64);
 
+        track_custom_callable(self, callable);
         Error::from_godot(error as i32)
     }
 
@@ -137,10 +140,17 @@ impl Signal {
     ///
     /// _Godot equivalent: `get_object`_
     pub fn object(&self) -> Option<Gd<Object>> {
-        self.as_inner().get_object().map(|mut object| {
-            <Object as Bounds>::DynMemory::maybe_inc_ref(&mut object.raw);
-            object
-        })
+        let object = self.as_inner().get_object()?;
+
+        // `get_object()` may hand out a pointer to an already-freed object (e.g. when the object was destroyed on another thread).
+        // Validate liveness before touching the instance, honoring this method's contract to return `None` for dead objects. Without this,
+        // `maybe_inc_ref()` below would access the freed instance and panic -- fatal if it happens during `Drop`, see `FallibleSignalFuture`.
+        if !object.is_instance_valid() {
+            return None;
+        }
+
+        <Object as Bounds>::DynMemory::maybe_inc_ref(object.raw.obj(), object.raw.cached_rtti());
+        Some(object)
     }
 
     /// Returns the ID of this signal's object, see also [`Gd::instance_id`].
@@ -156,11 +166,19 @@ impl Signal {
     }
 
     /// Returns `true` if the specified [`Callable`] is connected to this signal.
+    ///
+    /// If you need to do something with the object, prefer calling [`object()`][Self::object]. For `RefCounted` objects, this gives you a
+    /// strong-ref that cannot be invalidated while you hold it, and thus avoids [TOCTOU](https://en.wikipedia.org/wiki/Time-of-check_to_time-of-use)
+    /// issues with `is_null()` followed by connectivity or other checks.
     pub fn is_connected(&self, callable: &Callable) -> bool {
         self.as_inner().is_connected(callable)
     }
 
     /// Returns `true` if the signal's name does not exist in its object, or the object is not valid.
+    ///
+    /// If you need to do something with the object, prefer calling [`object()`][Self::object]. For `RefCounted` objects, this gives you a
+    /// strong-ref that cannot be invalidated while you hold it, and thus avoids [TOCTOU](https://en.wikipedia.org/wiki/Time-of-check_to_time-of-use)
+    /// issues with `is_null()` followed by connectivity or other checks.
     pub fn is_null(&self) -> bool {
         self.as_inner().is_null()
     }
@@ -168,6 +186,16 @@ impl Signal {
     #[doc(hidden)]
     pub fn as_inner(&self) -> inner::InnerSignal<'_> {
         inner::InnerSignal::from_outer(self)
+    }
+}
+
+/// See `Object::connect` companion in `type_safe_replacements.rs` for rationale.
+fn track_custom_callable(signal: &Signal, callable: &Callable) {
+    // Only the editor needs the registry; skip the `object()` FFI call entirely outside it.
+    if sys::is_editor()
+        && let Some(receiver) = signal.object()
+    {
+        store_custom_callable_connection(&receiver, &signal.name(), callable);
     }
 }
 
