@@ -142,7 +142,7 @@ fn signal_symbols_complex_emit() {
     }
 
     // Allows upcasting.
-    sig.emit(arg.upcast(), GString::from("hello"));
+    sig.emit(&arg.upcast::<Object>(), "hello");
 
     emitter.free();
 }

@@ -311,7 +311,7 @@ fn async_typed_signal_with_array() -> TaskHandle {
         assert_eq!(result, array![1, 2, 3]);
     });
 
-    object.signals().custom_signal_array().emit(array![1, 2, 3]);
+    object.signals().custom_signal_array().emit(&array![1, 2, 3]);
 
     task_handle
 }

@@ -76,7 +76,7 @@ impl<T: GodotClass> RawGd<T> {
         };
 
         Self {
-            memory: <T as Bounds>::DynMemory::new(obj.cast(), rtti),
+            memory: T::DynMemory::new(obj.cast(), rtti),
             cached_storage_ptr: InstanceCache::null(),
         }
     }
@@ -401,7 +401,7 @@ impl<T: GodotClass> RawGd<T> {
     /// but the object may already be dead. This is an internal helper for `check_rtti()`.
     #[cfg(safeguards_strict)]
     #[inline]
-    pub(crate) fn check_dynamic_type(&self, call_ctx: &CallContext<'static>) -> InstanceId {
+    pub(crate) fn check_dynamic_type(&self, call_ctx: &CallContext<'static>) {
         assert!(
             !self.is_null(),
             "internal bug: {call_ctx}: cannot call method on null object",
@@ -411,7 +411,6 @@ impl<T: GodotClass> RawGd<T> {
         // SAFETY: RawGd non-null (checked above).
         let rtti = unsafe { rtti.unwrap_unchecked() };
         rtti.check_type::<T>();
-        rtti.instance_id()
     }
 
     /// Creates a validated object for FFI boundary crossing.
@@ -622,7 +621,7 @@ where
             // the reference count again.
             unsafe { interface_fn!(ref_set_object)(ptr as sys::GDExtensionRefPtr, self.obj_sys()) };
         } else {
-            unsafe { ptr::write(ptr as *mut _, self.memory.obj()) };
+            unsafe { ptr::write(ptr as *mut *mut T, self.memory.obj().cast()) };
             // We've passed ownership to caller.
             std::mem::forget(self);
         }
@@ -726,7 +725,7 @@ impl<T: GodotClass> Clone for RawGd<T> {
     fn clone(&self) -> Self {
         out!("RawGd::clone:     {self:?}  (before clone)");
 
-        let cloned = if self.is_null() || !self.is_instance_valid() {
+        let cloned = if self.is_null() {
             Self::null()
         } else {
             self.check_rtti("clone");

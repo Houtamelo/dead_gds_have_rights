@@ -64,7 +64,7 @@ impl DeferredTestNode {
 impl INode2D for DeferredTestNode {
     fn process(&mut self, _delta: f64) {
         let name = self.base().get_name();
-        self.signals().test_completed().emit(name);
+        self.signals().test_completed().emit(&name);
         self.base_mut().queue_free();
     }
 

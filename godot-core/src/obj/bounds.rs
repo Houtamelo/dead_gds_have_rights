@@ -110,7 +110,7 @@ pub(super) mod private {
     ///
     /// This is only necessary if you do not use the proc-macro API.
     ///
-    /// Since `Bounds` is a super-trait of [`GodotClass`][crate::obj::GodotClass], you cannot accidentally forget to implement it.
+    /// Since `Bounds` is a supertrait of [`GodotClass`][crate::obj::GodotClass], you cannot accidentally forget to implement it.
     ///
     /// # Example
     /// ```no_run
@@ -174,6 +174,22 @@ pub trait DynMemory: Sealed + Clone {
     /// If ref-counted, then increment count
     #[doc(hidden)]
     fn maybe_inc_ref(obj: *mut Self::TSelf, cached_rtti: Option<ObjectRtti>);
+
+    /// If ref-counted, then decrement count. Returns `true` if the count hit 0 and the object can be
+    /// safely freed.
+    ///
+    /// This behavior can be overriden by a script, making it possible for the function to return `false`
+    /// even when the reference count hits 0. This is meant to be used to have a separate reference count
+    /// from Godot's internal reference count, or otherwise stop the object from being freed when the
+    /// reference count hits 0.
+    ///
+    /// # Safety
+    ///
+    /// If this method is used on a [`Gd`] that inherits from [`RefCounted`](crate::classes::RefCounted)
+    /// then the reference count must either be incremented before it hits 0, or some [`Gd`] referencing
+    /// this object must be forgotten.
+    #[doc(hidden)]
+    unsafe fn maybe_dec_ref(obj: *mut Self::TSelf, cached_rtti: Option<ObjectRtti>) -> bool;
 
     /// Check if ref-counted, return `None` if information is not available (dynamic and obj dead)
     #[doc(hidden)]
@@ -252,12 +268,33 @@ impl<T: GodotClass> DynMemory for MemRefCounted<T> {
         };
     }
 
+    unsafe fn maybe_dec_ref(obj: *mut T, rtti: Option<ObjectRtti>) -> bool {
+        out!("MemRefCounted::maybe_dec_ref <{}>", std::any::type_name::<T>());
+
+        // SAFETY: This `Gd` won't be dropped again after this.
+        // If destruction is triggered by Godot, Storage already knows about it, no need to notify it
+
+        if gd_is_null(obj, rtti) {
+            return false;
+        }
+
+        // SAFETY: DynMemory=MemRefCounted statically guarantees T inherits RefCounted.
+        unsafe {
+            with_ref_counted_unchecked(obj, rtti, |refc| {
+                let is_last = refc.unreference();
+                out!("  +-- was last={is_last}");
+                is_last
+            })
+        }
+    }
+
     fn is_ref_counted(_rtti: Option<ObjectRtti>) -> Option<bool> {
         Some(true)
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn get_ref_count(obj: *mut T, rtti: Option<ObjectRtti>) -> Option<usize> {
+        // SAFETY: DynMemory=MemRefCounted statically guarantees T inherits RefCounted.
         let ref_count =
             unsafe { with_ref_counted_unchecked(obj, rtti, |refc| refc.get_reference_count()) };
 
@@ -282,34 +319,14 @@ impl<T: GodotClass> DynMemory for MemRefCounted<T> {
     }
 }
 
-impl<T: GodotClass> MemRefCounted<T> {
-    unsafe fn maybe_dec_ref(obj: *mut T, rtti: Option<ObjectRtti>) -> bool {
-        out!(
-            "MemRefCounted::maybe_dec_ref   <{}>",
-            std::any::type_name::<T>()
-        );
-
-        // SAFETY: This `Gd` won't be dropped again after this.
-        // If destruction is triggered by Godot, Storage already knows about it, no need to notify it
-
-        if gd_is_null(obj, rtti) {
-            false
-        } else {
-            with_ref_counted(obj, rtti, |refc| {
-                let is_last = refc.unreference();
-                out!("  +-- was last={is_last}");
-                is_last
-            })
-        }
-    }
-}
-
 impl<T: GodotClass> Drop for MemRefCounted<T> {
     fn drop(&mut self) {
         out!("MemRefCounted::drop   <{}>", std::any::type_name::<T>());
-        let should_drop = unsafe { Self::maybe_dec_ref(self.obj, self.cached_rtti) };
 
-        if should_drop {
+        // SAFETY: This `Gd` won't be dropped again after this.
+        // If destruction is triggered by Godot, Storage already knows about it, no need to notify it
+        let is_last = unsafe { Self::maybe_dec_ref(self.obj, self.cached_rtti) }; // may drop
+        if is_last {
             unsafe {
                 interface_fn!(object_destroy)(obj_sys(self.obj));
             }
@@ -339,12 +356,9 @@ impl<T: GodotClass> Clone for MemDynamic<T> {
 impl<T: GodotClass> MemDynamic<T> {
     /// Check whether dynamic type is ref-counted.
     fn inherits_refcounted(cached_rtti: Option<ObjectRtti>) -> bool
-    where
-        T: GodotClass,
     {
         cached_rtti
-            .map(|rtti| rtti.instance_id())
-            .is_some_and(|id| id.is_ref_counted())
+            .is_some_and(|rtti| rtti.instance_id().is_ref_counted())
     }
 }
 
@@ -369,6 +383,19 @@ impl<T: GodotClass> DynMemory for MemDynamic<T> {
         if Self::inherits_refcounted(cached_rtti) {
             // Will call `RefCounted::reference()` which checks for liveness.
             MemRefCounted::maybe_inc_ref(obj, cached_rtti)
+        }
+    }
+
+    unsafe fn maybe_dec_ref(obj: *mut T, rtti: Option<ObjectRtti>) -> bool {
+        unsafe {
+            out!("  MemDyn::dec:   {obj:?}");
+            if rtti.is_some_and(|r| r.instance_id().is_ref_counted())
+            {
+                // Will call `RefCounted::unreference()` which checks for liveness.
+                MemRefCounted::maybe_dec_ref(obj, rtti)
+            } else {
+                false
+            }
         }
     }
 
@@ -400,23 +427,13 @@ impl<T: GodotClass> DynMemory for MemDynamic<T> {
 
 impl<T: GodotClass> Drop for MemDynamic<T> {
     fn drop(&mut self) {
+        // No-op for manually managed objects
         out!("MemDynamic::drop   <{}>", std::any::type_name::<T>());
 
         // SAFETY: This `Gd` won't be dropped again after this.
         // If destruction is triggered by Godot, Storage already knows about it, no need to notify it
-        let should_drop = unsafe {
-            if self
-                .cached_rtti
-                .map(|rtti| rtti.instance_id())
-                .is_some_and(|id| id.is_ref_counted())
-            {
-                // Will call `RefCounted::unreference()` which checks for liveness.
-                MemRefCounted::maybe_dec_ref(self.obj, self.cached_rtti)
-            } else {
-                false
-            }
-        }; // may drop
-        if should_drop {
+        let is_last = unsafe { T::DynMemory::maybe_dec_ref(self.obj.cast(), self.cached_rtti) }; // may drop
+        if is_last {
             unsafe {
                 interface_fn!(object_destroy)(obj_sys(self.obj));
             }
@@ -451,6 +468,10 @@ impl<T: GodotClass> DynMemory for MemManual<T> {
     fn maybe_init_ref(_: *mut T, _: Option<ObjectRtti>) {}
 
     fn maybe_inc_ref(_: *mut Self::TSelf, _: Option<ObjectRtti>) {}
+
+    unsafe fn maybe_dec_ref(_: *mut Self::TSelf, _: Option<ObjectRtti>) -> bool {
+        false
+    }
 
     fn is_ref_counted(_: Option<ObjectRtti>) -> Option<bool> {
         Some(false)

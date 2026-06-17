@@ -773,6 +773,8 @@ pub type ToArg<'r, Via, Pass> = <Pass as ArgPassing>::Output<'r, Via>;
 ///
 ///     fn foo(&mut self) {
 ///         let arg = self.to_gd();
+///         // Directly:
+///         self.signals().signal_optional_user_obj().emit(&arg);
 ///         // Via Some:
 ///         self.signals().signal_optional_user_obj().emit(Some(arg));
 ///         // With None (Note: Gd::null_arg() is restricted to engine classes):

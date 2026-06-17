@@ -77,9 +77,8 @@ fn object_subtype_swap_method() {
 
 #[itest]
 fn object_subtype_swap_clone() {
-    use godot::classes::Resource;
     let mut obj: Gd<Object> = Object::new_alloc();
-    let mut node: Gd<Resource> = Resource::new_gd();
+    let mut node: Gd<Node> = Node::new_alloc();
 
     std::mem::swap(&mut *obj, &mut *node);
 
@@ -87,15 +86,7 @@ fn object_subtype_swap_clone() {
         let _ = node.clone();
     });
 
-    // Standard DerefMut no longer works, as it checks the RTTI which then panics.
-    // #[allow]: we don't know the types inside the macro, and Rust still doesn't have typeof/decltype.
-    #[allow(clippy::missing_transmute_annotations)]
-    std::mem::swap(&mut obj, unsafe { std::mem::transmute(&mut node) });
-    obj.free();
-
-    node = Resource::new_gd();
-    let _ = node;
-    let _ = node;
+    swapped_free!(obj, node);
 }
 
 #[itest]
@@ -180,6 +171,7 @@ fn object_subtype_swap_casts() {
     std::mem::swap(&mut *obj, &mut *node3d);
     std::mem::swap(&mut *obj_v2, &mut *node3d_v2);
     std::mem::swap(&mut *obj_v3, &mut *node3d_v3);
+    drop(node3d_v3); // not needed, just existed as a swap partner for obj_v3.
 
     // Current design: ALL casts fail if self is badly typed, even with correct target type. See RawGd::ffi_cast() for details.
 

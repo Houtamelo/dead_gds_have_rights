@@ -243,12 +243,6 @@ fn object_instance_id_when_freed() {
 
     node.free(); // destroys object without moving out of reference
     assert!(!node.is_instance_valid());
-
-    /*
-    expect_panic_or_ub("instance_id() on dead object", move || {
-        node.instance_id();
-    });
-    */
 }
 
 #[itest]
