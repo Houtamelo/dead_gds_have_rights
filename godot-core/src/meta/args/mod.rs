@@ -22,10 +22,6 @@ pub use as_arg::{
     ArgPassing, AsArg, AsDirectElement, ByObject, ByOption, ByRef, ByValue, ByVariant, ToArg,
     owned_into_arg, ref_to_arg,
 };
-#[cfg(not(feature = "trace"))]
-pub(crate) use cow_arg::{CowArg, FfiArg};
-// Integration test only.
-#[cfg(feature = "trace")]
 #[doc(hidden)]
 pub use cow_arg::{CowArg, FfiArg};
 pub use object_arg::ObjectArg;
