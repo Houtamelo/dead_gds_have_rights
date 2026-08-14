@@ -39,7 +39,7 @@
 //! use godot::obj::{bounds, Bounds};
 //!
 //! struct MyGd<T>
-//! where T: GodotClass + Bounds<Memory = bounds::MemManual<T>>
+//! where T: GodotClass + Bounds<Memory = bounds::MemManual>
 //! {
 //!    inner: Gd<T>,
 //! }
@@ -47,13 +47,12 @@
 //!
 // Note that depending on if you want to exclude `Object`, you should use `DynMemory` instead of `Memory`.
 
-use godot_ffi::interface_fn;
 use private::Sealed;
 
 use crate::obj::cap::GodotDefault;
-use crate::obj::{Bounds, Gd, GodotClass, InstanceId, RawGd};
+use crate::obj::{Bounds, Gd, GodotClass, RawGd};
 use crate::storage::{InstanceCache, Storage};
-use crate::{classes, out, sys};
+use crate::{out, sys};
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Sealed trait
@@ -149,8 +148,6 @@ pub(super) mod private {
 // Macro re-exports
 
 pub use crate::implement_godot_bounds;
-use crate::meta::CallContext;
-use crate::private::ObjectRtti;
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Memory bounds
 
@@ -471,33 +468,33 @@ impl Exportable for No {}
 //         // Forgetting a null doesn't do anything, since dropping a null also does nothing.
 //         return Some(RawGd::null());
 //     }
-// 
+//
 //     // Before Godot API calls, make sure the object is alive (and in Debug mode, of the correct type).
 //     // Current design decision: EVERY cast fails on incorrect type, even if target type is correct. This avoids the risk of violated
 //     // invariants that leak to the Godot implementation. Also, we do not provide a way to recover from bad types -- this is always
 //     // a bug that must be solved by the user.
 //     check_rtti(obj, rtti, "ffi_cast");
-// 
+//
 //     let class_tag = unsafe { interface_fn!(classdb_get_class_tag)(U::class_id().string_sys()) };
 //     let cast_object_ptr = unsafe { interface_fn!(object_cast_to)(obj_sys(obj), class_tag) };
-// 
+//
 //     // Create weak object, as ownership will be moved and reference-counter stays the same.
 //     sys::ptr_then(cast_object_ptr, |ptr| unsafe {
 //         RawGd::from_obj_sys_weak(ptr)
 //     })
 // }
-// 
+//
 // pub(crate) fn check_rtti<T: GodotClass>(
 //     obj: *mut T,
 //     rtti: Option<ObjectRtti>,
 //     method_name: &'static str,
 // ) {
 //     let call_ctx = CallContext::gd::<T>(method_name);
-// 
+//
 //     let instance_id = check_dynamic_type(obj, rtti, &call_ctx);
 //     classes::ensure_object_alive(instance_id, obj_sys(obj), &call_ctx);
 // }
-// 
+//
 // pub(crate) fn check_dynamic_type<T: GodotClass>(
 //     obj: *mut T,
 //     rtti: Option<ObjectRtti>,
@@ -507,17 +504,17 @@ impl Exportable for No {}
 //         !gd_is_null(obj, rtti),
 //         "{_call_ctx}: cannot call method on null object",
 //     );
-// 
+//
 //     // SAFETY: code surrounding RawGd<T> ensures that `self` is non-null; above is just a sanity check against internal bugs.
 //     let rtti = unsafe { rtti.unwrap_unchecked() };
 //     rtti.check_type::<T>();
 //     rtti.instance_id()
 // }
-// 
+//
 // pub(crate) fn obj_sys<T: GodotClass>(obj: *mut T) -> sys::GDExtensionObjectPtr {
 //     obj as sys::GDExtensionObjectPtr
 // }
-// 
+//
 // pub(crate) fn with_ref_counted<T: GodotClass, R>(
 //     obj: *mut T,
 //     rtti: Option<ObjectRtti>,
@@ -525,15 +522,15 @@ impl Exportable for No {}
 // ) -> R {
 //     // Note: this previously called Declarer::scoped_mut() - however, no need to go through bind() for changes in base RefCounted.
 //     // Any accesses to user objects (e.g. destruction if refc=0) would bind anyway.
-// 
+//
 //     let tmp = unsafe { ffi_cast::<T, classes::RefCounted>(obj, rtti) };
 //     let mut tmp = tmp.expect("object expected to inherit RefCounted");
 //     let return_val = apply(tmp.as_target_mut());
-// 
+//
 //     std::mem::forget(tmp); // no ownership transfer
 //     return_val
 // }
-// 
+//
 // /// Executes a function directly on this object, assuming it is `RefCounted`.
 // ///
 // /// Unlike [`try_with_ref_counted`](Self::try_with_ref_counted), this does **not** check the type at runtime.
@@ -546,7 +543,7 @@ impl Exportable for No {}
 //     apply: impl FnOnce(&mut classes::RefCounted) -> R,
 // ) -> R {
 //     let cached_rtti = rtti.map(|rtti| ObjectRtti::of::<classes::RefCounted>(rtti.instance_id()));
-// 
+//
 //     // Note: caller guarantees T: Inherits<RefCounted>. `ManuallyDrop` keeps the refcount balanced when `borrow` goes out of scope.
 //     let raw = RawGd::<classes::RefCounted> {
 //         memory: MemRefCounted {
@@ -555,15 +552,15 @@ impl Exportable for No {}
 //         },
 //         cached_storage_ptr: InstanceCache::null(),
 //     };
-// 
+//
 //     let mut borrow = std::mem::ManuallyDrop::new(raw);
 //     apply(borrow.as_target_mut())
 // }
-// 
+//
 // pub(crate) fn gd_is_null<T>(obj: *mut T, rtti: Option<ObjectRtti>) -> bool {
 //     obj.is_null() || rtti.is_none()
 // }
-// 
+//
 // pub fn inherits_refcounted(rtti: Option<ObjectRtti>) -> bool {
 //     rtti.map(|rtti| rtti.instance_id())
 //         .is_some_and(|id| id.is_ref_counted())

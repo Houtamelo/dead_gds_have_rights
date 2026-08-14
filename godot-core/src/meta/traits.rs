@@ -10,7 +10,7 @@ use godot_ffi as sys;
 use crate::builtin;
 use crate::builtin::{Variant, VariantType};
 use crate::meta::error::ConvertError;
-use crate::meta::{sealed, FromGodot, GodotConvert, ToGodot};
+use crate::meta::{FromGodot, GodotConvert, ToGodot, sealed};
 use crate::registry::info::ParamMetadata;
 
 // Re-export sys traits in this module, so all are in one place.

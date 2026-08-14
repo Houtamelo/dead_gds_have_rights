@@ -151,6 +151,7 @@ impl ClassRegistrationInfo {
 
 /// Registers a class with static type information.
 // Will be needed for builder API. Don't remove.
+#[allow(unfulfilled_lint_expectations)]
 #[expect(dead_code)]
 pub fn register_class<
     T: cap::GodotDefault

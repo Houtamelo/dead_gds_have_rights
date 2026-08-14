@@ -89,7 +89,9 @@ pub use crate::{arg_into_owned, arg_into_ref, impl_godot_as_self};
 mod reexport_crate {
     pub(crate) use super::param_tuple::TupleFromGodot;
     pub(crate) use super::signature::{CallContext, Signature, varcall_return_checked};
-    pub(crate) use super::traits::{GodotNullableType, ExtVariantType, GodotFfiVariant, ffi_variant_type};
+    pub(crate) use super::traits::{
+        ExtVariantType, GodotFfiVariant, GodotNullableType, ffi_variant_type,
+    };
     // Private imports for this module only.
     pub(super) use crate::registry::method::MethodParamOrReturnInfo;
 }
