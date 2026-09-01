@@ -8,15 +8,8 @@
 use super::ApproxEq;
 use crate::builtin::{RealConv, Vector2, real};
 
-mod private {
-    pub trait Sealed {}
-
-    impl Sealed for f32 {}
-    impl Sealed for f64 {}
-}
-
 /// Trait that provides Godot math functions as extensions on `f32` and `f64`.
-pub trait FloatExt: private::Sealed + Copy {
+pub trait FloatExt: Copy {
     const CMP_EPSILON: Self;
 
     /// Linearly interpolates from `self` to `to` by `weight`.

@@ -474,7 +474,7 @@ fn object_engine_eq() {
 fn object_dead_eq() {
     let a = Node3D::new_alloc();
     let b = Node3D::new_alloc();
-    let b2 = b.clone();
+    let _ = b.clone();
 
     // Destroy b1 without consuming it
     b.clone().free();

@@ -55,15 +55,11 @@ fn upper_bound(bound: Bound<i64>) -> Option<i64> {
     }
 }
 
-mod sealed {
-    pub trait SealedRange {}
-}
-
 /// Trait supporting regular `usize` ranges, as well as negative indices.
 ///
 /// If a lower or upper bound is negative, then its value is relative to the end of the given collection.  \
 /// Use the [`wrapped()`] utility function to construct such ranges.
-pub trait SignedRange: sealed::SealedRange {
+pub trait SignedRange {
     /// Returns a tuple of `(from, to)` from a Rust range.
     /// Unbounded upper range is represented by `None`.
     // Note: in some cases unbounded upper bounds should be represented by `i32::MAX` instead of `i64::MAX`,
@@ -72,14 +68,12 @@ pub trait SignedRange: sealed::SealedRange {
     fn signed(&self) -> (i64, Option<i64>);
 }
 
-impl sealed::SealedRange for WrappedRange {}
 impl SignedRange for WrappedRange {
     fn signed(&self) -> (i64, Option<i64>) {
         (self.lower_bound, self.upper_bound)
     }
 }
 
-impl<R> sealed::SealedRange for R where R: RangeBounds<usize> {}
 impl<R> SignedRange for R
 where
     R: RangeBounds<usize>,

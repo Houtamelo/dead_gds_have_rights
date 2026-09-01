@@ -425,6 +425,7 @@ fn make_godot_init_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
     });
 
     quote! {
+        #[allow(clippy::redundant_field_names)]
         impl ::godot::obj::cap::GodotDefault for #class_name {
             fn __godot_user_init(base: ::godot::obj::Base<<#class_name as ::godot::obj::GodotClass>::Base>) -> Self {
                 Self {
