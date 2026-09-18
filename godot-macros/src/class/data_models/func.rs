@@ -6,7 +6,7 @@
  */
 
 use proc_macro2::{Group, Ident, Span, TokenStream, TokenTree};
-use quote::{format_ident, quote, quote_spanned};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 
 use crate::class::RpcAttr;
 use crate::util::{bail, bail_fn, ident, safe_ident, to_spanned_tuple};
@@ -73,6 +73,7 @@ pub fn make_virtual_callback(
         signature_info,
         before_kind,
         interface_trait,
+        None,
     );
     let sig_params = signature_info.params_type();
     let sig_ret = &signature_info.return_type;
@@ -111,6 +112,30 @@ pub fn make_method_registration(
     func_definition: FuncDefinition,
     interface_trait: Option<&venial::TypeExpr>,
 ) -> ParseResult<TokenStream> {
+    make_method_registration_inner(class_name, func_definition, interface_trait, None)
+}
+
+/// Generates registration for a method implemented on `Gd<Class>`.
+pub fn make_gd_method_registration(
+    class_name: &Ident,
+    gd_self_ty: &venial::TypeExpr,
+    func_definition: FuncDefinition,
+    extension_trait: Option<&venial::TypeExpr>,
+) -> ParseResult<TokenStream> {
+    make_method_registration_inner(
+        class_name,
+        func_definition,
+        extension_trait,
+        Some(gd_self_ty),
+    )
+}
+
+fn make_method_registration_inner(
+    class_name: &Ident,
+    func_definition: FuncDefinition,
+    interface_trait: Option<&venial::TypeExpr>,
+    gd_self_ty: Option<&venial::TypeExpr>,
+) -> ParseResult<TokenStream> {
     // Fresh ident, discarding span -- prevents IDE syntax highlighter from mapping generated unsafe code to user's class declaration.
     let class_name = ident(&class_name.to_string());
 
@@ -130,6 +155,7 @@ pub fn make_method_registration(
         signature_info,
         BeforeKind::Without,
         interface_trait,
+        gd_self_ty,
     );
 
     let default_parameters = make_default_argument_vec(
@@ -269,6 +295,7 @@ fn make_default_argument_vec(
 pub enum ReceiverType {
     Ref,
     Mut,
+    Owned,
     GdSelf,
     Static,
 }
@@ -336,17 +363,27 @@ fn make_forwarding_closure(
     signature_info: &SignatureInfo,
     before_kind: BeforeKind,
     interface_trait: Option<&venial::TypeExpr>,
+    gd_self_ty: Option<&venial::TypeExpr>,
 ) -> TokenStream {
     let method_name = &signature_info.method_name;
     let params = &signature_info.param_idents;
     let params_tuple = signature_info.params_tuple();
     let param_ident = Ident::new("params", signature_info.params_span);
 
-    let instance_decl = match &signature_info.receiver_type {
-        ReceiverType::Ref => quote! {
+    let instance_decl = match (&signature_info.receiver_type, gd_self_ty) {
+        (ReceiverType::Ref, Some(_)) => quote! {
+            let __gdext_self = ::godot::private::Storage::get_gd(storage);
+        },
+        (ReceiverType::Mut, Some(_)) => quote! {
+            let mut __gdext_self = ::godot::private::Storage::get_gd(storage);
+        },
+        (ReceiverType::Owned, Some(_)) => quote! {
+            let __gdext_self = ::godot::private::Storage::get_gd(storage);
+        },
+        (ReceiverType::Ref, None) => quote! {
             let __gdext_self = ::godot::private::Storage::get(storage);
         },
-        ReceiverType::Mut => quote! {
+        (ReceiverType::Mut, None) => quote! {
             let mut __gdext_self = ::godot::private::Storage::get_mut(storage);
         },
         _ => quote! {},
@@ -366,7 +403,7 @@ fn make_forwarding_closure(
     };
 
     match signature_info.receiver_type {
-        ReceiverType::Ref | ReceiverType::Mut => {
+        ReceiverType::Ref | ReceiverType::Mut | ReceiverType::Owned => {
             // Generated default virtual methods (e.g. for ready) may not have an actual implementation (user code), so
             // all they need to do is call the __before_ready() method. This means the actual method call may be optional.
             let method_call;
@@ -375,6 +412,26 @@ fn make_forwarding_closure(
             if matches!(before_kind, BeforeKind::OnlyBefore) {
                 sig_tuple_annotation = TokenStream::new();
                 method_call = TokenStream::new()
+            } else if let Some(gd_self_ty) = gd_self_ty {
+                let instance_ref = match signature_info.receiver_type {
+                    ReceiverType::Ref => quote! { &__gdext_self },
+                    ReceiverType::Mut => quote! { &mut __gdext_self },
+                    ReceiverType::Owned => quote! { __gdext_self },
+                    _ => unreachable!("unexpected receiver type"),
+                };
+
+                sig_tuple_annotation = TokenStream::new();
+                method_call = if let Some(extension_trait) = interface_trait {
+                    quote! {
+                        <#gd_self_ty as #extension_trait>::#method_name(
+                            #instance_ref, #(#params),*
+                        )
+                    }
+                } else {
+                    quote! {
+                        <#gd_self_ty>::#method_name(#instance_ref, #(#params),*)
+                    }
+                };
             } else if let Some(interface_trait) = interface_trait {
                 // impl ITrait for Class {...}
                 // Virtual methods.
@@ -382,6 +439,9 @@ fn make_forwarding_closure(
                 let instance_ref = match signature_info.receiver_type {
                     ReceiverType::Ref => quote! { &__gdext_self },
                     ReceiverType::Mut => quote! { &mut __gdext_self },
+                    ReceiverType::Owned => {
+                        unreachable!("by-value receivers are only valid for Gd impls")
+                    }
                     _ => unreachable!("unexpected receiver type"), // checked above.
                 };
 
@@ -447,37 +507,46 @@ fn make_forwarding_closure(
             //
             // Identifiers need to share the span to avoid proc macro hygiene issues
             // similar to https://github.com/godot-rust/gdext/pull/1397.
+            let method_call = if let Some(gd_self_ty) = gd_self_ty {
+                if let Some(extension_trait) = interface_trait {
+                    quote! { <#gd_self_ty as #extension_trait>::#method_name(#(#params),*) }
+                } else {
+                    quote! { <#gd_self_ty>::#method_name(#(#params),*) }
+                }
+            } else {
+                quote! { #class_name::#method_name(#(#params),*) }
+            };
+
             quote! {
                 |_, #param_ident| {
                     let #params_tuple = #param_ident;
-                    #class_name::#method_name(#(#params),*)
+                    #method_call
                 }
             }
         }
     }
 }
 
-/// Maps each usage of `Self` to the struct it's referencing,
+/// Maps each usage of `Self` to the type it's referencing,
 /// since `Self` can't be used inside nested functions.
-fn map_self_to_class_name<In, Out>(tokens: In, class_name: &Ident) -> Out
+fn map_self_to_type<In>(tokens: In, self_ty: &TokenStream) -> TokenStream
 where
     In: IntoIterator<Item = TokenTree>,
-    Out: FromIterator<TokenTree>,
 {
-    tokens
-        .into_iter()
-        .map(|tt| match tt {
-            // Change instances of Self to the class name.
-            TokenTree::Ident(ident) if ident == "Self" => TokenTree::Ident(class_name.clone()),
-            // Recurse into groups and make sure ALL instances are changed.
-            TokenTree::Group(group) => TokenTree::Group(Group::new(
+    let mut mapped = TokenStream::new();
+
+    for token in tokens {
+        match token {
+            TokenTree::Ident(ident) if ident == "Self" => mapped.extend(self_ty.clone()),
+            TokenTree::Group(group) => mapped.extend([TokenTree::Group(Group::new(
                 group.delimiter(),
-                map_self_to_class_name(group.stream(), class_name),
-            )),
-            // Pass all other tokens through unchanged.
-            tt => tt,
-        })
-        .collect()
+                map_self_to_type(group.stream(), self_ty),
+            ))]),
+            token => mapped.extend([token]),
+        }
+    }
+
+    mapped
 }
 
 pub(crate) fn into_signature_info(
@@ -485,6 +554,18 @@ pub(crate) fn into_signature_info(
     class_name: &Ident,
     has_gd_self: bool,
 ) -> SignatureInfo {
+    into_signature_info_for_type(signature, class_name, has_gd_self, None)
+}
+
+pub(crate) fn into_signature_info_for_type(
+    signature: venial::Function,
+    class_name: &Ident,
+    has_gd_self: bool,
+    self_ty: Option<&venial::TypeExpr>,
+) -> SignatureInfo {
+    let self_ty = self_ty
+        .map(ToTokens::to_token_stream)
+        .unwrap_or_else(|| quote! { #class_name });
     let method_name = signature.name.clone();
     let mut receiver_type = if has_gd_self {
         ReceiverType::GdSelf
@@ -498,7 +579,7 @@ pub(crate) fn into_signature_info(
     let mut param_types = Vec::with_capacity(num_params);
     let return_type = match signature.return_ty {
         None => quote! { () },
-        Some(ty) => map_self_to_class_name(ty.tokens, class_name),
+        Some(ty) => map_self_to_type(ty.tokens, &self_ty),
     };
 
     let mut next_unnamed_index = 0;
@@ -508,9 +589,9 @@ pub(crate) fn into_signature_info(
             venial::FnParam::Receiver(recv) => {
                 // Unsupported receivers (gd_self + receiver, or `self` by value) are validated before this function.
                 assert_ne!(receiver_type, ReceiverType::GdSelf);
-                assert!(recv.tk_ref.is_some());
-
-                receiver_type = if recv.tk_mut.is_some() {
+                receiver_type = if recv.tk_ref.is_none() {
+                    ReceiverType::Owned
+                } else if recv.tk_mut.is_some() {
                     ReceiverType::Mut
                 } else {
                     ReceiverType::Ref
@@ -533,7 +614,7 @@ pub(crate) fn into_signature_info(
 
                     // Not an error, just unchanged.
                     Err(ty) => venial::TypeExpr {
-                        tokens: map_self_to_class_name(ty.tokens, class_name),
+                        tokens: map_self_to_type(ty.tokens, &self_ty).into_iter().collect(),
                     },
                 };
 
@@ -609,7 +690,7 @@ fn make_method_flags(
             quote! { #flags::NORMAL | #flags::CONST }
         }
         // Conservatively assume Gd<Self> receivers to mutate the object, since user can call bind_mut().
-        ReceiverType::Mut | ReceiverType::GdSelf => {
+        ReceiverType::Mut | ReceiverType::Owned | ReceiverType::GdSelf => {
             quote! { #flags::NORMAL }
         }
         ReceiverType::Static => {
@@ -755,6 +836,15 @@ pub fn validate_receiver_extract_gdself(
     has_gd_self: bool,
     attr_name: &Ident,
 ) -> ParseResult<Option<Ident>> {
+    validate_receiver_extract_gdself_with_value(signature, has_gd_self, attr_name, false)
+}
+
+pub fn validate_receiver_extract_gdself_with_value(
+    signature: &mut venial::Function,
+    has_gd_self: bool,
+    attr_name: &Ident,
+    allow_value_receiver: bool,
+) -> ParseResult<Option<Ident>> {
     let param_ident = if has_gd_self {
         // #[func(gd_self)] case: extract Gd<Self> parameter.
         // Note: parameter is explicitly NOT renamed (maybe_rename_parameter).
@@ -762,7 +852,7 @@ pub fn validate_receiver_extract_gdself(
         Some(ident)
     } else {
         // Regular case: validate that receiver is `&self` or `&mut self`.
-        validate_ref_receiver(signature)?;
+        validate_ref_receiver(signature, allow_value_receiver)?;
         None
     };
 
@@ -770,9 +860,13 @@ pub fn validate_receiver_extract_gdself(
 }
 
 /// Validates that the function signature has a reference receiver (`&self` or `&mut self`).
-fn validate_ref_receiver(signature: &venial::Function) -> ParseResult<()> {
+fn validate_ref_receiver(
+    signature: &venial::Function,
+    allow_value_receiver: bool,
+) -> ParseResult<()> {
     if let Some((venial::FnParam::Receiver(recv), _)) = signature.params.first()
         && recv.tk_ref.is_none()
+        && !allow_value_receiver
     {
         return bail!(
             &recv.tk_self,

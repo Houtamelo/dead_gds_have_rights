@@ -12,8 +12,8 @@ use quote::{ToTokens, format_ident, quote};
 use crate::class::data_models::func;
 use crate::class::{
     ConstDefinition, FuncDefinition, RpcAttr, RpcMode, SignalDefinition, SignatureInfo,
-    TransferMode, into_signature_info, make_constant_registration, make_method_registration,
-    make_signal_registrations,
+    TransferMode, into_signature_info, into_signature_info_for_type, make_constant_registration,
+    make_gd_method_registration, make_method_registration, make_signal_registrations,
 };
 use crate::util::{
     KvParser, bail, c_str, format_funcs_collection_struct, ident, make_funcs_collection_constants,
@@ -79,6 +79,12 @@ pub(crate) struct InherentImplAttr {
     pub no_typed_rpcs: bool,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ImplReceiver {
+    UserClass,
+    Gd,
+}
+
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
 /// Codegen for `#[godot_api] impl MyType`
@@ -92,7 +98,12 @@ pub fn transform_inherent_impl(
     let prv = quote! { ::godot::private };
 
     // Can add extra functions to the end of the impl block.
-    let (funcs, signals) = process_godot_fns(&class_name, &mut impl_block, meta.secondary)?;
+    let (funcs, signals) = process_godot_fns(
+        &class_name,
+        &mut impl_block,
+        meta.secondary,
+        ImplReceiver::UserClass,
+    )?;
     let consts = process_godot_constants(&mut impl_block)?;
 
     let inherent_impl_docs =
@@ -234,6 +245,60 @@ pub fn transform_inherent_impl(
     }
 }
 
+/// Codegen for `#[godot_api] impl Gd<MyType>` and extension traits implemented for it.
+///
+/// These blocks always act as secondary API blocks: they contribute registrations to the
+/// primary `#[godot_api] impl MyType` block without generating class-level registration state.
+pub fn transform_gd_impl(
+    mut impl_block: venial::Impl,
+    class_name: Ident,
+) -> ParseResult<TokenStream> {
+    let prv = quote! { ::godot::private };
+    let gd_self_ty = impl_block.self_ty.clone();
+    let extension_trait = impl_block.trait_ty.clone();
+
+    let (funcs, signals) = process_godot_fns(&class_name, &mut impl_block, true, ImplReceiver::Gd)?;
+    debug_assert!(signals.is_empty());
+    let consts = process_godot_constants(&mut impl_block)?;
+
+    let inherent_impl_docs =
+        crate::docs::make_trait_docs_registration(&funcs, &consts, &signals, &class_name, &prv);
+
+    let method_registrations = funcs
+        .into_iter()
+        .map(|func_def| {
+            make_gd_method_registration(
+                &class_name,
+                &gd_self_ty,
+                func_def,
+                extension_trait.as_ref(),
+            )
+        })
+        .collect::<ParseResult<Vec<_>>>()?;
+    let class_name_obj = util::class_name_obj(&class_name);
+    let constant_registration = make_constant_registration(consts, &class_name, &class_name_obj)?;
+
+    let fill_storage = quote! {
+        ::godot::sys::shard_execute_pre_main!({
+            let mut guard = #class_name::__registration_storage().lock().unwrap();
+
+            guard.0.push(|| {
+                #( #method_registrations )*
+            });
+
+            guard.1.push(|| {
+                #constant_registration
+            });
+        });
+    };
+
+    Ok(quote! {
+        #impl_block
+        #fill_storage
+        #inherent_impl_docs
+    })
+}
+
 /* Re-enable if we allow controlling declarative macros for signals (base_field_macro, visibility_macros).
 fn extract_hint_attribute(impl_block: &mut venial:: Impl) -> ParseResult<GodotApiHints> {
     // #[hint(has_base_field = BOOL)]
@@ -255,7 +320,9 @@ fn process_godot_fns(
     class_name: &Ident,
     impl_block: &mut venial::Impl,
     is_secondary_impl: bool,
+    impl_receiver: ImplReceiver,
 ) -> ParseResult<(Vec<FuncDefinition>, Vec<SignalDefinition>)> {
+    let gd_self_ty = (impl_receiver == ImplReceiver::Gd).then(|| impl_block.self_ty.clone());
     let mut func_definitions = vec![];
     let mut signal_definitions = vec![];
     let mut virtual_functions = vec![];
@@ -294,6 +361,13 @@ fn process_godot_fns(
 
         match attr.ty {
             ItemAttrType::Func(func, rpc_info) => {
+                if impl_receiver == ImplReceiver::Gd && func.has_gd_self {
+                    return bail!(
+                        &function,
+                        "#[func(gd_self)] is not allowed in `Gd<UserClass>` impl blocks",
+                    )?;
+                }
+
                 if rpc_info.is_some() && is_secondary_impl {
                     return bail!(
                         &function,
@@ -307,15 +381,24 @@ fn process_godot_fns(
                 //   from function:     #[attr] pub fn foo(&self, a: i32) -> i32 { ... }
                 //   into signature:    fn foo(&self, a: i32) -> i32
                 let mut signature = util::reduce_to_signature(function);
-                let gd_self_parameter = func::validate_receiver_extract_gdself(
+                let gd_self_parameter = func::validate_receiver_extract_gdself_with_value(
                     &mut signature,
                     func.has_gd_self,
                     &attr.attr_name,
+                    impl_receiver == ImplReceiver::Gd,
                 )?;
 
                 // Clone might not strictly be necessary, but the 2 other callers of into_signature_info() are better off with pass-by-value.
-                let mut signature_info =
-                    into_signature_info(signature.clone(), class_name, gd_self_parameter.is_some());
+                let mut signature_info = if let Some(gd_self_ty) = gd_self_ty.as_ref() {
+                    into_signature_info_for_type(
+                        signature.clone(),
+                        class_name,
+                        gd_self_parameter.is_some(),
+                        Some(gd_self_ty),
+                    )
+                } else {
+                    into_signature_info(signature.clone(), class_name, gd_self_parameter.is_some())
+                };
 
                 // Default value expressions from `#[opt(default = EXPR)]`; None for required parameters.
                 let all_param_maybe_defaults = parse_default_expressions(&mut function.params)?;
@@ -325,14 +408,23 @@ fn process_godot_fns(
                 // For virtual methods, rename/mangle existing user method and create a new method with the original name,
                 // which performs a dynamic dispatch.
                 let registered_name = if func.is_virtual {
-                    let registered_name = add_virtual_script_call(
-                        &mut virtual_functions,
-                        function,
-                        &signature_info,
-                        class_name,
-                        &func.rename,
-                        gd_self_parameter,
-                    );
+                    let registered_name = if impl_receiver == ImplReceiver::Gd {
+                        add_gd_virtual_script_call(
+                            function,
+                            &signature_info,
+                            class_name,
+                            &func.rename,
+                        )
+                    } else {
+                        add_virtual_script_call(
+                            &mut virtual_functions,
+                            function,
+                            &signature_info,
+                            class_name,
+                            &func.rename,
+                            gd_self_parameter,
+                        )
+                    };
 
                     Some(registered_name)
                 } else {
@@ -533,6 +625,71 @@ fn add_virtual_script_call(
     std::mem::swap(&mut function.body, &mut early_bound_function.body);
     virtual_functions.push(early_bound_function);
 
+    method_name_str
+}
+
+/// Replaces the body of a script-virtual method on `Gd<Class>` with dynamic dispatch.
+///
+/// The original body is kept inline as the fallback. Unlike user-class impls, this also works
+/// for extension-trait impls, where generating an undeclared early-bound trait method would be
+/// invalid Rust.
+fn add_gd_virtual_script_call(
+    function: &mut venial::Function,
+    signature_info: &SignatureInfo,
+    class_name: &Ident,
+    rename: &Option<String>,
+) -> String {
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(cfg!(since_api = "4.3"));
+    }
+
+    let is_params = function.params.iter_mut().skip(1);
+    let should_param_names = signature_info.param_idents.iter();
+    is_params
+        .zip(should_param_names)
+        .for_each(|(param, should_param_name)| {
+            if let venial::FnParam::Typed(param) = &mut param.0 {
+                param.name = should_param_name.clone();
+            }
+        });
+
+    let class_name_str = class_name.to_string();
+    let method_name_str = match rename {
+        Some(rename) => rename.clone(),
+        None => format!("_{}", function.name),
+    };
+    let method_name_cstr = c_str(&method_name_str);
+    let call_params = signature_info.params_type();
+    let call_ret = &signature_info.return_type;
+    let arg_names = &signature_info.param_idents;
+    let original_body = function.body.take().expect("functions must have a body");
+
+    let code = quote! {
+        let object_ptr = self.obj_sys();
+        let method_sname = ::godot::builtin::StringName::__cstr(#method_name_cstr);
+        let method_sname_ptr = method_sname.string_sys();
+        let has_virtual_override = unsafe {
+            ::godot::private::has_virtual_script_method(object_ptr, method_sname_ptr)
+        };
+
+        if has_virtual_override {
+            type CallParams = #call_params;
+            type CallRet = #call_ret;
+            let args = (#( #arg_names, )*);
+            unsafe {
+                ::godot::private::Signature::<CallParams, CallRet>::out_script_virtual_call(
+                    #class_name_str,
+                    #method_name_str,
+                    method_sname_ptr,
+                    object_ptr,
+                    args,
+                )
+            }
+        } else #original_body
+    };
+
+    function.body = Some(Group::new(Delimiter::Brace, code));
     method_name_str
 }
 

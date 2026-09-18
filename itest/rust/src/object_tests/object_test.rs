@@ -24,7 +24,7 @@ use godot::obj::{
 use godot::register::{GodotClass, godot_api};
 use godot::sys::{self, GodotFfi, interface_fn};
 
-use crate::framework::{TestContext, expect_panic, expect_panic_or_ub, itest};
+use crate::framework::{TestContext, create_gdscript, expect_panic, expect_panic_or_ub, itest};
 
 // TODO:
 // * make sure that ptrcalls are used when possible (i.e. when type info available; maybe GDScript integration test)
@@ -1154,6 +1154,89 @@ fn custom_constructor_works() {
     let obj = object_test_gd::CustomConstructor::construct_object(42);
     assert_eq!(obj.bind().val, 42);
     obj.free();
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+#[derive(GodotClass)]
+#[class(init, base=RefCounted)]
+struct GdExtensionPayload {
+    value: i64,
+}
+
+// Gd impl blocks contribute to the registration storage created by the primary block.
+#[godot_api]
+impl GdExtensionPayload {}
+
+trait GdExtensionMethods {
+    fn increment(&mut self, amount: i64) -> i64;
+    fn current_value(&self) -> i64;
+    fn owned_value(self) -> i64;
+    fn duplicate_handle(&self) -> Self;
+    fn virtual_value(&self) -> i64;
+}
+
+#[godot_api]
+impl GdExtensionMethods for Gd<GdExtensionPayload> {
+    #[func]
+    fn increment(&mut self, amount: i64) -> i64 {
+        let mut guard = self.bind_mut();
+        guard.value += amount;
+        guard.value
+    }
+
+    #[func]
+    fn current_value(&self) -> i64 {
+        self.bind().value
+    }
+
+    #[func]
+    fn owned_value(self) -> i64 {
+        self.bind().value
+    }
+
+    #[func]
+    fn duplicate_handle(&self) -> Self {
+        self.clone()
+    }
+
+    #[func(virtual)]
+    fn virtual_value(&self) -> i64 {
+        42
+    }
+}
+
+#[itest]
+fn gd_extension_trait_methods_work_from_rust_and_godot() {
+    let mut object = GdExtensionPayload::new_gd();
+
+    assert_eq!(object.increment(2), 2);
+    assert_eq!(object.current_value(), 2);
+
+    assert!(object.has_method("increment"));
+    assert!(object.has_method("current_value"));
+
+    let value: i64 = object.call("increment", &[3_i64.to_variant()]).to();
+    assert_eq!(value, 5);
+
+    let value: i64 = object.call("current_value", &[]).to();
+    assert_eq!(value, 5);
+
+    assert_eq!(object.clone().owned_value(), 5);
+    let value: i64 = object.call("owned_value", &[]).to();
+    assert_eq!(value, 5);
+
+    let duplicate: Gd<GdExtensionPayload> = object.call("duplicate_handle", &[]).to();
+    assert_eq!(duplicate.instance_id(), object.instance_id());
+
+    assert_eq!(object.virtual_value(), 42);
+
+    object.set_script(&create_gdscript(
+        "extends GdExtensionPayload\nfunc _virtual_value(): return 84",
+    ));
+    assert_eq!(object.virtual_value(), 84);
+    let value: i64 = object.call("_virtual_value", &[]).to();
+    assert_eq!(value, 84);
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------

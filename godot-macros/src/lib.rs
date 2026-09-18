@@ -920,6 +920,44 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
+/// ## Methods on `Gd<UserClass>`
+///
+/// `#[godot_api]` can also expose methods implemented directly on `Gd<T>`. This avoids an
+/// automatic bind before entering the method, so the method controls when the user object is
+/// borrowed. Such blocks are implicitly secondary and therefore require a primary
+/// `#[godot_api] impl T` block. Methods can receive `self`, `&self`, or `&mut self`; an engine
+/// call supplies an owned `Gd<T>` handle for the method invocation.
+///
+/// Extension traits are supported on stable Rust:
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init)]
+/// struct MyStruct {
+///     field: i64,
+/// }
+///
+/// #[godot_api]
+/// impl MyStruct {}
+///
+/// trait MyStructGdExt {
+///     fn field(&self) -> i64;
+/// }
+///
+/// #[godot_api]
+/// impl MyStructGdExt for Gd<MyStruct> {
+///     #[func]
+///     fn field(&self) -> i64 {
+///         self.bind().field
+///     }
+/// }
+/// ```
+///
+/// Inherent `impl Gd<MyStruct>` blocks are also understood by the macro, but standard Rust
+/// rejects them under its orphan rules. `#[func(gd_self)]` is not allowed in either form because
+/// the method already receives `Gd<MyStruct>` as `Self`.
+///
 /// ## Default parameters
 /// Functions can have default parameters using the `#[opt]` attribute. When a caller provides fewer arguments than the function
 /// signature defines, the default values are used for the missing parameters.
