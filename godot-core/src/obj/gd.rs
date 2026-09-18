@@ -626,35 +626,35 @@ impl<T: GodotClass> Gd<T> {
         // v0.6 migration: under the legacy path (no `upcoming-editor-placeholders`), `T::new_alloc()` / `T::new_gd()` returns a real Rust
         // instance even for non-`#[class(tool)]` classes in the editor. In v0.6 this becomes a placeholder, silently losing Rust-side
         // logic (init/ready/...). One warning per class id, then backtrace printed to stderr so user can locate caller.
-        #[cfg(not(feature = "upcoming-editor-placeholders"))]
-        let class_id = T::class_id();
-        #[cfg(not(feature = "upcoming-editor-placeholders"))]
-        if sys::is_editor_or_unknown().unwrap_or(false)
-            && crate::registry::class::is_class_tool(class_id) == Some(false)
-        {
-            use std::collections::HashSet;
-
-            // Persists for the process lifetime, including across hot reloads -- one warning per class per process, not per reload.
-            static WARNED: sys::Global<HashSet<ClassId>> = sys::Global::default();
-
-            let is_new = WARNED.lock().insert(class_id);
-            if is_new {
-                sys::defer_startup_warn!(
-                    id: "EditorPlaceholderV06",
-                    "godot-rust v0.6 will change editor behavior for non-`#[class(tool)]` runtime classes.\n\
-                    Class `{class_id}` creation in editor now returns real Rust instance; v0.6 will return a placeholder (details with RUST_BACKTRACE=1).\n\
-                    Opt in early via the `upcoming-editor-placeholders` feature, or mark the class as `#[class(tool)]` if it runs in the editor.",
-                );
-
-                // If RUST_BACKTRACE is set, print backtrace.
-                let bt = std::backtrace::Backtrace::capture();
-                if bt.status() == std::backtrace::BacktraceStatus::Captured {
-                    eprintln!(
-                        "Backtrace for `{class_id}` (v0.6 editor-placeholder migration):\n{bt}"
-                    );
-                }
-            }
-        }
+        // #[cfg(not(feature = "upcoming-editor-placeholders"))]
+        // let class_id = T::class_id();
+        // #[cfg(not(feature = "upcoming-editor-placeholders"))]
+        // if sys::is_editor_or_unknown().unwrap_or(false)
+        //     && crate::registry::class::is_class_tool(class_id) == Some(false)
+        // {
+        //     use std::collections::HashSet;
+        // 
+        //     // Persists for the process lifetime, including across hot reloads -- one warning per class per process, not per reload.
+        //     static WARNED: sys::Global<HashSet<ClassId>> = sys::Global::default();
+        // 
+        //     let is_new = WARNED.lock().insert(class_id);
+        //     if is_new {
+        //         sys::defer_startup_warn!(
+        //             id: "EditorPlaceholderV06",
+        //             "godot-rust v0.6 will change editor behavior for non-`#[class(tool)]` runtime classes.\n\
+        //             Class `{class_id}` creation in editor now returns real Rust instance; v0.6 will return a placeholder (details with RUST_BACKTRACE=1).\n\
+        //             Opt in early via the `upcoming-editor-placeholders` feature, or mark the class as `#[class(tool)]` if it runs in the editor.",
+        //         );
+        // 
+        //         // If RUST_BACKTRACE is set, print backtrace.
+        //         let bt = std::backtrace::Backtrace::capture();
+        //         if bt.status() == std::backtrace::BacktraceStatus::Captured {
+        //             eprintln!(
+        //                 "Backtrace for `{class_id}` (v0.6 editor-placeholder migration):\n{bt}"
+        //             );
+        //         }
+        //     }
+        // }
 
         // Fast path if not running in the editor: bypass substitution and directly call creation func.
         unsafe {
